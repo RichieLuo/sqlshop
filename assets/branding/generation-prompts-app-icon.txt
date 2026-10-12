@@ -1,0 +1,13 @@
+Generation mode: built-in image_gen.imagegen
+
+OPAQUE APPLICATION ICON EDIT PROMPT
+
+Use case: precise-object-edit.
+Input image 1: edit target, the approved SQLShop teal lynx head emblem.
+Primary request: Convert the approved animal emblem into a finished macOS desktop application icon with a substantial SOLID BACKGROUND TILE. The current floating animal silhouette is unsuitable for the user's Dock preference.
+Preserve EXACTLY the existing lynx drawing: ear tufts, face outline, teal and mint color planes, white facial fur, eyes and expression, nose, and six rounded data squares on its left cheek. No animal redesign and no text.
+Composition: square app icon, centered lynx scaled down so all ear tips and cheek points have calm generous breathing room. The animal's full height should be about 69 percent of the canvas and width approximately 60 percent. Center optically so its face has a balanced position.
+Background: fill the ENTIRE square image with a perfectly uniform opaque pale mint-white #F0F6F2, all the way to the four outer corners. Alpha must be fully opaque everywhere. This must be a backed app icon, not a transparent cutout and not a checkerboard. The field is the background tile itself. A very restrained one-pixel inset frame with softly rounded corners in slightly darker mint #D9E7DF may hint at macOS app icon geometry, but prioritize the simple clean flat opaque tile.
+Style: finished clean premium application icon, crisp edges and smooth anti-aliasing, gentle mint contrast beneath the animal. No heavy rim, no drop shadow, no plastic shine, no cast shadows, no texture, no border beyond the optional subtle inset, no wordmark, no slogans, no other objects, no mockup, no desktop or dock scene.
+Deliver just ONE square icon with a solid background, fully opaque pixels, ready to use as a native application icon.
+

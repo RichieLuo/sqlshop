@@ -1,0 +1,23 @@
+Generation mode: built-in image_gen.imagegen
+
+LYNX LOGO PROMPT
+
+Use case: logo-brand.
+Asset type: new original animal-based primary horizontal brand logo for SQLShop, a local desktop SQL database workbench. The user rejected generic folded-S graphics and explicitly wants animal elements.
+Primary request: Create a beautifully crafted, original lynx mascot emblem paired with the exact wordmark "SQLShop". The ANIMAL must be clearly recognizable and be the main visual idea.
+Animal design: a compact almost front-facing Eurasian lynx head, slight three-quarter angle is acceptable, with distinctive tall triangular ears ending in restrained short dark tufts, broad flared cheek ruffs, a tiny nose, and calm alert intelligent eyes. Attractive, friendly and confident, a tool companion for curious database developers. The face is sculpted from a few broad flowing interlocking planes with beautifully balanced symmetry and optical corrections, expressive but sophisticated. Eyes have quiet concentration rather than aggression. No human body or clothing.
+Database integration: subtly integrate a small two-by-three grid of broad rounded data cells within ONE lower cheek plane, tone-on-tone with the teal face, seamlessly part of the animal geometry. Keep this subtle; the first impression must be a beautiful lynx. It should not look like a computer pasted onto a cat. Do not use literal database barrels or terminals.
+Craft: expertly drawn iconic silhouette, flowing cheek contours, precisely matched radii, clean broad negative spaces, controlled warm personality. Broad organic curves contrast with elegant ear angles. Two or three main colored planes and perhaps one soft restrained tonal transition for depth, no busy fur or whisker detail. Works at app icon sizes and in one color.
+Palette: main deep jade teal #007461, selective light mint #64D2B4 inner face planes, dark charcoal #152B31 for eyes, nose and wordmark. Use near-white negative space where useful. Restrained highlights only, no rainbow.
+Wordmark (verbatim): "SQLShop", elegant contemporary humanist/geometric sans-serif, medium-semibold weight, beautifully even kerning, exact mixed-case spelling. Animal emblem about 1.35 times wordmark cap height, with generous comfortable space between animal and text. Both vertically optically aligned.
+Composition: ONE finished horizontal logo lockup centered on a completely uniform very pale warm off-white #FAFBF9 background, spacious margins, no border, no board of options.
+Style/medium: premium minimalist illustrated brand emblem with flat vector-like crisp clean edges, tasteful shallow color depth, mature developer product with a friendly animal identity.
+Originality constraints: draw an original lynx from the described anatomy. Do not copy or imitate any existing software, animal, sports-team or browser logo. Avoid beavers, foxes around globes, owls with circular glasses, generic folded-S ribbons and esports shield mascots.
+Avoid: cute baby proportions, anime eyes, fierce fangs, angry eyebrows, thick comic outlines, circles around the animal, shields, badges, shopping bags, gradients across the entire logo, photorealism, 3D render, metallic sheen, heavy shadows, tiny technical details, slogans, watermark, extra text. One refined completed logo only.
+
+TRANSPARENT LYNX ICON EDIT PROMPT
+
+Use case: precise-object-edit.
+Input image 1 is the edit target, the new SQLShop lynx logo.
+Extract precisely the same lynx head emblem from the left of the image as a standalone square transparent app icon. Remove the wordmark entirely and remove only the off-white canvas background outside the animal silhouette. Preserve the exact animal face, ear tufts, fur shapes, proportions, teal and mint colors, eye expression, white facial fur, and the six mint rounded data cells on its left cheek. White facial fur and eye highlights INSIDE the animal must remain opaque. Center the existing emblem on a square canvas with generous equal visual margins, approximately 14 percent padding above and below. Keep all silhouette edges clean, no pale or green halos. Genuine transparent alpha outside the emblem. No redesign, no added shapes or backplate, no shadow, no lettering. Output one isolated animal emblem.
+

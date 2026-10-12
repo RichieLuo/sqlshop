@@ -1,0 +1,30 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod branding;
+mod ui;
+
+fn main() -> eframe::Result {
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("SQLShop · 本地数据库工作台")
+        .with_icon(branding::icon_data())
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([900.0, 600.0]);
+    if std::env::var_os("SQLSHOP_SCREENSHOT").is_some()
+        && let Ok(size) = std::env::var("SQLSHOP_SCREENSHOT_SIZE")
+        && let Some((width, height)) = size.split_once('x')
+        && let (Ok(width), Ok(height)) = (width.parse::<u16>(), height.parse::<u16>())
+        && (900..=4096).contains(&width)
+        && (600..=2160).contains(&height)
+    {
+        viewport = viewport.with_inner_size([f32::from(width), f32::from(height)]);
+    }
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "SQLShop",
+        options,
+        Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
+    )
+}

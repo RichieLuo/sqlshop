@@ -1,0 +1,22 @@
+Generation mode: built-in image_gen.imagegen
+
+ROUNDED MACOS ICON PROMPT
+
+Use case: precise-object-edit.
+Input image 1 is the edit target: SQLShop's approved lynx on a pale mint background. The customer observed that its macOS Dock icon looks like a harsh opaque square.
+Primary request: Correct ONLY the app icon background silhouette, padding and native macOS presentation. Preserve the existing lynx drawing exactly, including ears, face, eyes, teal/mint palette, white fur and six cheek data cells.
+CRITICAL ALPHA REQUIREMENT: The pale mint backing plate itself MUST be fully opaque, including beneath every part of the animal. The OUTSIDE of that plate MUST have real transparent alpha, including all four image corners and all outer padding. Do NOT paint a square opaque canvas behind the rounded plate. Do NOT paint a checkerboard pattern.
+Geometry: square canvas. One centered macOS-style rounded-square / continuous-corner squircle backing plate, about 84 percent of the full canvas width and height, leaving about 8 percent genuinely transparent inset on every side. Its four corners must be generously rounded, about 22 percent of the plate's side length, smoothly flowing with no abrupt straight-angle corners. Use a solid pale mint-white #F0F6F2 fill. Remove the old drawn border entirely. A very subtle shallow highlight on the plate itself is optional, no outline or heavy drop shadow.
+Animal placement: keep the original animal emblem intact, centered optically within the opaque plate. Entire ear-tip-to-chin height approximately 78 percent of the plate height, with comfortable clearance on all four sides, no part protruding past the backing plate. Preserve the existing visual weight and eye expression.
+Style: clean polished macOS application icon, crisp edge anti-aliasing, flat restrained colors, attractive at small Dock sizes. No new details, no text, no mockups or desktop scene.
+Deliver exactly ONE square icon asset with a SOLID rounded-square background plate and TRANSPARENT exterior corners. The deliverable must show real rounded outer edges rather than a rounded border drawn on an opaque square image.
+
+EDGE CLEANUP PROMPT
+
+Use case: precise-object-edit.
+Input image 1 is the edit target, SQLShop's rounded-square macOS application icon.
+Perform a meticulous alpha-edge cleanup ONLY. Preserve the lynx artwork, pale mint solid backing plate, proportions, colors and positioning exactly.
+The current transparent exterior has erroneous stray white flecks and irregular scraps above, below and to the right of the rounded tile. Remove EVERY such outside fleck, hairline halo, ragged pixel, light scrap and residue. The outside of the tile must be completely empty transparent alpha. In particular the top transparent margin must be empty, the right margin empty, and the bottom margin empty.
+The backing tile must have one mathematically smooth rounded-square contour: perfectly straight horizontal/vertical mid-edge stretches, smooth tangent continuous rounded corners, no wobble or protrusions. Keep a clear transparent inset surrounding all four edges. The light mint plate and all animal colors inside it must stay opaque. No crop of animal, no animal redesign, no text, no new effects, no shadows.
+The result is a production icon with a single clean rounded-square alpha silhouette and fully opaque interior. DO NOT draw any checkerboard, white square background or black background.
+

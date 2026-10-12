@@ -1,0 +1,21 @@
+Generation mode: built-in image_gen.imagegen
+
+PRIMARY LOGO PROMPT
+
+Use case: logo-brand.
+Asset type: primary transparent logo lockup for SQLShop, a local desktop SQL database workbench built in Rust, supporting MySQL, PostgreSQL and Microsoft SQL Server.
+Primary request: Design one polished original logo with an emblem on the left and the exact wordmark "SQLShop" on the right.
+Subject: A strong compact geometric emblem combining three clean stacked database layers with a SQL query chevron > cut into their center as generous negative space. Make the mark distinctive and visually balanced, a recognizable abstract S silhouette is welcome only if naturally compatible with the layered database form. Prioritize a clear memorable shape over literal detail.
+Style/medium: premium minimalist software identity, flat vector-like crisp edges, intentional optical spacing, clean geometric construction, no 3D.
+Composition: single horizontal logo, emblem roughly as tall as capital letters plus a little breathing room; wordmark in a carefully kerned contemporary geometric sans-serif, medium-semibold weight, exact mixed capitalization SQLShop. Center the full lockup in the image with generous clear padding around all edges. No other samples or panels.
+Color palette: emblem solid deep teal #007461, matching the existing application light-mode accent. Wordmark solid dark slate #152B31.
+Text (verbatim): "SQLShop". No slogan or additional text.
+Background: genuinely transparent alpha channel; no drawn checkerboard.
+Constraints: clean enough to reduce to a desktop app icon, simple broad negative spaces, no tiny details, no shadows, no gradients, no chrome, no shopping cart, no shopping bag, no storefront, no mascot, no stock logo imitation, no watermark. Although the name contains Shop, the product is a SQL workbench and has no commerce function. Output one finished logo only.
+
+APP ICON EDIT PROMPT
+
+Use case: precise-object-edit, logo-brand.
+Input image 1 is the approved SQLShop logo and the edit target.
+Create a square standalone app emblem asset from it. Retain precisely the same left-hand teal database cylinder emblem with three tiers and a transparent central right-facing chevron > cutout. Keep its geometry, relative dimensions, layered curves, stroke gaps, teal #007461 color and clean flat vector-like rendering unchanged. Remove the wordmark entirely. Center the isolated emblem on a square transparent canvas, leaving roughly 18 percent padding on all four sides. The emblem should fill the useful center area, appropriate as a desktop application icon. Genuine transparent alpha outside the emblem and inside its cutouts. Do not invent a different logo or add a rounded-square background, shadows, gradients, decorations, text or watermark. Output one icon only.
+

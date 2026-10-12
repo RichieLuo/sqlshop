@@ -1,0 +1,20 @@
+Generation mode: built-in image_gen.imagegen
+
+PRIMARY LOGO V2 PROMPT
+
+Use case: logo-brand.
+Asset type: refined primary horizontal logo for SQLShop, a professional local desktop SQL database workbench.
+Primary request: Completely redesign the emblem with considerably more beautiful, bespoke geometry and sophisticated visual balance. One finished horizontal logo with a compact sculptural S monogram to the left and "SQLShop" wordmark to the right.
+Creative direction: a meticulously drawn continuous folded ribbon forming an unmistakable capital S, with two broad opposing curves and a crisp diagonal bridge, like an elegant data path flowing between two layers. Let parallel upper and lower edges subtly suggest stacked data without drawing a literal database cylinder. Distinctively purposeful cuts, smoothly tangential curves, disciplined spacing, generous open counters. Think of a beautifully engineered piece of folded paper reduced to a small striking symbol. Visually simple, distinctive and elegant; readable silhouette at 24 pixels.
+Shape: compact upright S with subtly squared outer profile and softly radiused corners; strong consistent visual weight, a little optical correction at turns. Integrate the data motif into the S itself, with no separate icon attached. No arrow or chevron pasted on top. Two or at most three broad contiguous facets that create the illusion of a single folded ribbon, no fussy small details.
+Color: deep jade teal #007461 on the main ribbon, a restrained brighter jade mint face drawn from the app's #64D2B4 accent; only a gentle controlled transition across a broad face if it helps distinguish the fold, no rainbow or metallic shine. Wordmark solid deep charcoal #152B31.
+Typography: exact text "SQLShop", mixed capitalization, refined contemporary geometric sans-serif, medium weight instead of extra-bold, beautiful even kerning, subtly rounded letters; elegant developer software identity. Emblem roughly 1.4 times wordmark cap height with airy intentional separation.
+Composition: one spacious horizontal lockup, vertically centered on a genuinely transparent background. Large clear padding, logo fills approximately 80% width. No presentation board or extra variants.
+Style: polished professional brand design, crisp vector-like edges and deliberately constructed geometry, sophisticated restraint. No literal barrel, no cylinder, no generic server stack, no terminal chevron, no shopping imagery, no mascots, no orbiting nodes, no rings, no sparkles, no detailed 3D render, no shadow, no watermark, no tagline. One coherent finished logo only.
+
+LIGHT BACKGROUND PREVIEW EDIT PROMPT
+
+Use case: precise-object-edit.
+Input image 1 is the edit target, the new SQLShop folded S logo.
+Refine only edge quality and final presentation. Preserve the exact folded S ribbon geometry, teal and mint shading, its size, positioning, and exact wordmark "SQLShop". Remove every stray lime-green speck, neon-green fringe or pixel artifact, particularly beside the top-left curve, the center counter, and beneath the bottom-left ribbon. All silhouette edges must be pristine, smooth, sharply defined and free of chromatic halos. Keep the logo itself unchanged. Set a perfectly flat soft warm-white #FAFBF9 background across the entire image so the typography is clearly readable and this is a finished brand preview. No shadow, texture, grain, new details or additional text. Output the same single spacious horizontal logo on the light background.
+
