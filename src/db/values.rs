@@ -16,6 +16,20 @@ macro_rules! decode {
     };
 }
 
+pub fn mysql_table(row: &MySqlRow, columns: &[crate::model::TableColumn]) -> Vec<Option<String>> {
+    let mut cells = mysql(row);
+    for (index, column) in columns.iter().enumerate() {
+        if column.kind == crate::model::CellKind::Text {
+            // Table metadata distinguishes binary-collated text from actual binary data;
+            // SQLx's String compatibility check cannot make that distinction.
+            if let Ok(value) = row.try_get_unchecked::<Option<String>, _>(index) {
+                cells[index] = value;
+            }
+        }
+    }
+    cells
+}
+
 pub fn mysql(row: &MySqlRow) -> Vec<Option<String>> {
     (0..row.len())
         .map(|index| {

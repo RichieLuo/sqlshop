@@ -56,6 +56,8 @@ async fn serve(
     mut socket: TcpStream,
     allowed: Arc<Vec<String>>,
     attempts: Arc<Mutex<Vec<String>>>,
+    slow_started: Arc<tokio::sync::Notify>,
+    slow_release: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let length = socket.read_u32().await? as usize;
     anyhow::ensure!((8..65_536).contains(&length), "Invalid startup packet");
@@ -97,7 +99,11 @@ async fn serve(
         }
         anyhow::ensure!(tag == b'Q', "Unexpected protocol tag {tag}");
         let sql = String::from_utf8_lossy(&body);
-        if sql.contains("FROM pg_database") {
+        if sql.contains("sqlshop_slow_query") {
+            slow_started.notify_one();
+            slow_release.notified().await;
+            rows(&mut socket, &["origin"], &[vec![database.clone()]]).await?;
+        } else if sql.contains("FROM pg_database") {
             let result: Vec<_> = allowed.iter().map(|db| vec![db.clone()]).collect();
             rows(&mut socket, &["datname"], &result).await?;
         } else if sql.contains("current_database()") {
@@ -129,6 +135,8 @@ struct Fixture {
     address: SocketAddr,
     attempts: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
+    slow_started: Arc<tokio::sync::Notify>,
+    slow_release: Arc<tokio::sync::Notify>,
 }
 
 impl Fixture {
@@ -139,12 +147,18 @@ impl Fixture {
             Arc::new(databases.iter().map(|name| name.to_string()).collect());
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let records = attempts.clone();
+        let slow_started = Arc::new(tokio::sync::Notify::new());
+        let slow_release = Arc::new(tokio::sync::Notify::new());
+        let started = slow_started.clone();
+        let release = slow_release.clone();
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let allowed = allowed.clone();
                 let attempts = records.clone();
+                let started = started.clone();
+                let release = release.clone();
                 tokio::spawn(async move {
-                    let _ = serve(socket, allowed, attempts).await;
+                    let _ = serve(socket, allowed, attempts, started, release).await;
                 });
             }
         });
@@ -152,6 +166,8 @@ impl Fixture {
             address,
             attempts,
             task,
+            slow_started,
+            slow_release,
         })
     }
 
@@ -218,11 +234,100 @@ async fn postgres_bootstrap_falls_back_to_the_user_database() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_workers_run_independently_and_preserve_targets() -> Result<()> {
+    use sqlshop::workspace::QueryTarget;
+    use uuid::Uuid;
+    let fixture = Fixture::start(&["postgres", "app_a", "app_b"]).await?;
+    let a = Worker::start(|| {});
+    let b = Worker::start(|| {});
+    let receive = |worker: &Worker| worker.receiver.recv_timeout(Duration::from_secs(5));
+    let profile_a = fixture.profile();
+    let profile_b = fixture.profile();
+    let target_a = QueryTarget {
+        connection: profile_a.id,
+        database: Some("app_a".into()),
+    };
+    let target_b = QueryTarget {
+        connection: profile_b.id,
+        database: Some("app_b".into()),
+    };
+    for (worker, profile, database) in [(&a, profile_a.clone(), "app_a"), (&b, profile_b, "app_b")]
+    {
+        worker.send(Request::Connect(profile, Credentials::default()))?;
+        assert!(matches!(receive(worker)?, Response::Connected(_)));
+        worker.send(Request::SelectDatabase(database.into()))?;
+        assert!(matches!(receive(worker)?, Response::DatabaseSelected(db) if db == database));
+    }
+    let tab_a = Uuid::new_v4();
+    let tab_b = Uuid::new_v4();
+    a.send(Request::RunQuery {
+        tab: tab_a,
+        target: target_a.clone(),
+        sql: "SELECT sqlshop_slow_query".into(),
+    })?;
+    tokio::time::timeout(Duration::from_secs(5), fixture.slow_started.notified()).await?;
+    // A is held behind a protocol-fixture barrier, not a timing-dependent sleep.
+    b.send(Request::RunQuery {
+        tab: tab_b,
+        target: target_b.clone(),
+        sql: "SELECT 1".into(),
+    })?;
+    assert!(
+        matches!(receive(&b)?, Response::QueryResult { tab, database: Some(db), .. } if tab == tab_b && db == "app_b")
+    );
+    assert!(matches!(
+        a.receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    // Cross-connection targets are rejected even though both workers are live.
+    b.send(Request::RunQuery {
+        tab: tab_b,
+        target: target_a.clone(),
+        sql: "SELECT 1".into(),
+    })?;
+    assert!(
+        matches!(receive(&b)?, Response::OperationError { tab, disconnected: false, .. } if tab == tab_b)
+    );
+    // Testing credentials uses a third, isolated worker, even for an existing profile.
+    let test = Worker::start(|| {});
+    test.send(Request::Test(profile_a, Credentials::default()))?;
+    assert!(matches!(receive(&test)?, Response::Tested));
+    b.send(Request::Tables)?;
+    assert!(matches!(receive(&b)?, Response::Tables(tables) if tables[0].name == "app_b_table"));
+    b.send(Request::Disconnect)?;
+    assert!(matches!(receive(&b)?, Response::Disconnected));
+    fixture.slow_release.notify_one();
+    match receive(&a)? {
+        Response::QueryResult {
+            tab,
+            database,
+            output,
+        } => {
+            assert_eq!(tab, tab_a);
+            assert_eq!(database, Some("app_a".into()));
+            assert_eq!(output.sets[0].rows[0][0].as_deref(), Some("app_a"));
+        }
+        _ => panic!("A's result was lost or routed to another operation"),
+    }
+    a.send(Request::Tables)?;
+    assert!(matches!(receive(&a)?, Response::Tables(tables) if tables[0].name == "app_a_table"));
+    a.send(Request::RunQuery {
+        tab: tab_a,
+        target: target_a,
+        sql: "SELECT 1".into(),
+    })?;
+    assert!(matches!(receive(&a)?, Response::QueryResult { tab, .. } if tab == tab_a));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_keeps_server_connection_after_failed_database_selection() -> Result<()> {
     let fixture = Fixture::start(&["postgres", "app"]).await?;
     let worker = Worker::start(|| {});
     let receive = || worker.receiver.recv_timeout(Duration::from_secs(5));
-    worker.send(Request::Connect(fixture.profile(), Credentials::default()))?;
+    let profile = fixture.profile();
+    let connection = profile.id;
+    worker.send(Request::Connect(profile, Credentials::default()))?;
     assert!(matches!(receive()?, Response::Connected(_)));
     worker.send(Request::Databases)?;
     assert!(matches!(receive()?, Response::Databases(_)));
@@ -238,6 +343,41 @@ async fn worker_keeps_server_connection_after_failed_database_selection() -> Res
     ));
     worker.send(Request::Query("SELECT 1".into()))?;
     assert!(matches!(receive()?, Response::Query { database: Some(db), .. } if db == "app"));
+    let tab = uuid::Uuid::new_v4();
+    for target in [
+        sqlshop::workspace::QueryTarget {
+            connection: uuid::Uuid::new_v4(),
+            database: Some("app".into()),
+        },
+        sqlshop::workspace::QueryTarget {
+            connection,
+            database: Some("other".into()),
+        },
+        sqlshop::workspace::QueryTarget {
+            connection,
+            database: None,
+        },
+    ] {
+        worker.send(Request::RunQuery {
+            tab,
+            target,
+            sql: "SELECT 1".into(),
+        })?;
+        assert!(
+            matches!(receive()?, Response::OperationError { tab: response_tab, disconnected: false, .. } if response_tab == tab)
+        );
+    }
+    worker.send(Request::RunQuery {
+        tab,
+        target: sqlshop::workspace::QueryTarget {
+            connection,
+            database: Some("app".into()),
+        },
+        sql: "SELECT 1".into(),
+    })?;
+    assert!(
+        matches!(receive()?, Response::QueryResult { tab: response_tab, database: Some(db), .. } if response_tab == tab && db == "app")
+    );
     worker.send(Request::Disconnect)?;
     assert!(matches!(receive()?, Response::Disconnected));
     Ok(())

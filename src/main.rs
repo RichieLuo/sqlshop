@@ -5,7 +5,8 @@ mod ui;
 
 fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("SQLShop · 本地数据库工作台")
+        .with_title("SQLShop")
+        .with_decorations(false)
         .with_icon(branding::icon_data())
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([900.0, 600.0]);

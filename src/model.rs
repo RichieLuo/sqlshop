@@ -182,6 +182,8 @@ pub struct Table {
 #[derive(Clone, Debug, Default)]
 pub struct ResultSet {
     pub columns: Vec<String>,
+    /// SQL types from driver or table metadata, aligned with columns when available.
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub affected: Option<u64>,
     pub truncated: bool,
@@ -213,6 +215,8 @@ pub enum CellKind {
 #[derive(Clone, Debug)]
 pub struct TableColumn {
     pub name: String,
+    /// Original catalog type, for display rather than parameter casts.
+    pub declared_type: String,
     pub sql_type: String,
     pub kind: CellKind,
     pub editable: bool,

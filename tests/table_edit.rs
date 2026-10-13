@@ -40,11 +40,26 @@ fn exercise(engine: Engine, prefix: &str) {
         session.query(&format!("CREATE TABLE {qualified} ({fields}, PRIMARY KEY(tenant,id))")).await.unwrap();
         let binary = match engine { Engine::Postgres => "decode('00ff','hex')", _ => "0x00ff" };
         session.query(&format!("INSERT INTO {qualified} (tenant,id,name,note,amount,payload,observed_at,score) VALUES (1,9223372036854775806,'first',NULL,12.3456,{binary},'2026-10-12 12:34:56.123456',0.1),(2,9223372036854775806,'second',NULL,12.3456,{binary},'2026-10-12 12:34:56.123456',0.1)")).await.unwrap();
+        // Arbitrary setup SQL has its own physical connection. In particular,
+        // MySQL editing is conservatively disabled after user SQL on a session.
+        drop(session);
+        let mut session = Session::connect(&profile, &credentials).await.unwrap();
+        session.select_database("sqlshop_test").await.unwrap();
         let snapshot = session.table_data(&table).await.unwrap();
+        assert!(!session.raw_session_requires_confirmation());
+        assert_eq!(snapshot.output.sets[0].column_types.len(), snapshot.columns.len());
+        if engine == Engine::MySql {
+            for (name, declared, cast) in [("name", "varchar(100)", "CHAR CHARACTER SET utf8mb4"), ("amount", "decimal(20,4)", "decimal(20,4)"), ("observed_at", "datetime(6)", "DATETIME(6)")] {
+                let index = snapshot.columns.iter().position(|c| c.name == name).unwrap();
+                assert_eq!(snapshot.columns[index].declared_type, declared);
+                assert_eq!(snapshot.output.sets[0].column_types[index], declared);
+                assert_eq!(snapshot.columns[index].sql_type, cast);
+            }
+        }
         assert_eq!(snapshot.primary_keys, ["tenant", "id"]);
         assert_eq!(snapshot.keys[0], [Some("1".into()), Some("9223372036854775806".into())]);
         assert_eq!(cell(&snapshot, "amount", 0), Some("12.3456"));
-        assert!(!snapshot.columns.iter().find(|c| c.name=="generated").unwrap().editable);
+        assert!(!snapshot.columns.iter().find(|c| c.name=="computed_label").unwrap().editable);
         assert!(session.update_cell(&change(&snapshot, &table, "computed_label", Some("blocked"))).await.is_err());
         let new_name = "中文 ' ; UPDATE never_run --";
         session.update_cell(&change(&snapshot, &table, "name", Some(new_name))).await.unwrap();
@@ -75,10 +90,31 @@ fn exercise(engine: Engine, prefix: &str) {
         let read_only = session.table_data(&no_key).await.unwrap();
         assert!(read_only.primary_keys.is_empty());
         assert!(session.update_cell(&change(&read_only, &no_key, "marker", Some("blocked"))).await.is_err());
+        // Reject edits in a user transaction without committing or rolling it back.
+        let data = session.table_data(&table).await.unwrap();
+        session.query(match engine { Engine::SqlServer => "BEGIN TRANSACTION", _ => "BEGIN" }).await.unwrap();
+        session.query(&format!("UPDATE {qualified} SET note='uncommitted' WHERE tenant=1")).await.unwrap();
+        assert!(session.update_cell(&change(&data, &table, "name", Some("must-not-save"))).await.is_err());
+        session.query("ROLLBACK").await.unwrap();
+        assert_eq!(cell(&session.table_data(&table).await.unwrap(), "note", 0), None);
+        if engine == Engine::Postgres {
+            // The savepoint probe also rejects aborted transactions without
+            // ending them; ROLLBACK is still the caller's responsibility.
+            session.query("BEGIN").await.unwrap();
+            assert!(session.query("SELECT 1/0").await.is_err());
+            assert!(session.update_cell(&change(&data, &table, "name", Some("blocked"))).await.is_err());
+            assert!(session.query("SELECT 1").await.is_err());
+            session.query("ROLLBACK").await.unwrap();
+            session.update_cell(&change(&data, &table, "name", Some("after-rollback"))).await.unwrap();
+        }
+        if engine == Engine::MySql {
+            assert!(session.update_cell(&change(&data, &table, "name", Some("raw-only"))).await.is_err());
+        }
         session.query(&format!("DELETE FROM {qualified}")).await.unwrap();
         let empty = session.table_data(&table).await.unwrap();
         assert!(empty.output.sets[0].rows.is_empty());
         assert_eq!(empty.output.sets[0].columns.len(), 9);
+        assert_eq!(empty.output.sets[0].column_types, snapshot.output.sets[0].column_types);
         session.query(&format!("DROP TABLE {qualified}")).await.unwrap();
     });
 }

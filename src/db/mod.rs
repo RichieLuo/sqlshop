@@ -1,4 +1,9 @@
+mod browser;
+mod structure;
 mod table_edit;
+pub use browser::{
+    ColumnFilter, ColumnSort, FilterOperator, TableBrowseOptions, TablePage, TableStructure,
+};
 mod values;
 
 pub(crate) use table_edit::EditRejected;
@@ -10,7 +15,8 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use futures_util::TryStreamExt;
 use sqlx::{
-    Column, Connection, Either, Row, mysql::MySqlConnectOptions, postgres::PgConnectOptions,
+    Column, Connection, Either, Row, TypeInfo, mysql::MySqlConnectOptions,
+    postgres::PgConnectOptions,
 };
 use std::time::Instant;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, QueryItem};
@@ -51,6 +57,7 @@ pub struct Session {
     _tunnel: Option<Tunnel>,
     profile: Profile,
     credentials: Credentials,
+    raw_query_used: bool,
 }
 
 impl Session {
@@ -183,11 +190,12 @@ impl Session {
             _tunnel: tunnel,
             profile: profile.clone(),
             credentials: credentials.clone(),
+            raw_query_used: false,
         })
     }
 
     pub async fn ping(&mut self) -> Result<()> {
-        self.query("SELECT 1 AS connection_test").await?;
+        self.query_internal("SELECT 1 AS connection_test").await?;
         Ok(())
     }
 
@@ -206,7 +214,7 @@ impl Session {
                 "SELECT name FROM sys.databases WHERE state = 0 AND HAS_DBACCESS(name) = 1 ORDER BY name"
             }
         };
-        let output = self.query(sql).await?;
+        let output = self.query_internal(sql).await?;
         let mut databases = Vec::new();
         for set in output.sets {
             anyhow::ensure!(
@@ -276,7 +284,7 @@ impl Session {
             Engine::SqlServer => "SELECT DB_NAME() AS current_database",
         };
         Ok(self
-            .query(sql)
+            .query_internal(sql)
             .await?
             .sets
             .first()
@@ -299,7 +307,7 @@ impl Session {
                 "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME"
             }
         };
-        let output = self.query(sql).await?;
+        let output = self.query_internal(sql).await?;
         let mut tables = Vec::new();
         for set in output.sets {
             if set.truncated {
@@ -318,7 +326,18 @@ impl Session {
         Ok(tables)
     }
 
+    pub fn raw_session_requires_confirmation(&self) -> bool {
+        self.raw_query_used
+    }
+
     pub async fn query(&mut self, sql: &str) -> Result<QueryOutput> {
+        // SQLx hides MySQL server transaction status. Never implicitly commit
+        // a possible transaction after arbitrary SQL has run on this connection.
+        self.raw_query_used = true;
+        self.query_internal(sql).await
+    }
+
+    pub(crate) async fn query_internal(&mut self, sql: &str) -> Result<QueryOutput> {
         anyhow::ensure!(!sql.trim().is_empty(), "SQL 不能为空");
         let start = Instant::now();
         let mut output = QueryOutput::default();
@@ -336,6 +355,11 @@ impl Session {
                             if set.columns.is_empty() {
                                 set.columns =
                                     row.columns().iter().map(|c| c.name().into()).collect();
+                                set.column_types = row
+                                    .columns()
+                                    .iter()
+                                    .map(|c| c.type_info().name().into())
+                                    .collect();
                             }
                             if set.rows.len() < ROW_LIMIT {
                                 set.rows.push(values::mysql(&row));
@@ -362,6 +386,11 @@ impl Session {
                             if set.columns.is_empty() {
                                 set.columns =
                                     row.columns().iter().map(|c| c.name().into()).collect();
+                                set.column_types = row
+                                    .columns()
+                                    .iter()
+                                    .map(|c| c.type_info().name().into())
+                                    .collect();
                             }
                             if set.rows.len() < ROW_LIMIT {
                                 set.rows.push(values::postgres(&row));
@@ -388,6 +417,11 @@ impl Session {
                                         .iter()
                                         .map(|c| c.name().into())
                                         .collect(),
+                                    column_types: metadata
+                                        .columns()
+                                        .iter()
+                                        .map(|c| sqlserver_type_name(c.column_type()).into())
+                                        .collect(),
                                     ..ResultSet::default()
                                 },
                             )?;
@@ -412,6 +446,48 @@ impl Session {
     }
 }
 
+/// Tiberius exposes wire types without lengths/precision or alias names.
+/// Keep ambiguous wire families explicit rather than inventing a SQL type.
+fn sqlserver_type_name(column_type: tiberius::ColumnType) -> &'static str {
+    use tiberius::ColumnType::*;
+    match column_type {
+        Null => "NULL",
+        Bit | Bitn => "bit",
+        Int1 => "tinyint",
+        Int2 => "smallint",
+        Int4 => "int",
+        Int8 => "bigint",
+        Datetime4 => "smalldatetime",
+        Float4 => "real",
+        Float8 => "float",
+        Money => "money",
+        Datetime => "datetime",
+        Money4 => "smallmoney",
+        Guid => "uniqueidentifier",
+        Decimaln => "decimal",
+        Numericn => "numeric",
+        Daten => "date",
+        Timen => "time",
+        Datetime2 => "datetime2",
+        DatetimeOffsetn => "datetimeoffset",
+        BigVarBin => "varbinary",
+        BigVarChar => "varchar",
+        BigBinary => "binary",
+        BigChar => "char",
+        NVarchar => "nvarchar",
+        NChar => "nchar",
+        Xml => "xml",
+        Text => "text",
+        Image => "image",
+        NText => "ntext",
+        SSVariant => "sql_variant",
+        Intn => "integer (TDS Intn; size unknown)",
+        Floatn => "floating point (TDS Floatn; size unknown)",
+        Datetimen => "datetime / smalldatetime (TDS Datetimen)",
+        Udt => "user-defined type (TDS Udt)",
+    }
+}
+
 fn push_set(output: &mut QueryOutput, set: ResultSet) -> Result<()> {
     anyhow::ensure!(
         output.sets.len() < RESULT_LIMIT,
@@ -419,4 +495,57 @@ fn push_set(output: &mut QueryOutput, set: ResultSet) -> Result<()> {
     );
     output.sets.push(set);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlserver_type_name;
+    use tiberius::ColumnType;
+
+    #[test]
+    fn sqlserver_headers_use_sql_names_not_wire_variant_names() {
+        for (wire, sql) in [
+            (ColumnType::Int4, "int"),
+            (ColumnType::Int8, "bigint"),
+            (ColumnType::Bitn, "bit"),
+            (ColumnType::NVarchar, "nvarchar"),
+            (ColumnType::BigVarBin, "varbinary"),
+            (ColumnType::Guid, "uniqueidentifier"),
+            (ColumnType::Decimaln, "decimal"),
+            (ColumnType::Datetime2, "datetime2"),
+        ] {
+            assert_eq!(sqlserver_type_name(wire), sql);
+        }
+        assert_eq!(
+            sqlserver_type_name(ColumnType::Datetimen),
+            "datetime / smalldatetime (TDS Datetimen)"
+        );
+        assert!(sqlserver_type_name(ColumnType::Intn).contains("unknown"));
+        assert!(sqlserver_type_name(ColumnType::Floatn).contains("unknown"));
+        assert!(sqlserver_type_name(ColumnType::Udt).contains("user-defined"));
+    }
+}
+
+/// Only ordinary server statement errors are known to preserve the transport.
+/// Unknown errors, including an undrained result-set limit, are unsafe.
+pub fn query_error_preserves_session(error: &anyhow::Error) -> bool {
+    if let Some(sqlx::Error::Database(error)) = error.downcast_ref::<sqlx::Error>() {
+        let code = error.code();
+        let code = code.as_deref().unwrap_or("");
+        if code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03") {
+            return false;
+        }
+        if let Some(pg) = error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+            return !matches!(
+                pg.severity(),
+                sqlx::postgres::PgSeverity::Fatal | sqlx::postgres::PgSeverity::Panic
+            );
+        }
+        if let Some(mysql) = error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+            return !matches!(mysql.number(), 1053 | 1927 | 2006 | 2013 | 4031);
+        }
+        return true;
+    }
+    matches!(error.downcast_ref::<tiberius::error::Error>(),
+        Some(tiberius::error::Error::Server(error)) if error.class() < 20)
 }

@@ -1,6 +1,6 @@
 use eframe::egui::{self, IconData};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/branding/sqlshop-lynx-app-icon.png");
 const LOGO_PNG: &[u8] = include_bytes!("../assets/branding/sqlshop-lynx-icon.png");
 
@@ -9,16 +9,25 @@ pub fn icon_data() -> IconData {
     {
         // eframe installs this icon after application creation, so the viewport
         // must carry the rounded image rather than a separate startup override.
-        image_data(macos_icon_image())
+        image_data(rounded_icon_image())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        image_data(image::imageops::resize(
+            &rounded_icon_image(),
+            256,
+            256,
+            image::imageops::FilterType::Lanczos3,
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         decode_icon(APP_ICON_PNG)
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_icon_image() -> image::RgbaImage {
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn rounded_icon_image() -> image::RgbaImage {
     let logo = image::load_from_memory(LOGO_PNG)
         .expect("the embedded SQLShop logo must be a valid PNG")
         .resize_exact(760, 760, image::imageops::FilterType::Lanczos3)
@@ -67,11 +76,27 @@ pub fn load_texture(ctx: &egui::Context) -> egui::TextureHandle {
     ctx.load_texture("sqlshop-lynx", image, egui::TextureOptions::LINEAR)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
     #[test]
-    fn dock_icon_has_a_solid_plate_and_transparent_rounded_exterior() {
-        let image = super::macos_icon_image();
+    fn windows_icon_has_a_solid_plate_and_transparent_rounded_exterior() {
+        let icon = super::icon_data();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        let image = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba).unwrap();
+        for (x, y) in [(0, 0), (255, 0), (0, 255), (255, 255), (28, 28)] {
+            assert_eq!(image.get_pixel(x, y)[3], 0);
+        }
+        for (x, y) in [(128, 32), (32, 128), (128, 128), (128, 223)] {
+            assert_eq!(image.get_pixel(x, y)[3], 255);
+        }
+        assert!(image.rows().next().unwrap().all(|pixel| pixel[3] == 0));
+        assert!(image.rows().next_back().unwrap().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn rounded_icon_has_a_solid_plate_and_transparent_rounded_exterior() {
+        let image = super::rounded_icon_image();
         assert_eq!(image.dimensions(), (1024, 1024));
         for (x, y) in [(0, 0), (1023, 0), (0, 1023), (1023, 1023), (110, 110)] {
             assert_eq!(image.get_pixel(x, y)[3], 0);

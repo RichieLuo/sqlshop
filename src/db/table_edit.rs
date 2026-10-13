@@ -16,7 +16,20 @@ impl fmt::Display for EditRejected {
 impl std::error::Error for EditRejected {}
 
 impl Session {
-    async fn parameter_query(&mut self, sql: &str, parameters: &[&str]) -> Result<QueryOutput> {
+    pub(super) async fn parameter_query(
+        &mut self,
+        sql: &str,
+        parameters: &[&str],
+    ) -> Result<QueryOutput> {
+        self.parameter_query_columns(sql, parameters, None).await
+    }
+
+    pub(super) async fn parameter_query_columns(
+        &mut self,
+        sql: &str,
+        parameters: &[&str],
+        columns: Option<&[TableColumn]>,
+    ) -> Result<QueryOutput> {
         let start = Instant::now();
         let rows = match &mut self.driver {
             Driver::MySql(connection) => {
@@ -28,7 +41,10 @@ impl Session {
                     .fetch_all(connection)
                     .await?
                     .iter()
-                    .map(values::mysql)
+                    .map(|row| match columns {
+                        Some(columns) => values::mysql_table(row, columns),
+                        None => values::mysql(row),
+                    })
                     .collect()
             }
             Driver::Postgres(connection) => {
@@ -67,7 +83,7 @@ impl Session {
         })
     }
 
-    async fn table_columns(&mut self, table: &Table) -> Result<Vec<TableColumn>> {
+    pub(super) async fn table_columns(&mut self, table: &Table) -> Result<Vec<TableColumn>> {
         let sql = match self.profile.engine {
             Engine::Postgres => {
                 r#"SELECT a.attname::text, pg_catalog.format_type(a.atttypid,a.atttypmod)::text, t.typname::text,
@@ -85,8 +101,12 @@ impl Session {
                 CAST(c.DATA_TYPE AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci,
                 CASE WHEN c.EXTRA LIKE '%GENERATED%' OR c.EXTRA LIKE '%auto_increment%' OR t.TABLE_TYPE <> 'BASE TABLE' OR t.ENGINE <> 'InnoDB' THEN 'true' ELSE 'false' END,
                 CASE WHEN c.COLUMN_KEY='PRI' THEN 'true' ELSE 'false' END
-                FROM information_schema.COLUMNS c JOIN information_schema.TABLES t ON t.TABLE_SCHEMA=c.TABLE_SCHEMA AND t.TABLE_NAME=c.TABLE_NAME
-                WHERE c.TABLE_SCHEMA=? AND c.TABLE_NAME=? ORDER BY c.ORDINAL_POSITION"#
+                FROM information_schema.COLUMNS c JOIN information_schema.TABLES t
+                ON CONVERT(t.TABLE_SCHEMA USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(c.TABLE_SCHEMA USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                AND CONVERT(t.TABLE_NAME USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(c.TABLE_NAME USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                WHERE CONVERT(c.TABLE_SCHEMA USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                AND CONVERT(c.TABLE_NAME USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                ORDER BY c.ORDINAL_POSITION"#
             }
             Engine::SqlServer => {
                 r#"SELECT c.name,
@@ -153,10 +173,11 @@ impl Session {
                     CellKind::Time => "TIME(6)".into(),
                     _ => "CHAR CHARACTER SET utf8mb4".into(),
                 },
-                _ => declared,
+                _ => declared.clone(),
             };
             columns.push(TableColumn {
                 name,
+                declared_type: declared,
                 sql_type,
                 kind,
                 editable: field(3)? == "false" && kind != CellKind::Unsupported,
@@ -168,71 +189,14 @@ impl Session {
     }
 
     pub async fn table_data(&mut self, table: &Table) -> Result<TableData> {
-        let columns = self.table_columns(table).await?;
-        let engine = self.profile.engine;
-        let expressions = columns
-            .iter()
-            .map(|column| {
-                format!(
-                    "{} AS {}",
-                    display_expression(engine, column),
-                    engine.quote(&column.name)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let table_name = format!(
-            "{}.{}",
-            engine.quote(&table.schema),
-            engine.quote(&table.name)
-        );
-        let primary_keys: Vec<_> = columns
-            .iter()
-            .filter(|c| c.primary_key)
-            .map(|c| c.name.clone())
-            .collect();
-        let order = if primary_keys.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " ORDER BY {}",
-                primary_keys
-                    .iter()
-                    .map(|name| engine.quote(name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let sql = match engine {
-            Engine::SqlServer => format!("SELECT TOP (200) {expressions} FROM {table_name}{order}"),
-            _ => format!("SELECT {expressions} FROM {table_name}{order} LIMIT 200"),
-        };
-        let mut output = self.query(&sql).await?;
-        if output.sets.is_empty() {
-            output.sets.push(ResultSet::default());
-        }
-        output.sets[0].columns = columns.iter().map(|column| column.name.clone()).collect();
-        output.sets[0].affected = None;
-        let indexes: Vec<_> = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary_key)
-            .map(|(index, _)| index)
-            .collect();
-        let keys = output.sets[0]
-            .rows
-            .iter()
-            .map(|row| indexes.iter().map(|index| row[*index].clone()).collect())
-            .collect();
-        Ok(TableData {
-            output,
-            columns,
-            primary_keys,
-            keys,
-        })
+        Ok(self
+            .table_page(table, &super::TableBrowseOptions::default())
+            .await?
+            .data)
     }
 
     pub async fn update_cell(&mut self, change: &CellUpdate) -> Result<()> {
+        self.ensure_edit_transaction_safe().await?;
         if self.current_database().await?.as_deref() != Some(change.database.as_str()) {
             return Err(
                 EditRejected("当前数据库已改变，请选择此表所属数据库后再保存".into()).into(),
@@ -393,7 +357,7 @@ fn valid_hex(value: &str) -> bool {
         .is_some_and(|hex| hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn placeholder(engine: Engine, index: usize) -> String {
+pub(super) fn placeholder(engine: Engine, index: usize) -> String {
     match engine {
         Engine::MySql => "?".into(),
         Engine::Postgres => format!("${index}"),
@@ -401,7 +365,7 @@ fn placeholder(engine: Engine, index: usize) -> String {
     }
 }
 
-fn parameter_expression(engine: Engine, column: &TableColumn, index: usize) -> String {
+pub(super) fn parameter_expression(engine: Engine, column: &TableColumn, index: usize) -> String {
     let parameter = placeholder(engine, index);
     if column.kind == CellKind::Binary {
         return match engine {
@@ -411,12 +375,15 @@ fn parameter_expression(engine: Engine, column: &TableColumn, index: usize) -> S
         };
     }
     match engine {
+        // A bound string has lower collation precedence than the column. Casting it
+        // to CHAR can give both operands implicit precedence with different collations.
+        Engine::MySql if column.kind == CellKind::Text => parameter,
         Engine::Postgres => format!("CAST(CAST({parameter} AS text) AS {})", column.sql_type),
         _ => format!("CAST({parameter} AS {})", column.sql_type),
     }
 }
 
-fn display_expression(engine: Engine, column: &TableColumn) -> String {
+pub(super) fn display_expression(engine: Engine, column: &TableColumn) -> String {
     let name = engine.quote(&column.name);
     if column.kind == CellKind::Unsupported {
         return format!("CASE WHEN {name} IS NULL THEN NULL ELSE '[暂不支持的类型]' END");

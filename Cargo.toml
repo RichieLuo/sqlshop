@@ -26,6 +26,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Dwm"] }
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSColor"] }
 objc2-foundation = { version = "0.2.2", features = ["NSData", "NSThread"] }

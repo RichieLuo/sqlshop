@@ -4242,6 +4242,7 @@ dependencies = [
  "image",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+ "raw-window-handle",
  "rfd",
  "russh",
  "rust_decimal",
@@ -4253,6 +4254,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

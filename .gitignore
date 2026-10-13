@@ -4,3 +4,5 @@
 .env.*
 !.env.test.example
 !.env.example
+/.workbuddy
+/.claude
