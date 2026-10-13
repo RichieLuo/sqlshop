@@ -99,7 +99,7 @@ impl Session {
                 CAST(c.COLUMN_NAME AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci,
                 CAST(c.COLUMN_TYPE AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci,
                 CAST(c.DATA_TYPE AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci,
-                CASE WHEN c.EXTRA LIKE '%GENERATED%' OR c.EXTRA LIKE '%auto_increment%' OR t.TABLE_TYPE <> 'BASE TABLE' OR t.ENGINE <> 'InnoDB' THEN 'true' ELSE 'false' END,
+                CASE WHEN c.EXTRA LIKE '%VIRTUAL GENERATED%' OR c.EXTRA LIKE '%STORED GENERATED%' OR c.EXTRA LIKE '%auto_increment%' OR t.TABLE_TYPE <> 'BASE TABLE' OR t.ENGINE <> 'InnoDB' THEN 'true' ELSE 'false' END,
                 CASE WHEN c.COLUMN_KEY='PRI' THEN 'true' ELSE 'false' END
                 FROM information_schema.COLUMNS c JOIN information_schema.TABLES t
                 ON CONVERT(t.TABLE_SCHEMA USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(c.TABLE_SCHEMA USING utf8mb4) COLLATE utf8mb4_unicode_ci

@@ -6,10 +6,18 @@ mod ui;
 fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("SQLShop")
-        .with_decorations(false)
+        .with_decorations(!cfg!(target_os = "windows"))
         .with_icon(branding::icon_data())
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([900.0, 600.0]);
+    #[cfg(target_os = "macos")]
+    {
+        viewport = viewport
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
+            .with_titlebar_buttons_shown(true);
+    }
     if std::env::var_os("SQLSHOP_SCREENSHOT").is_some()
         && let Ok(size) = std::env::var("SQLSHOP_SCREENSHOT_SIZE")
         && let Some((width, height)) = size.split_once('x')

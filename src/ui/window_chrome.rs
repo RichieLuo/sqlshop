@@ -1,7 +1,12 @@
 use eframe::egui::{self, Color32};
 
 pub(super) const TITLE_HEIGHT: f32 = 44.0;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const CONTROL_WIDTH: f32 = 46.0;
+
+pub(super) const fn leading_inset() -> f32 {
+    if cfg!(target_os = "macos") { 78.0 } else { 0.0 }
+}
 
 pub(super) fn configure_window(cc: &eframe::CreationContext<'_>) {
     #[cfg(target_os = "windows")]
@@ -34,60 +39,77 @@ pub(super) fn configure_window(cc: &eframe::CreationContext<'_>) {
 }
 
 pub(super) fn paint_border(ctx: &egui::Context) {
-    let dark = ctx.style().visuals.dark_mode;
-    let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
-    let color = match (dark, focused) {
-        (false, true) => Color32::from_rgb(110, 145, 143),
-        (false, false) => Color32::from_rgb(155, 165, 170),
-        (true, true) => Color32::from_rgb(100, 155, 150),
-        (true, false) => Color32::from_rgb(95, 105, 115),
-    };
-    let rounded = ctx.data(|data| {
-        data.get_temp::<bool>(egui::Id::new("native-window-rounded"))
-            .unwrap_or(false)
-    });
-    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-    let radius = if rounded && !maximized {
-        (8.0 / ctx.pixels_per_point()).round() as u8
-    } else {
-        0
-    };
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("window-border"),
-    ))
-    .rect_stroke(
-        ctx.viewport_rect(),
-        radius,
-        egui::Stroke::new(1.5, color),
-        egui::StrokeKind::Inside,
-    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ctx;
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let dark = ctx.style().visuals.dark_mode;
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        let color = match (dark, focused) {
+            (false, true) => Color32::from_rgb(110, 145, 143),
+            (false, false) => Color32::from_rgb(155, 165, 170),
+            (true, true) => Color32::from_rgb(100, 155, 150),
+            (true, false) => Color32::from_rgb(95, 105, 115),
+        };
+        let rounded = ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::new("native-window-rounded"))
+                .unwrap_or(false)
+        });
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        let radius = if rounded && !maximized {
+            (8.0 / ctx.pixels_per_point()).round() as u8
+        } else {
+            0
+        };
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("window-border"),
+        ))
+        .rect_stroke(
+            ctx.viewport_rect(),
+            radius,
+            egui::Stroke::new(1.5, color),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 pub(super) fn controls(ui: &mut egui::Ui) {
-    let maximized = ui.input(|input| input.viewport().maximized.unwrap_or(false));
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for (control, label, command) in [
-            (WindowControl::Close, "关闭", egui::ViewportCommand::Close),
-            (
-                WindowControl::Maximize { maximized },
-                if maximized { "还原" } else { "最大化" },
-                egui::ViewportCommand::Maximized(!maximized),
-            ),
-            (
-                WindowControl::Minimize,
-                "最小化",
-                egui::ViewportCommand::Minimized(true),
-            ),
-        ] {
-            if control_button(ui, control).on_hover_text(label).clicked() {
-                ui.ctx().send_viewport_cmd(command);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let _ = ui;
+        return;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let maximized = ui.input(|input| input.viewport().maximized.unwrap_or(false));
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (control, label, command) in [
+                (WindowControl::Close, "关闭", egui::ViewportCommand::Close),
+                (
+                    WindowControl::Maximize { maximized },
+                    if maximized { "还原" } else { "最大化" },
+                    egui::ViewportCommand::Maximized(!maximized),
+                ),
+                (
+                    WindowControl::Minimize,
+                    "最小化",
+                    egui::ViewportCommand::Minimized(true),
+                ),
+            ] {
+                if control_button(ui, control).on_hover_text(label).clicked() {
+                    ui.ctx().send_viewport_cmd(command);
+                }
             }
-        }
-    });
+        });
+    }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[derive(Clone, Copy)]
 enum WindowControl {
     Minimize,
@@ -95,6 +117,7 @@ enum WindowControl {
     Close,
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_WIDTH, TITLE_HEIGHT),
@@ -179,6 +202,7 @@ fn control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Response {
 mod tests {
     use super::*;
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn render(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
@@ -202,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn caption_buttons_send_commands_from_the_top_right_edge() {
         for (offset, expected) in [
             (0.5, egui::ViewportCommand::Close),

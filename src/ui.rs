@@ -352,7 +352,7 @@ impl App {
         if app.screenshot_path.is_some()
             && matches!(
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
-                Ok("catalog" | "results")
+                Ok("catalog" | "results" | "cell-edit")
             )
         {
             let profile = Profile {
@@ -393,7 +393,10 @@ impl App {
             }
             app.sessions.insert(app.profiles[0].id, session);
             app.status = "数据库树界面测试 · 示例数据，未建立真实连接".into();
-            if std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref() == Ok("results") {
+            if matches!(
+                std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
+                Ok("results" | "cell-edit")
+            ) {
                 let tab = &mut app.tabs[app.active_tab];
                 let columns: Vec<_> = ["id", "name", "email", "note", "amount", "created_at"]
                     .into_iter()
@@ -461,6 +464,29 @@ impl App {
                 tab.query_started = true;
                 tab.selected_cell = Some((1, 1));
                 app.editor_height = Some(100.0);
+                if std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref() == Ok("cell-edit") {
+                    app.cell_editor = Some(CellEditor {
+                        tab: tab.id,
+                        connection: app.profiles[0].id,
+                        change: CellUpdate {
+                            database: "app_dev".into(),
+                            table: Table {
+                                schema: "app_dev".into(),
+                                name: "users".into(),
+                                kind: "BASE TABLE".into(),
+                            },
+                            primary_keys: vec!["id".into()],
+                            key_values: vec![Some("2".into())],
+                            column: "note".into(),
+                            original: Some("支持双击编辑单元格".into()),
+                            value: None,
+                        },
+                        text: "支持编辑长文本、NULL 和二进制值\n点击保存后更新对应行并刷新表数据"
+                            .into(),
+                        is_null: false,
+                        focus: true,
+                    });
+                }
             }
         }
         app
@@ -1720,17 +1746,22 @@ impl App {
                 ));
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.checkbox(&mut editor.is_null, "设为 NULL");
-                    let response = ui.add_enabled(
-                        !editor.is_null,
-                        egui::TextEdit::multiline(&mut editor.text)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(6),
-                    );
-                    if editor.focus {
-                        response.request_focus();
-                        editor.focus = false;
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("cell-editor-text")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            let response = ui.add_enabled(
+                                !editor.is_null,
+                                egui::TextEdit::multiline(&mut editor.text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(6),
+                            );
+                            if editor.focus {
+                                response.request_focus();
+                                editor.focus = false;
+                            }
+                        });
                     ui.label(
                         RichText::new("保存后立即写入这一行 · 空文本与 NULL 分开处理")
                             .small()
@@ -2029,6 +2060,7 @@ impl eframe::App for App {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.horizontal(|ui| {
                     ui.set_height(window_chrome::TITLE_HEIGHT);
+                    ui.add_space(window_chrome::leading_inset());
                     let brand = ui.allocate_ui_with_layout(
                         egui::vec2(160.0, window_chrome::TITLE_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -2653,12 +2685,17 @@ fn grid_cell(ui: &mut egui::Ui, text: RichText, selected: bool, header: bool) ->
             accent(ui).gamma_multiply(if selected { 0.16 } else { 0.07 }),
         );
     }
-    let response = ui.add_sized(
-        rect.size(),
-        egui::Label::new(text)
-            .selectable(false)
-            .truncate()
-            .sense(egui::Sense::click()),
+    let (_, response) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        (rect.width() - 16.0).max(1.0),
+        egui::TextStyle::Body,
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        ui.visuals().text_color(),
     );
     grid_cell_border(ui, rect);
     if selected {
@@ -3471,6 +3508,88 @@ fn install_font(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_cell_double_click_uses_snapshot_keys_and_respects_read_only_mode() {
+        let ctx = egui::Context::default();
+        let mut tab = QueryTab::new(1);
+        let connection = Uuid::new_v4();
+        tab.table_target = Some(TableTarget {
+            connection,
+            database: "app_dev".into(),
+            schema: "public".into(),
+            name: "users".into(),
+        });
+        tab.output = Some(QueryOutput {
+            sets: vec![sqlshop::model::ResultSet {
+                columns: vec!["id".into(), "name".into()],
+                rows: vec![vec![Some("7".into()), Some("original".into())]],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        tab.table_data = Some(TableData {
+            output: QueryOutput::default(),
+            primary_keys: vec!["id".into()],
+            keys: vec![vec![Some("7".into())]],
+            columns: ["id", "name"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| sqlshop::model::TableColumn {
+                    name: name.into(),
+                    declared_type: "text".into(),
+                    sql_type: "text".into(),
+                    kind: sqlshop::model::CellKind::Text,
+                    editable: true,
+                    primary_key: index == 0,
+                })
+                .collect(),
+        });
+        let mut frame = |time, pressed: Option<bool>, can_edit| {
+            let position = egui::pos2(100.0, 80.0);
+            let mut events = vec![egui::Event::PointerMoved(position)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let mut editor = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        editor = result_grid(ui, &mut tab, can_edit);
+                    });
+                },
+            );
+            editor
+        };
+        frame(0.0, None, true);
+        frame(0.02, Some(true), true);
+        assert!(frame(0.03, Some(false), true).is_none());
+        frame(0.12, Some(true), true);
+        let editor =
+            frame(0.13, Some(false), true).expect("double click should edit the clicked cell");
+        assert_eq!(editor.connection, connection);
+        assert_eq!(editor.change.column, "id");
+        assert_eq!(editor.change.key_values, [Some("7".into())]);
+        assert_eq!(editor.change.original.as_deref(), Some("7"));
+        frame(1.0, Some(true), false);
+        assert!(frame(1.01, Some(false), false).is_none());
+        frame(1.1, Some(true), false);
+        assert!(frame(1.11, Some(false), false).is_none());
+    }
 
     #[test]
     fn theme_text_colors_remain_readable_in_light_and_dark_modes() {

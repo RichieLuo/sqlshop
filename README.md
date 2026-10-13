@@ -64,6 +64,8 @@ cargo run --locked
 - SQL 编辑区与结果区之间可上下拖动分隔线，双击分隔线恢复默认高度。
 - 未执行的查询标签只显示 SQL 编辑区，使用全部可用高度；开始执行后才显示结果区和分隔线，各标签独立保留这个状态。
 - 查看多个结果集，区分 NULL 与空字符串，复制单元格，导出当前结果集为 CSV。
+- 结果表格随窗口宽度铺开，支持列宽拖动、单元格选中和双向滚动。
+- 双击打开表后，可双击或右键编辑单元格，支持文本、数值、日期时间、NULL 和 `0x` 十六进制二进制值；点击保存后写入数据库并刷新。支持单列和组合主键。
 - 后台执行数据库操作，直连超时 15 秒，SSH + 数据库连接总超时 30 秒，查询超时 60 秒。
 - 中文界面，默认跟随系统外观；右上角可选择“跟随系统 / 浅色 / 深色”。
 
@@ -123,6 +125,8 @@ PostgreSQL 协议必须连接到一个具体数据库才能读取服务器目录
 
 这是一版可继续扩展的 MVP，已支持有限单格编辑和只读表结构查看；尚未实现表结构设计、SQL 自动补全、事务管理按钮、新增/删除行和数据导入。数据库列表按账号权限返回，选择数据库时会验证访问权限；当前同时使用一个活动数据库会话。MySQL 数据库节点下直接显示表，PostgreSQL / SQL Server 按 schema 分组。
 
+表数据编辑只对通过表目录打开、具有可用主键的表启用，前 200 行按主键排序加载。视图、没有主键的表、生成列、自动生成的标识列、专有未支持类型及 MySQL 非 InnoDB 表只读。普通 SQL 查询结果只读；表标签中手动运行 SQL 后，可以通过“刷新表数据”恢复可编辑的表视图。单元格保存使用绑定参数和数据库类型转换，以完整主键定位行，并检查该单元格的原值；匹配到零行或多行时回滚并报告冲突。每次保存是独立事务，保存成功后刷新表数据；当前不支持新增或删除行。
+
 SQL 原文发送到数据库，写入语句遵循数据库自身的自动提交规则，不会自动包装为事务。可恢复的 SQL 服务器错误保留会话，以便修正或执行 ROLLBACK；连接/协议故障及超时关闭活动连接。批处理之前的语句可能已经提交，不应直接重试整批写入。单格保存有独立自动事务及前述混用保护。
 
 SQL Server 首版使用 SQL Server 用户名密码认证，不支持 Windows 集成认证及命名实例自动发现，请提供 TCP 主机和端口。SQL Server 的批处理结果暂不提供受影响行数。MySQL / PostgreSQL 的零行结果暂不能保留列标题。
@@ -148,10 +152,12 @@ src/db/structure.rs 三引擎结构元数据和有限 DDL 重建
 src/ssh.rs        SSH 认证、主机密钥校验及隧道生命周期
 src/db/mod.rs     MySQL / PostgreSQL / SQL Server 驱动
 src/db/values.rs  数据库值转展示文本
+src/db/table_edit.rs  表结构、可编辑快照、主键定位及单元格事务保存
 tests/core.rs     配置、SQL 引用、CSV 和工作线程测试
 tests/ssh.rs      本机自动启动的 SSH 服务及转发、认证、清理测试
 tests/database_navigation.rs  PostgreSQL 协议客户端与数据库导航测试
 tests/databases.rs  真实数据库联测（默认跳过）
+tests/table_edit.rs  本机测试数据库中的单元格编辑联测（默认跳过）
 ```
 
 界面使用 [egui / eframe](https://docs.rs/eframe/0.33.3/eframe/)，MySQL / PostgreSQL 使用 [SQLx](https://docs.rs/sqlx/0.8.6/sqlx/)，SQL Server 使用 [Tiberius](https://docs.rs/tiberius/0.12.3/tiberius/)，SSH 使用 [Russh](https://docs.rs/russh/0.64.1/russh/)。
@@ -226,3 +232,11 @@ SQLSHOP_TEST_NATIVE_ICON=1 cargo test --locked --test macos_icon
 ```
 
 设置 `SQLSHOP_SCREENSHOT_VIEW=catalog` 可截图数据库目录树的布局测试；该模式使用明确标记的示例数据，不建立真实数据库连接。
+
+设置 `SQLSHOP_SCREENSHOT_VIEW=results` 可截图结果表格，`cell-edit` 可截图单元格编辑窗口，`SQLSHOP_SCREENSHOT_SIZE=1920x1080` 可检查大窗口布局；只在截图模式中生效，使用示例数据。
+
+单元格编辑联测只对本项目独立 Docker 实例运行，创建临时表验证组合主键、中文、空字符串、NULL、小数、日期、二进制、并发修改及失败回滚，完成后删除临时表：
+
+```sh
+python3 scripts/test-docker.py test-edit mysql postgres sqlserver
+```
