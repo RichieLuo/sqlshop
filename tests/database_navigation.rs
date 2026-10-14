@@ -4,7 +4,7 @@ use anyhow::Result;
 use sqlshop::{
     db::Session,
     model::{Credentials, Engine, Profile},
-    worker::{Request, Response, Worker},
+    worker::{QueryRequest, QueryResponse, QueryWorker, Request, Response, Worker},
 };
 use std::{
     net::SocketAddr,
@@ -99,7 +99,9 @@ async fn serve(
         }
         anyhow::ensure!(tag == b'Q', "Unexpected protocol tag {tag}");
         let sql = String::from_utf8_lossy(&body);
-        if sql.contains("sqlshop_slow_query") {
+        if sql.contains("sqlshop_drop_transport") {
+            return Ok(());
+        } else if sql.contains("sqlshop_slow_query") {
             slow_started.notify_one();
             slow_release.notified().await;
             rows(&mut socket, &["origin"], &[vec![database.clone()]]).await?;
@@ -191,6 +193,46 @@ impl Drop for Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_transport_failure_discards_only_its_session_without_retry() -> Result<()> {
+    let fixture = Fixture::start(&["postgres", "app"]).await?;
+    let profile = fixture.profile();
+    let tab = uuid::Uuid::new_v4();
+    let target = sqlshop::workspace::QueryTarget {
+        schema: None,
+        connection: profile.id,
+        database: Some("app".into()),
+    };
+    let worker = QueryWorker::start(tab, || {});
+    let receive = || worker.receiver.recv_timeout(Duration::from_secs(5));
+    let send = |sql: &str| {
+        worker.send(QueryRequest::Run {
+            profile: profile.clone(),
+            credentials: Credentials::default(),
+            target: target.clone(),
+            sql: sql.into(),
+        })
+    };
+    send("SELECT 1")?;
+    assert!(
+        matches!(receive()?, QueryResponse::Finished { tab: origin, database: Some(db), .. } if origin == tab && db == "app")
+    );
+    let before = fixture.attempts.lock().unwrap().len();
+    send("SELECT sqlshop_drop_transport")?;
+    assert!(
+        matches!(receive()?, QueryResponse::Error { tab: origin, connected: false, database: None, .. } if origin == tab)
+    );
+    assert_eq!(fixture.attempts.lock().unwrap().len(), before);
+    assert!(worker.receiver.try_recv().is_err());
+    // Only a new, explicitly submitted operation establishes a fresh session.
+    send("SELECT 1")?;
+    assert!(
+        matches!(receive()?, QueryResponse::Finished { tab: origin, database: Some(db), .. } if origin == tab && db == "app")
+    );
+    assert_eq!(fixture.attempts.lock().unwrap().len(), before + 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_discovers_and_selects_databases_without_a_configured_database() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let fixture = Fixture::start(&["postgres", "app_b", "app_a"]).await?;
@@ -244,10 +286,12 @@ async fn simultaneous_workers_run_independently_and_preserve_targets() -> Result
     let profile_a = fixture.profile();
     let profile_b = fixture.profile();
     let target_a = QueryTarget {
+        schema: None,
         connection: profile_a.id,
         database: Some("app_a".into()),
     };
     let target_b = QueryTarget {
+        schema: None,
         connection: profile_b.id,
         database: Some("app_b".into()),
     };
@@ -346,14 +390,17 @@ async fn worker_keeps_server_connection_after_failed_database_selection() -> Res
     let tab = uuid::Uuid::new_v4();
     for target in [
         sqlshop::workspace::QueryTarget {
+            schema: None,
             connection: uuid::Uuid::new_v4(),
             database: Some("app".into()),
         },
         sqlshop::workspace::QueryTarget {
+            schema: None,
             connection,
             database: Some("other".into()),
         },
         sqlshop::workspace::QueryTarget {
+            schema: None,
             connection,
             database: None,
         },
@@ -370,6 +417,7 @@ async fn worker_keeps_server_connection_after_failed_database_selection() -> Res
     worker.send(Request::RunQuery {
         tab,
         target: sqlshop::workspace::QueryTarget {
+            schema: None,
             connection,
             database: Some("app".into()),
         },

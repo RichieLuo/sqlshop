@@ -2,6 +2,7 @@
 use sqlshop::{
     db::{ROW_LIMIT, Session, connection_error},
     model::{Credentials, Engine, Profile},
+    sql_editor::{byte_to_char_index, current_statement_range},
 };
 
 #[path = "support/ssh_gateway.rs"]
@@ -125,6 +126,25 @@ fn exercise(engine: Engine, prefix: &str, sql: &str, many_rows: &str) {
             assert_eq!(multi.sets.len(), 2);
             assert_eq!(multi.sets[0].rows[0][0].as_deref(), Some("1"));
             assert_eq!(multi.sets[1].rows[0][0].as_deref(), Some("2"));
+            // Execute the selected statement through each real driver, including
+            // SSH. A quoted semicolon and a Unicode prefix must not send a
+            // neighbouring statement to the database.
+            let document = "-- 中文🦀\nSELECT 'a;''b' AS marker;\nSELECT 2 AS marker;";
+            for (byte_cursor, expected) in [
+                (document.find("'a;").unwrap(), "a;'b"),
+                (document.find("SELECT 2").unwrap(), "2"),
+            ] {
+                let range = current_statement_range(
+                    document,
+                    byte_to_char_index(document, byte_cursor),
+                    engine,
+                )
+                .unwrap()
+                .unwrap();
+                let selected = session.query(&document[range]).await.unwrap();
+                assert_eq!(selected.sets.len(), 1);
+                assert_eq!(selected.sets[0].rows[0][0].as_deref(), Some(expected));
+            }
             let limited = session.query(many_rows).await.unwrap();
             assert_eq!(limited.sets[0].rows.len(), ROW_LIMIT);
             assert!(limited.sets[0].truncated);

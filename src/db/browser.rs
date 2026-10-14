@@ -77,12 +77,11 @@ pub struct TableStructure {
     pub ddl: String,
 }
 
-fn page_sql(
+fn browse_predicates(
     engine: Engine,
-    table: &Table,
     columns: &[TableColumn],
     options: &TableBrowseOptions,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>)> {
     ensure!(
         (1..=1000).contains(&options.page_size),
         "每页行数必须在 1 到 1000 之间"
@@ -165,6 +164,22 @@ fn page_sql(
             ));
         }
     }
+    Ok((predicates, parameters))
+}
+
+fn page_sql(
+    engine: Engine,
+    table: &Table,
+    columns: &[TableColumn],
+    options: &TableBrowseOptions,
+) -> Result<(String, Vec<String>)> {
+    let (predicates, parameters) = browse_predicates(engine, columns, options)?;
+    let find = |name: &str| {
+        columns
+            .iter()
+            .find(|column| column.name == name)
+            .context("筛选或排序列已不存在，请刷新表结构")
+    };
     let mut order = Vec::new();
     let mut seen = Vec::new();
     for sort in &options.sorts {
@@ -257,12 +272,62 @@ fn set_table_metadata(set: &mut ResultSet, columns: &[TableColumn]) {
 }
 
 impl Session {
+    /// COUNT is requested only by explicit last-page navigation. The count and
+    /// read do not lock the table; concurrent writes may change the last page.
+    pub async fn table_last_page(
+        &mut self,
+        table: &Table,
+        options: &TableBrowseOptions,
+    ) -> Result<(TablePage, u64)> {
+        let columns = self.table_columns(table).await?;
+        let mut last_options = options.clone();
+        last_options.offset = 0;
+        // Validate sorts as well as predicates before a potentially costly count.
+        let _ = page_sql(self.profile.engine, table, &columns, &last_options)
+            .map_err(|error| EditRejected(error.to_string()))?;
+        let (predicates, parameters) =
+            browse_predicates(self.profile.engine, &columns, &last_options)
+                .map_err(|error| EditRejected(error.to_string()))?;
+        let count = if self.profile.engine == Engine::SqlServer {
+            "COUNT_BIG(*)"
+        } else {
+            "COUNT(*)"
+        };
+        let mut sql = format!(
+            "SELECT {count} AS row_count FROM {}.{}",
+            self.profile.engine.quote(&table.schema),
+            self.profile.engine.quote(&table.name)
+        );
+        if !predicates.is_empty() {
+            sql.push_str(&format!(" WHERE {}", predicates.join(" AND ")));
+        }
+        let parameters = parameters.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self.parameter_query(&sql, &parameters).await?;
+        let count = output
+            .sets
+            .first()
+            .and_then(|set| set.rows.first())
+            .and_then(|row| row.first())
+            .and_then(|value| value.as_deref())
+            .context("未返回筛选后的记录总数")?
+            .parse::<u64>()
+            .context("记录总数格式无效")?;
+        let size = u64::from(last_options.page_size);
+        let offset = (count.saturating_sub(1) / size)
+            .checked_mul(size)
+            .context("末页偏移量过大")?;
+        last_options.offset = offset;
+        let page = self.table_page(table, &last_options).await?;
+        Ok((page, offset))
+    }
+
     pub async fn table_page(
         &mut self,
         table: &Table,
         options: &TableBrowseOptions,
     ) -> Result<TablePage> {
         let columns = self.table_columns(table).await?;
+        let writable = self.table_writable(table).await?;
         let (sql, parameters) = page_sql(self.profile.engine, table, &columns, options)
             .map_err(|error| EditRejected(error.to_string()))?;
         let refs = parameters.iter().map(String::as_str).collect::<Vec<_>>();
@@ -291,11 +356,87 @@ impl Session {
                 columns,
                 primary_keys,
                 keys,
+                writable,
             },
             has_more,
             sql,
             parameters,
         })
+    }
+
+    pub async fn export_table_csv(
+        &mut self,
+        database: &str,
+        table: &Table,
+        options: &TableBrowseOptions,
+        path: &std::path::Path,
+    ) -> Result<u64> {
+        if self.current_database().await?.as_deref() != Some(database) {
+            return Err(EditRejected("当前数据库已改变，导出未执行".into()).into());
+        }
+        let columns = self.table_columns(table).await?;
+        ensure!(
+            columns.iter().all(|c| c.kind != CellKind::Unsupported),
+            "此表包含无法无损导出的列"
+        );
+        let mut options = options.clone();
+        options.offset = 0;
+        options.page_size = 1000;
+        ensure!(
+            columns.iter().any(|c| c.primary_key),
+            "完整导出要求主键以保证分页顺序稳定"
+        );
+        let _ = page_sql(self.profile.engine, table, &columns, &options)?;
+        ensure!(path.file_name().is_some(), "请选择 CSV 文件路径");
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => ensure!(metadata.file_type().is_file(), "导出目标不是普通文件"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .all(|c| c.kind != CellKind::Unsupported),
+            "主键类型不支持稳定导出"
+        );
+        let temporary =
+            path.with_extension(format!("sqlshop-{}.tmp", uuid::Uuid::new_v4().simple()));
+        let result = async {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create_new(&temporary)?);
+            crate::model::write_csv_row(
+                &mut writer,
+                &columns
+                    .iter()
+                    .map(|c| Some(c.name.clone()))
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut total = 0u64;
+            loop {
+                let page = self.table_page(table, &options).await?;
+                for row in &page.data.output.sets[0].rows {
+                    crate::model::write_csv_row(&mut writer, row)?;
+                    total += 1;
+                }
+                if !page.has_more {
+                    break;
+                }
+                options.offset = options
+                    .offset
+                    .checked_add(page.data.output.sets[0].rows.len() as u64)
+                    .context("导出分页偏移量溢出")?;
+            }
+            std::io::Write::flush(&mut writer)?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            std::fs::rename(&temporary, path)?;
+            Ok(total)
+        }
+        .await;
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub(super) async fn ensure_edit_transaction_safe(&mut self) -> Result<()> {
@@ -406,6 +547,7 @@ mod tests {
                 output: Default::default(),
                 columns: vec![],
                 primary_keys: vec![],
+                writable: false,
                 keys: vec![],
             },
             has_more: false,

@@ -240,6 +240,7 @@ mod tests {
         let store = CatalogStore::new(dir.path().into());
         let mut catalog = Catalog::default();
         let target = Some(QueryTarget {
+            schema: None,
             connection: Uuid::new_v4(),
             database: Some("生产库".into()),
         });

@@ -54,14 +54,16 @@ impl App {
     pub(super) fn modal_open(&self) -> bool {
         self.form.is_some()
             || self.confirm_delete.is_some()
+            || self.schema_dialog.is_some()
+            || self.delete_rows.is_some()
             || self.export_path.is_some()
-            || self.cell_editor.is_some()
+            || self.csv_import.is_some()
             || self.confirm_tab_action.is_some()
             || self.confirm_rebind.is_some()
             || self.confirm_request.is_some()
+            || self.confirm_sql.is_some()
             || self.confirm_exit
             || self.history_open
-            || self.structure.is_some()
             || self.library_open
             || self.catalog_dialog.is_some()
     }
@@ -102,7 +104,11 @@ impl App {
             .selected_session()
             .is_some_and(|s| s.active_database.is_some());
         let writable = self.catalog_store.is_some();
-        let sql_tab = self.tabs[self.active_tab].table_target.is_none();
+        let sql_tab = !self.browser_visible
+            && !self.tabs[self.active_tab].management_document()
+            && self.table_create.is_none()
+            && (self.tabs[self.active_tab].table_target.is_none()
+                && self.tabs[self.active_tab].definition.is_none());
         let dark = ctx.style().visuals.dark_mode;
         let divider = egui::Stroke::new(
             1.0,
@@ -255,6 +261,26 @@ impl App {
                                 self.execute();
                                 ui.close();
                             }
+                            if ui
+                                .add_enabled(
+                                    sql_tab && self.can_execute(),
+                                    egui::Button::new("执行当前语句  Ctrl/⌘+Shift+Enter"),
+                                )
+                                .clicked()
+                            {
+                                self.execute_scope(SqlExecutionScope::CurrentStatement);
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    sql_tab && self.can_execute(),
+                                    egui::Button::new("执行全文"),
+                                )
+                                .clicked()
+                            {
+                                self.execute_scope(SqlExecutionScope::All);
+                                ui.close();
+                            }
                             ui.separator();
                             if ui
                                 .add_enabled(
@@ -284,7 +310,22 @@ impl App {
                                 ui.close();
                             }
                         });
+                        self.management_menu(ui);
                         ui.menu_button("视图", |ui| {
+                            ui.checkbox(&mut self.view.navigation, "导航栏  ⌘/Ctrl+1");
+                            if ui
+                                .checkbox(&mut self.inspector_visible, "信息栏  ⌘/Ctrl+2")
+                                .changed()
+                            {
+                                self.view.information_force = self.inspector_visible;
+                                if self.inspector_visible {
+                                    self.view.focus = false;
+                                }
+                            }
+                            ui.checkbox(&mut self.view.toolbar, "工具栏");
+                            ui.checkbox(&mut self.view.status, "状态栏");
+                            ui.checkbox(&mut self.view.focus, "专注模式");
+                            ui.separator();
                             for (theme, label) in [
                                 (egui::ThemePreference::System, "跟随系统"),
                                 (egui::ThemePreference::Light, "浅色"),
@@ -300,6 +341,9 @@ impl App {
                     });
                 });
             });
+        if !self.view.toolbar || self.view.focus {
+            return;
+        }
         egui::TopBottomPanel::top("main-toolbar")
             .frame(
                 egui::Frame::new()
@@ -377,7 +421,9 @@ impl App {
 
     pub(super) fn open_saved_query(&mut self, query: SavedQuery) {
         // Always create a new editor, never overwrite a dirty draft, connect or run.
-        self.apply_ui_tab_action(TabAction::New);
+        if !self.apply_ui_tab_action(TabAction::New) {
+            return;
+        }
         self.tabs[self.active_tab] = query_tab_from_saved(query, self.tabs[self.active_tab].id);
         self.status = "已在新标签打开保存的查询，保留原执行目标；未连接、未执行".into();
         self.error = false;
@@ -395,7 +441,7 @@ impl App {
                         if self.catalog_store.is_none() { ui.colored_label(Color32::from_rgb(230, 130, 90), "查询库不可用，修改已禁用；请检查状态栏错误并重启。"); }
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.library_search).hint_text("搜索查询名称 / SQL"));
-                            if ui.add_enabled(self.catalog_store.is_some() && self.tabs[self.active_tab].table_target.is_none(), egui::Button::new("保存当前查询…")).clicked() { self.save_to_library(None); }
+                            if ui.add_enabled(self.catalog_store.is_some() && (self.tabs[self.active_tab].table_target.is_none() && self.tabs[self.active_tab].definition.is_none()), egui::Button::new("保存当前查询…")).clicked() { self.save_to_library(None); }
                         });
                         let needle = self.library_search.to_lowercase();
                         egui::ScrollArea::vertical().id_salt("saved-query-list").max_height(280.0).show(ui, |ui| {
@@ -408,7 +454,7 @@ impl App {
                                         if ui.button("打开").clicked() { selected_query = Some(query.clone()); }
                                         ui.add_enabled_ui(self.catalog_store.is_some(), |ui| {
                                             if ui.button("重命名…").clicked() { self.catalog_dialog = Some(CatalogDialog::Query { id: Some(query.id), name: query.name.clone(), sql: query.sql.clone(), target: query.target.clone() }); }
-                                            if ui.add_enabled(self.tabs[self.active_tab].table_target.is_none(), egui::Button::new("用当前查询更新…")).on_hover_text("确认后覆盖此命名查询的 SQL 和执行目标，不修改 SQL 文件").clicked() { self.save_to_library(Some(query.id)); }
+                                            if ui.add_enabled(self.tabs[self.active_tab].table_target.is_none() && self.tabs[self.active_tab].definition.is_none(), egui::Button::new("用当前查询更新…")).on_hover_text("确认后覆盖此命名查询的 SQL 和执行目标，不修改 SQL 文件").clicked() { self.save_to_library(Some(query.id)); }
                                             if ui.button("删除…").clicked() { self.catalog_dialog = Some(CatalogDialog::DeleteQuery(query.id, query.name.clone())); }
                                         });
                                     });
@@ -555,6 +601,7 @@ mod tests {
     #[test]
     fn library_open_preserves_missing_target_without_executing_or_claiming_a_file_save() {
         let target = Some(QueryTarget {
+            schema: None,
             connection: Uuid::new_v4(),
             database: Some("生产".into()),
         });

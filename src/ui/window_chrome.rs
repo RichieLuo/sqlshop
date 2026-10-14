@@ -1,4 +1,6 @@
-use eframe::egui::{self, Color32};
+use eframe::egui;
+#[cfg(target_os = "windows")]
+use eframe::egui::Color32;
 
 pub(super) const TITLE_HEIGHT: f32 = 44.0;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -9,6 +11,9 @@ pub(super) const fn leading_inset() -> f32 {
 }
 
 pub(super) fn configure_window(cc: &eframe::CreationContext<'_>) {
+    #[cfg(target_os = "macos")]
+    set_miniwindow_image(cc);
+
     #[cfg(target_os = "windows")]
     {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -38,11 +43,99 @@ pub(super) fn configure_window(cc: &eframe::CreationContext<'_>) {
     let _ = cc;
 }
 
+#[cfg(target_os = "macos")]
+fn set_miniwindow_image(cc: &eframe::CreationContext<'_>) {
+    use objc2::ClassType as _;
+    use objc2_app_kit::{NSImage, NSView};
+    use objc2_foundation::NSSize;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    let view = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
+    let Some(window) = view.window() else {
+        return;
+    };
+
+    let icon = crate::branding::icon_data();
+    let Some(bitmap) = miniwindow_bitmap(&icon) else {
+        return;
+    };
+    let image = unsafe {
+        NSImage::initWithSize(
+            NSImage::alloc(),
+            NSSize::new(icon.width as f64, icon.height as f64),
+        )
+    };
+    unsafe { image.addRepresentation(&bitmap) };
+    unsafe { window.setMiniwindowImage(Some(&image)) };
+}
+
+#[cfg(target_os = "macos")]
+fn miniwindow_bitmap(
+    icon: &egui::IconData,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSBitmapImageRep>> {
+    use objc2::ClassType as _;
+    use objc2_app_kit::{NSBitmapImageRep, NSDeviceRGBColorSpace};
+    let row_bytes = icon.width.checked_mul(4)?;
+    let length = row_bytes.checked_mul(icon.height)? as usize;
+    if length == 0 || icon.rgba.len() != length {
+        return None;
+    }
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            icon.width as isize,
+            icon.height as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            row_bytes as isize,
+            32,
+        )
+    }?;
+    let pixels = unsafe { bitmap.bitmapData() };
+    if pixels.is_null() {
+        return None;
+    }
+    // A null planes argument makes AppKit own the allocation. The image can
+    // retain this representation after the source IconData has been dropped.
+    unsafe { std::ptr::copy_nonoverlapping(icon.rgba.as_ptr(), pixels, length) };
+    Some(bitmap)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod bitmap_tests {
+    #[test]
+    fn miniwindow_pixels_outlive_the_source_buffer() {
+        use super::miniwindow_bitmap;
+        use eframe::egui;
+        let expected = vec![255, 0, 0, 255, 0, 255, 0, 255];
+        let icon = egui::IconData {
+            rgba: expected.clone(),
+            width: 2,
+            height: 1,
+        };
+        let bitmap = miniwindow_bitmap(&icon).unwrap();
+        let pixels = unsafe { bitmap.bitmapData() };
+        assert_ne!(pixels.cast_const(), icon.rgba.as_ptr());
+        drop(icon);
+        let actual = unsafe { std::slice::from_raw_parts(pixels, expected.len()) };
+        assert_eq!(actual, expected);
+    }
+}
+
 pub(super) fn paint_border(ctx: &egui::Context) {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = ctx;
-        return;
     }
     #[cfg(target_os = "windows")]
     {
@@ -81,7 +174,6 @@ pub(super) fn controls(ui: &mut egui::Ui) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let _ = ui;
-        return;
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -198,11 +290,27 @@ fn control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Response {
     response
 }
 
-#[cfg(test)]
+pub(super) fn drag_area(ui: &mut egui::Ui) {
+    let response = ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
+    drag_response(&response);
+}
+
+pub(super) fn drag_response(response: &egui::Response) {
+    let ctx = &response.ctx;
+    if response.double_clicked() {
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    } else if response.is_pointer_button_down_on()
+        && ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "macos", target_os = "linux"))))]
 mod tests {
     use super::*;
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn render(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
@@ -226,7 +334,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn caption_buttons_send_commands_from_the_top_right_edge() {
         for (offset, expected) in [
             (0.5, egui::ViewportCommand::Close),
@@ -263,22 +370,5 @@ mod tests {
                     .contains(&expected)
             );
         }
-    }
-}
-
-pub(super) fn drag_area(ui: &mut egui::Ui) {
-    let response = ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
-    drag_response(&response);
-}
-
-pub(super) fn drag_response(response: &egui::Response) {
-    let ctx = &response.ctx;
-    if response.double_clicked() {
-        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-    } else if response.is_pointer_button_down_on()
-        && ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
-    {
-        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 }

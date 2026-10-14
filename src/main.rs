@@ -4,6 +4,9 @@ mod branding;
 mod ui;
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "macos")]
+    branding::enable_miniwindow_icons();
+
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("SQLShop")
         .with_decorations(!cfg!(target_os = "windows"))

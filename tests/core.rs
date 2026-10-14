@@ -288,7 +288,17 @@ fn csv_preserves_quoted_multiline_unicode_empty_and_null_values() {
     let row = reader.records().next().unwrap().unwrap();
     assert_eq!(
         row.iter().collect::<Vec<_>>(),
-        ["中文,\"quoted\"\nnext line", "", "NULL"]
+        ["中文,\"quoted\"\nnext line", "", ""]
+    );
+    let bytes = std::fs::read(directory.path().join("result.csv")).unwrap();
+    let (_, parsed) = sqlshop::model::parse_nullable_csv(&bytes).unwrap();
+    assert_eq!(
+        parsed[0],
+        [
+            sqlshop::model::InsertValue::Text("中文,\"quoted\"\nnext line".into()),
+            sqlshop::model::InsertValue::Text(String::new()),
+            sqlshop::model::InsertValue::Null,
+        ]
     );
 }
 

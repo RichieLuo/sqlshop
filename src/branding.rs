@@ -1,5 +1,20 @@
 use eframe::egui::{self, IconData};
 
+#[cfg(target_os = "macos")]
+pub fn enable_miniwindow_icons() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSString, NSUserDefaults};
+
+    let defaults = unsafe { NSUserDefaults::standardUserDefaults() };
+    let key = NSString::from_str("AppleDockIconEnabled");
+    let value = Retained::into_super(Retained::into_super(NSNumber::numberWithBool(true)));
+    let registration = NSDictionary::<NSString, NSObject>::from_id_slice(&[&*key], &[value]);
+    let registration: Retained<NSDictionary<NSString, AnyObject>> =
+        unsafe { Retained::cast(registration) };
+    unsafe { defaults.registerDefaults(&registration) };
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/branding/sqlshop-lynx-app-icon.png");
 const LOGO_PNG: &[u8] = include_bytes!("../assets/branding/sqlshop-lynx-icon.png");

@@ -53,7 +53,7 @@ def test_service(service, suite="databases"):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("up", "test", "test-edit", "down", "status"))
+    parser.add_argument("command", choices=("up", "test", "test-browser", "test-edit", "test-query", "test-all", "down", "status"))
     parser.add_argument("services", nargs="*", metavar="SERVICE")
     args = parser.parse_args()
     services = args.services or list(SERVICES)
@@ -61,13 +61,21 @@ def main():
         parser.error("Services must be mysql, postgres, or sqlserver.")
     if args.command == "up":
         run(COMPOSE + ["up", "-d", "--wait", "--wait-timeout", "360"] + services)
-    elif args.command in ("test", "test-edit"):
+    elif args.command in ("test", "test-browser", "test-edit", "test-query", "test-all"):
+        suites = {
+            "test": ("databases",),
+            "test-browser": ("table_browser",),
+            "test-edit": ("table_edit",),
+            "test-query": ("query_sessions",),
+            "test-all": ("databases", "table_browser", "table_edit", "query_sessions"),
+        }[args.command]
         failed = []
         for service in services:
-            try:
-                test_service(service, "table_edit" if args.command == "test-edit" else "databases")
-            except subprocess.CalledProcessError:
-                failed.append(service)
+            for suite in suites:
+                try:
+                    test_service(service, suite)
+                except subprocess.CalledProcessError:
+                    failed.append(f"{service}/{suite}")
         if failed:
             raise SystemExit("Failed database tests: " + ", ".join(failed))
     elif args.command == "down":

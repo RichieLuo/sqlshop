@@ -4,6 +4,11 @@
 mod branding;
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "../src/ui/window_chrome.rs"]
+mod window_chrome;
+
+#[cfg(target_os = "macos")]
 fn main() {
     use eframe::egui;
     use objc2_app_kit::{NSApplication, NSBitmapImageRep};
@@ -13,6 +18,8 @@ fn main() {
         println!("Skipped: set SQLSHOP_TEST_NATIVE_ICON=1 to check the macOS Dock icon");
         return;
     }
+
+    branding::enable_miniwindow_icons();
 
     struct Probe {
         frames: usize,
@@ -31,7 +38,8 @@ fn main() {
                 // SAFETY: AppKit runs on its main thread. Retained objects outlive
                 // each read, and every queried pixel lies within the bitmap.
                 unsafe {
-                    let icon = NSApplication::sharedApplication(mtm)
+                    let application = NSApplication::sharedApplication(mtm);
+                    let icon = application
                         .applicationIconImage()
                         .expect("eframe must set the Dock icon");
                     let tiff = icon.TIFFRepresentation().unwrap();
@@ -57,6 +65,12 @@ fn main() {
                         .unwrap()
                         .alphaComponent();
                     assert!(alpha > 0.99, "the backing plate must stay opaque");
+                    let windows = application.windows();
+                    let window = windows.firstObject().expect("the test window must exist");
+                    assert!(
+                        window.miniwindowImage().is_some(),
+                        "the minimized-window Dock tile must use the SQLShop icon"
+                    );
                 }
                 println!(
                     "Dock icon has transparent corners and a solid plate at frame {}",
@@ -82,6 +96,7 @@ fn main() {
         "SQLShop icon check",
         options,
         Box::new(|cc| {
+            window_chrome::configure_window(cc);
             Ok(Box::new(Probe {
                 frames: 0,
                 logo: branding::load_texture(&cc.egui_ctx),

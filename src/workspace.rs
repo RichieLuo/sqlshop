@@ -18,6 +18,11 @@ const MAX_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
 pub struct QueryTarget {
     pub connection: Uuid,
     pub database: Option<String>,
+    /// PostgreSQL search_path target; SQL Server's observed user default schema.
+    /// SQL Server restores it by validation only, never ALTER USER. Older
+    /// workspaces omitted this field.
+    #[serde(default)]
+    pub schema: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +45,33 @@ pub struct HistoryEntry {
     pub success: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorkspaceLayout {
+    pub navigation: bool,
+    pub information: bool,
+    pub information_force: bool,
+    pub toolbar: bool,
+    pub status: bool,
+    pub focus: bool,
+    pub connected_only: bool,
+    pub theme: String,
+}
+impl Default for WorkspaceLayout {
+    fn default() -> Self {
+        Self {
+            navigation: true,
+            information: true,
+            information_force: false,
+            toolbar: true,
+            status: true,
+            focus: false,
+            connected_only: false,
+            theme: "system".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Workspace {
     pub version: u32,
@@ -49,6 +81,8 @@ pub struct Workspace {
     /// Oldest first; new executions are appended.
     pub history: Vec<HistoryEntry>,
     pub editor_height: Option<f32>,
+    #[serde(default)]
+    pub layout: Option<WorkspaceLayout>,
 }
 
 impl Default for Workspace {
@@ -60,6 +94,7 @@ impl Default for Workspace {
             next_tab: 1,
             history: Vec::new(),
             editor_height: None,
+            layout: None,
         }
     }
 }
@@ -259,6 +294,7 @@ mod tests {
             target: QueryTarget {
                 connection: Uuid::new_v4(),
                 database: Some("资料库".into()),
+                schema: None,
             },
             source: "SQL 1".into(),
             timestamp: index,
