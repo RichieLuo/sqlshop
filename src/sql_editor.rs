@@ -607,28 +607,60 @@ pub fn completion_word(sql: &str, cursor: usize) -> Option<Range<usize>> {
     None
 }
 
-pub fn completions(prefix: &str, columns: &[String]) -> Vec<(String, bool)> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompletionKind {
+    Keyword,
+    Field,
+    Table,
+}
+
+impl CompletionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            CompletionKind::Keyword => "关键字",
+            CompletionKind::Field => "字段",
+            CompletionKind::Table => "表",
+        }
+    }
+}
+
+/// Completion candidates for the word under the cursor: SQL keywords, then
+/// column names, then table names. Keywords win name collisions, then
+/// columns, so a column named like a keyword is not offered twice.
+pub fn completions(
+    prefix: &str,
+    columns: &[String],
+    tables: &[String],
+) -> Vec<(String, CompletionKind)> {
     if prefix.is_empty() {
         return Vec::new();
     }
-    let mut candidates = Vec::new();
+    let folded_prefix = prefix.to_lowercase();
+    let mut candidates: Vec<(String, CompletionKind)> = Vec::new();
     for keyword in KEYWORDS {
-        if keyword.len() > prefix.len()
-            && keyword
-                .to_ascii_lowercase()
-                .starts_with(&prefix.to_ascii_lowercase())
+        if keyword.len() > prefix.len() && keyword.to_ascii_lowercase().starts_with(&folded_prefix)
         {
-            candidates.push(((*keyword).to_owned(), false));
+            candidates.push(((*keyword).to_owned(), CompletionKind::Keyword));
         }
     }
     for column in columns {
         if column.len() > prefix.len()
-            && column.to_lowercase().starts_with(&prefix.to_lowercase())
+            && column.to_lowercase().starts_with(&folded_prefix)
             && !candidates
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(column))
         {
-            candidates.push((column.clone(), true));
+            candidates.push((column.clone(), CompletionKind::Field));
+        }
+    }
+    for table in tables {
+        if table.len() > prefix.len()
+            && table.to_lowercase().starts_with(&folded_prefix)
+            && !candidates
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(table))
+        {
+            candidates.push((table.clone(), CompletionKind::Table));
         }
     }
     candidates.sort_by_key(|a| a.0.to_lowercase());
@@ -966,13 +998,20 @@ mod tests {
         let cursor = "🦀 SELECT 中".chars().count();
         let range = completion_word(sql, cursor).unwrap();
         assert_eq!(&sql[range.clone()], "中名尾");
-        let choices = completions("中", &["中文列".into(), "中文列".into(), "其他".into()]);
-        assert_eq!(choices, [("中文列".into(), true)]);
+        let choices = completions(
+            "中",
+            &["中文列".into(), "中文列".into(), "其他".into()],
+            &[],
+        );
+        assert_eq!(choices, [("中文列".into(), CompletionKind::Field)]);
         let mut text = sql.to_owned();
         let cursor = insert_completion(&mut text, range, &choices[0].0).unwrap();
         assert_eq!(text, "🦀 SELECT 中文列 FROM t");
         assert_eq!(cursor, "🦀 SELECT 中文列".chars().count());
-        assert_eq!(completions("sel", &[]), [("SELECT".into(), false)]);
+        assert_eq!(
+            completions("sel", &[], &[]),
+            [("SELECT".into(), CompletionKind::Keyword)]
+        );
         assert!(completion_word("-- SELECT", 9).is_none());
         assert!(completion_word("SELECT 'abc'", 11).is_none());
         assert!(completion_word("SELECT `abc`", 11).is_none());
@@ -981,6 +1020,35 @@ mod tests {
         assert!(completion_word("abc$def", 7).is_some());
         assert!(completion_word("SELECT abc", usize::MAX).is_none());
         assert!(insert_completion(&mut text, 1..3, "x").is_none());
+    }
+
+    #[test]
+    fn completion_offers_table_names_beside_keywords_and_columns() {
+        let tables = [
+            "users".to_string(),
+            "user_roles".to_string(),
+            "orders".to_string(),
+        ];
+        let choices = completions("use", &[], &tables);
+        assert!(choices.contains(&("users".into(), CompletionKind::Table)));
+        assert!(choices.contains(&("user_roles".into(), CompletionKind::Table)));
+        assert!(!choices.iter().any(|(name, _)| name == "orders"));
+        // A table sharing a name with a keyword or column is offered once,
+        // as the higher-priority kind.
+        let choices = completions("sel", &["seller".into()], &["select_log".into()]);
+        assert_eq!(choices[0], ("SELECT".into(), CompletionKind::Keyword));
+        let choices = completions("id", &["id_col".into()], &["identities".into()]);
+        assert_eq!(
+            choices,
+            [
+                ("id_col".into(), CompletionKind::Field),
+                ("identities".into(), CompletionKind::Table),
+            ]
+        );
+        assert!(completions("", &[], &tables).is_empty());
+        assert_eq!(CompletionKind::Field.label(), "字段");
+        assert_eq!(CompletionKind::Table.label(), "表");
+        assert_eq!(CompletionKind::Keyword.label(), "关键字");
     }
 
     #[test]

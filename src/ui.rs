@@ -125,8 +125,7 @@ impl QueryTab {
         Self {
             id: Uuid::new_v4(),
             name: format!("查询 {index}"),
-            sql: "-- 在这里编写 SQL；⌘ / Ctrl + Enter 执行选中内容或整段 SQL\nSELECT 1 AS hello;"
-                .into(),
+            sql: "".into(),
             last_executed_sql: None,
             last_executed_document: None,
             last_executed_char_start: None,
@@ -169,9 +168,7 @@ impl QueryTab {
             grid_scroll_row: None,
             target: None,
             file_path: None,
-            saved_sql:
-                "-- 在这里编写 SQL；⌘ / Ctrl + Enter 执行选中内容或整段 SQL\nSELECT 1 AS hello;"
-                    .into(),
+            saved_sql: "".into(),
             browse: TableBrowseOptions::default(),
             has_more: false,
             filters_open: false,
@@ -574,10 +571,7 @@ impl ConnectionSession {
     }
 
     fn columns_for(&self, target: &QueryTarget) -> Vec<String> {
-        if self.connected.as_ref().map(|profile| profile.id) != Some(target.connection)
-            || self.active_database != target.database
-            || target.database.is_none()
-        {
+        if !self.target_matches(target) {
             return Vec::new();
         }
         let mut columns = Vec::new();
@@ -599,6 +593,35 @@ impl ConnectionSession {
             }
         }
         columns
+    }
+
+    /// Table and view names offered as completion candidates; the table list
+    /// is already loaded for the object browser, so no extra fetch is needed.
+    fn tables_for(&self, target: &QueryTarget) -> Vec<String> {
+        if !self.target_matches(target) {
+            return Vec::new();
+        }
+        let mut names = Vec::new();
+        for table in self.tables.iter().filter(|table| {
+            target
+                .schema
+                .as_ref()
+                .is_none_or(|schema| schema == &table.schema)
+        }) {
+            if !names
+                .iter()
+                .any(|name: &String| name.eq_ignore_ascii_case(&table.name))
+            {
+                names.push(table.name.clone());
+            }
+        }
+        names
+    }
+
+    fn target_matches(&self, target: &QueryTarget) -> bool {
+        self.connected.as_ref().map(|profile| profile.id) == Some(target.connection)
+            && self.active_database == target.database
+            && target.database.is_some()
     }
 
     fn new(ctx: &egui::Context) -> Self {
@@ -1487,6 +1510,18 @@ FROM users;"
                 self.sessions
                     .get(&target.connection)
                     .map(|session| session.columns_for(target))
+            })
+            .unwrap_or_default()
+    }
+
+    fn completion_tables(&self) -> Vec<String> {
+        self.tabs[self.active_tab]
+            .target
+            .as_ref()
+            .and_then(|target| {
+                self.sessions
+                    .get(&target.connection)
+                    .map(|session| session.tables_for(target))
             })
             .unwrap_or_default()
     }
@@ -3746,12 +3781,14 @@ FROM users;"
             || self.tabs[self.active_tab].output.is_some();
         if !table_tab {
             let columns = self.completion_columns();
+            let tables = self.completion_tables();
             let (_, needs_columns) = sql_editor(
                 ui,
                 &mut self.tabs[self.active_tab],
                 &mut self.editor_height,
                 show_results,
                 &columns,
+                &tables,
             );
             if needs_columns && self.tabs[self.active_tab].target.is_some() {
                 self.prefetch_completion_columns();
@@ -4230,16 +4267,11 @@ FROM users;"
         let mut connect = false;
         let mut test = false;
         let mut selection_error = None;
-        egui::Window::new("数据库连接")
+        dialog_window("数据库连接", ctx)
             .open(&mut open)
-            .collapsible(false)
             .resizable(true)
             .default_width((ctx.content_rect().width() - 120.0).clamp(620.0, 860.0))
             .min_width(620.0)
-            .default_pos(egui::pos2(
-                ((ctx.content_rect().width() - 860.0) * 0.5).max(24.0),
-                64.0,
-            ))
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.label(
@@ -4343,10 +4375,7 @@ FROM users;"
         let busy = self.session_busy(id) || self.query_connection_busy(id);
         let mut cancel = false;
         let mut delete = false;
-        egui::Window::new("删除本机连接")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        dialog_window("删除本机连接", ctx).show(ctx, |ui| {
                 ui.label("将删除此连接配置及保存的密码，数据库中的数据不受影响。");
                 if self.sessions.get(&id).is_some_and(|s| s.connected.is_some()) || self.query_connection_used(id) {
                     ui.label("此连接仍有存活会话。删除会关闭其管理会话和所有 SQL 标签会话，未提交事务可能回滚；其他连接不受影响。");
@@ -4406,23 +4435,20 @@ FROM users;"
                 .iter()
                 .find(|tab| tab.id == tab_id)
                 .is_some_and(|tab| !tab.table_snapshot_stale && !tab.has_table_drafts());
-        egui::Window::new("删除选中行")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "将从 {}.{} 删除 {} 行。此操作无法撤销。",
-                    target.schema,
-                    target.name,
-                    key_values.len()
-                ));
-                ui.horizontal(|ui| {
-                    cancel = ui.button("取消").clicked();
-                    confirm = ui
-                        .add_enabled(can_delete, egui::Button::new("删除行"))
-                        .clicked();
-                });
+        dialog_window("删除选中行", ctx).show(ctx, |ui| {
+            ui.label(format!(
+                "将从 {}.{} 删除 {} 行。此操作无法撤销。",
+                target.schema,
+                target.name,
+                key_values.len()
+            ));
+            ui.horizontal(|ui| {
+                cancel = ui.button("取消").clicked();
+                confirm = ui
+                    .add_enabled(can_delete, egui::Button::new("删除行"))
+                    .clicked();
             });
+        });
         if cancel {
             self.delete_rows = None;
         }
@@ -4459,45 +4485,40 @@ FROM users;"
             SchemaDialogAction::DropDatabase { .. } => "删除数据库",
             SchemaDialogAction::DropTable { .. } => "删除数据表",
         };
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                match &mut dialog.action {
-                    SchemaDialogAction::CreateDatabase { .. } => {
-                        ui.label("数据库名称");
-                        ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(360.0));
-                    }
-                    SchemaDialogAction::DropDatabase { database, .. } => {
-                        ui.label(format!(
-                            "确定删除数据库 {database}？其中的所有表和数据都会被删除，且无法撤销。"
-                        ));
-                    }
-                    SchemaDialogAction::DropTable {
-                        database, table, ..
-                    } => {
-                        ui.label(format!(
-                            "确定删除数据表 {database}.{}.{}？表内所有数据都会被删除，且无法撤销。",
-                            table.schema, table.name
-                        ));
-                    }
+        dialog_window(title, ctx).open(&mut open).show(ctx, |ui| {
+            match &mut dialog.action {
+                SchemaDialogAction::CreateDatabase { .. } => {
+                    ui.label("数据库名称");
+                    ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(360.0));
                 }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    cancel = ui.button("取消").clicked();
-                    let label = if matches!(
-                        dialog.action,
-                        SchemaDialogAction::DropDatabase { .. }
-                            | SchemaDialogAction::DropTable { .. }
-                    ) {
-                        "删除"
-                    } else {
-                        "创建"
-                    };
-                    confirm = ui.button(label).clicked();
-                });
+                SchemaDialogAction::DropDatabase { database, .. } => {
+                    ui.label(format!(
+                        "确定删除数据库 {database}？其中的所有表和数据都会被删除，且无法撤销。"
+                    ));
+                }
+                SchemaDialogAction::DropTable {
+                    database, table, ..
+                } => {
+                    ui.label(format!(
+                        "确定删除数据表 {database}.{}.{}？表内所有数据都会被删除，且无法撤销。",
+                        table.schema, table.name
+                    ));
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                cancel = ui.button("取消").clicked();
+                let label = if matches!(
+                    dialog.action,
+                    SchemaDialogAction::DropDatabase { .. } | SchemaDialogAction::DropTable { .. }
+                ) {
+                    "删除"
+                } else {
+                    "创建"
+                };
+                confirm = ui.button(label).clicked();
             });
+        });
         if cancel || !open {
             self.schema_dialog = None;
             return;
@@ -4634,7 +4655,10 @@ FROM users;"
             let form = self.csv_import.as_mut().unwrap();
             let mut open = true;
             let mut submit = false;
-            egui::Window::new("CSV 导入 · 映射预览").open(&mut open).default_width(700.0).show(ctx, |ui| {
+            dialog_window("CSV 导入 · 映射预览", ctx)
+                .open(&mut open)
+                .default_width(700.0)
+                .show(ctx, |ui| {
                 ui.label(format!("{} / {}.{} · {} 行", form.target.database.as_deref().unwrap_or(""), form.table.schema, form.table.name, form.rows.len()));
                 ui.label("CSV 空字段（未引号）= NULL；双引号包裹的空文本=空字符串；文字 NULL 始终是字符串。未映射列使用默认值。");
                 for (index, header) in form.headers.iter().enumerate() {
@@ -4693,13 +4717,17 @@ FROM users;"
         let selected_count = self.export_rows.as_ref().map(|(_, rows)| rows.len());
         let complete_table =
             selected_count.is_none() && self.tabs[self.active_tab].table_target.is_some();
-        egui::Window::new(if selected_count.is_some() {
-            "导出选中行"
-        } else {
-            if complete_table { "完整导出表（含当前筛选）" } else { "导出当前结果集" }
-        })
+        dialog_window(
+            if selected_count.is_some() {
+                "导出选中行"
+            } else if complete_table {
+                "完整导出表（含当前筛选）"
+            } else {
+                "导出当前结果集"
+            },
+            ctx,
+        )
         .open(&mut open)
-        .collapsible(false)
         .default_width(500.0)
         .show(ctx, |ui| {
             ui.label("保存路径");
@@ -6299,6 +6327,7 @@ fn sql_editor(
     height: &mut Option<f32>,
     show_results: bool,
     columns: &[String],
+    tables: &[String],
 ) -> (egui::Response, bool) {
     let minimum = if ui.available_height() < 320.0 {
         60.0
@@ -6352,6 +6381,7 @@ fn sql_editor(
                         !completions(
                             &tab.sql[word.start..char_to_byte_index(&tab.sql, *cursor)],
                             columns,
+                            tables,
                         )
                         .is_empty()
                     });
@@ -6430,7 +6460,7 @@ fn sql_editor(
                         let prefix = &tab.sql[range.start..char_to_byte_index(&tab.sql, cursor)];
                         needs_columns =
                             tab.completion_dismissed.as_ref() != Some(&(tab.sql.clone(), cursor));
-                        let choices = completions(prefix, columns);
+                        let choices = completions(prefix, columns, tables);
                         let key = (tab.sql.clone(), cursor);
                         if tab.completion_dismissed.as_ref() != Some(&key) && !choices.is_empty() {
                             tab.completion_selected =
@@ -6453,12 +6483,8 @@ fn sql_editor(
                                 .open(true)
                                 .show(|ui| {
                                     ui.set_min_width(200.0);
-                                    for (index, (name, field)) in choices.iter().enumerate() {
-                                        let label = format!(
-                                            "{}  · {}",
-                                            name,
-                                            if *field { "字段" } else { "关键字" }
-                                        );
+                                    for (index, (name, kind)) in choices.iter().enumerate() {
+                                        let label = format!("{}  · {}", name, kind.label());
                                         if ui
                                             .selectable_label(
                                                 index == tab.completion_selected,
@@ -7086,6 +7112,18 @@ fn choose_private_key(current: &str) -> anyhow::Result<Option<PathBuf>> {
         .pick_file()
         .map(|path| sqlshop::ssh::private_key_path(&path.display().to_string()))
         .transpose()
+}
+
+/// Modal-style dialog window. The pivot is the window center and the default
+/// position is the content-area center, so dialogs open centered instead of
+/// at the top-left egui default; once the user drags a dialog, egui remembers
+/// that position per window id as usual.
+fn dialog_window(title: impl Into<String>, ctx: &egui::Context) -> egui::Window<'static> {
+    egui::Window::new(title.into())
+        .collapsible(false)
+        .resizable(false)
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.content_rect().center())
 }
 
 fn accent(ui: &egui::Ui) -> Color32 {
@@ -8327,6 +8365,62 @@ mod tests {
     }
 
     #[test]
+    fn completion_tables_require_matching_bound_connected_database_and_schema() {
+        let mut app = session_test_app();
+        let a = add_test_session(&mut app, "A", "db_a");
+        let b = add_test_session(&mut app, "B", "db_b");
+        app.tabs[0].target = Some(a.clone());
+        assert_eq!(app.completion_tables(), ["db_a_table"]);
+        app.tabs[0].target = Some(b.clone());
+        assert_eq!(app.completion_tables(), ["db_b_table"]);
+        app.tabs[0].target = Some(a.clone());
+        app.sessions.get_mut(&a.connection).unwrap().active_database = Some("other".into());
+        assert!(app.completion_tables().is_empty());
+        let session = app.sessions.get_mut(&a.connection).unwrap();
+        session.active_database = a.database.clone();
+        session.tables.push(Table {
+            schema: "other_schema".into(),
+            name: "db_a_table".into(),
+            kind: "BASE TABLE".into(),
+        });
+        // The same table name in two schemas is offered once.
+        assert_eq!(app.completion_tables(), ["db_a_table"]);
+        app.tabs[0].target.as_mut().unwrap().schema = Some("other_schema".into());
+        assert_eq!(app.completion_tables(), ["db_a_table"]);
+        app.tabs[0].target.as_mut().unwrap().schema = Some("missing".into());
+        assert!(app.completion_tables().is_empty());
+        app.sessions.get_mut(&a.connection).unwrap().connected = None;
+        assert!(app.completion_tables().is_empty());
+    }
+
+    #[test]
+    fn dialog_windows_open_centered_on_screen() {
+        let ctx = egui::Context::default();
+        let mut rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let response = dialog_window("居中测试", ctx)
+                .default_width(400.0)
+                .show(ctx, |ui| ui.label("内容"));
+            rect = response.map(|inner| inner.response.rect);
+        });
+        let rect = rect.expect("dialog shown");
+        assert!(rect.width() > 0.0 && rect.height() > 0.0);
+        let content = ctx.content_rect();
+        assert!(
+            (rect.center().x - content.center().x).abs() <= 1.0,
+            "dialog center x {} vs content center {}",
+            rect.center().x,
+            content.center().x
+        );
+        assert!(
+            (rect.center().y - content.center().y).abs() <= 1.0,
+            "dialog center y {} vs content center {}",
+            rect.center().y,
+            content.center().y
+        );
+    }
+
+    #[test]
     fn execution_scope_preserves_target_and_confirms_only_the_requested_sql() {
         let mut app = session_test_app();
         let a = add_test_session(&mut app, "A", "db_a");
@@ -9126,7 +9220,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        splitter = sql_editor(ui, &mut tab, &mut height, true, &[]).0.rect;
+                        splitter = sql_editor(ui, &mut tab, &mut height, true, &[], &[]).0.rect;
                     });
                 },
             );

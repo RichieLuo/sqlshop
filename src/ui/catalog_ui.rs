@@ -433,7 +433,7 @@ impl App {
         if self.library_open {
             let mut open = true;
             let mut selected_query = None;
-            egui::Window::new("已保存查询与连接分组")
+            dialog_window("已保存查询与连接分组", ctx)
                 .open(&mut open).default_width(740.0).default_height(480.0)
                 .show(ctx, |ui| {
                     ui.add_enabled_ui(self.catalog_dialog.is_none(), |ui| {
@@ -495,10 +495,8 @@ impl App {
         if let Some(mut dialog) = self.catalog_dialog.take() {
             let mut cancel = false;
             let mut confirm = false;
-            egui::Window::new("确认查询库修改")
+            dialog_window("确认查询库修改", ctx)
                 .id(egui::Id::new("catalog-dialog"))
-                .collapsible(false)
-                .resizable(false)
                 .show(ctx, |ui| {
                     match &mut dialog {
                         CatalogDialog::Group { id, name } => {

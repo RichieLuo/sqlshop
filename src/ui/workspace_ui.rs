@@ -1416,9 +1416,7 @@ impl App {
         if let Some(pending) = &self.confirm_sql {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Window::new("确认执行 SQL？")
-                .collapsible(false)
-                .resizable(false)
+            dialog_window("确认执行 SQL？", ctx)
                 .default_width(720.0)
                 .max_width((ctx.available_rect().width() - 32.0).max(200.0))
                 .show(ctx, |ui| {
@@ -1456,9 +1454,7 @@ impl App {
         if let Some(action) = self.confirm_tab_action {
             let mut discard = false;
             let mut cancel = false;
-            egui::Window::new("关闭 SQL 标签？")
-                .collapsible(false)
-                .show(ctx, |ui| {
+            dialog_window("关闭 SQL 标签？", ctx).show(ctx, |ui| {
                     ui.label("关闭将移除这些标签的草稿，并结束对应独立会话；未保存的 SQL 编辑会丢弃，未提交事务可能回滚。");
                     ui.label("需要保留时，请取消并保存文件或执行 COMMIT / ROLLBACK。");
                     ui.horizontal(|ui| {
@@ -1477,9 +1473,7 @@ impl App {
         if let Some((id, target)) = self.confirm_rebind.clone() {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Window::new("确认更改 SQL 标签目标")
-                .collapsible(false)
-                .show(ctx, |ui| {
+            dialog_window("确认更改 SQL 标签目标", ctx).show(ctx, |ui| {
                     ui.label(format!(
                         "后续执行将发送到 {} / {}{}。这不会执行 SQL。",
                         target.connection,
@@ -1504,7 +1498,7 @@ impl App {
         if self.confirm_request.is_some() {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Window::new("切换 / 断开数据库会话？").collapsible(false).show(ctx, |ui| {
+            dialog_window("切换 / 断开数据库会话？", ctx).show(ctx, |ui| {
                 let connection = self.confirm_request.as_ref().map(|(id, _, _)| *id).unwrap();
                 let name = self.profiles.iter().find(|p| p.id == connection).map(|p| p.name.as_str()).unwrap_or("原连接");
                 ui.label(format!("连接 {name} 已执行用户 SQL。切库、重连或断开此连接可能回滚未提交事务；其他连接不受影响。应用不会自动提交或自动重连。"));
@@ -1523,26 +1517,22 @@ impl App {
             let mut exit = false;
             let mut discard_exit = false;
             let mut cancel = false;
-            egui::Window::new("退出前确认")
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.label(
-                        "存在未保存到 SQL 文件的修改、未提交的表数据暂存，或正在执行数据库操作。",
-                    );
-                    ui.label("表数据暂存不会自动保存；退出将丢弃暂存修改。未提交事务可能回滚。");
-                    ui.horizontal(|ui| {
-                        cancel = ui.button("取消").clicked();
-                        exit = ui
-                            .add_enabled(!busy, egui::Button::new("保存草稿并退出"))
-                            .clicked();
-                        discard_exit = ui
-                            .add_enabled(!busy, egui::Button::new("不保存草稿，直接退出"))
-                            .clicked();
-                    });
-                    if busy {
-                        ui.label("正在执行数据库操作，请返回并停止查询或等待任务结束后退出。");
-                    }
+            dialog_window("退出前确认", ctx).show(ctx, |ui| {
+                ui.label("存在未保存到 SQL 文件的修改、未提交的表数据暂存，或正在执行数据库操作。");
+                ui.label("表数据暂存不会自动保存；退出将丢弃暂存修改。未提交事务可能回滚。");
+                ui.horizontal(|ui| {
+                    cancel = ui.button("取消").clicked();
+                    exit = ui
+                        .add_enabled(!busy, egui::Button::new("保存草稿并退出"))
+                        .clicked();
+                    discard_exit = ui
+                        .add_enabled(!busy, egui::Button::new("不保存草稿，直接退出"))
+                        .clicked();
                 });
+                if busy {
+                    ui.label("正在执行数据库操作，请返回并停止查询或等待任务结束后退出。");
+                }
+            });
             if cancel {
                 self.confirm_exit = false;
             }
@@ -1556,7 +1546,7 @@ impl App {
             let mut open = true;
             let mut restore = None;
             let mut clear = false;
-            egui::Window::new("查询历史（仅恢复到编辑器，不执行）")
+            dialog_window("查询历史（仅恢复到编辑器，不执行）", ctx)
                 .open(&mut open)
                 .default_width(720.0)
                 .show(ctx, |ui| {

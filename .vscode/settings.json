@@ -1,0 +1,13 @@
+{
+  "terminal.integrated.profiles.windows": {
+    "PowerShell (SQLShop VS2022)": {
+      "path": "${env:windir}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "args": [
+        "-NoExit",
+        "-Command",
+        "& 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\Tools\\Launch-VsDevShell.ps1' -Arch amd64 -HostArch amd64 -SkipAutomaticLocation"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "PowerShell (SQLShop VS2022)"
+}
