@@ -39,12 +39,20 @@ objc2 = { version = "0.5.3", default-features = false }
 objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSColor", "NSGraphics", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.2.2", features = ["NSData", "NSThread", "NSGeometry", "NSDictionary", "NSObject", "NSString", "NSUserDefaults", "NSValue"] }
 
+[target.'cfg(target_os = "windows")'.build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+winres = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 
 [[test]]
 name = "macos_icon"
 harness = false
+
+# Work around a Rust 1.95 incremental metadata encoder ICE in vendored drivers.
+[profile.dev]
+incremental = false
 
 [profile.release]
 lto = "thin"

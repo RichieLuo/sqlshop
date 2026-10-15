@@ -264,15 +264,72 @@ impl App {
         }
     }
 
+    fn workspace_tabs(&self) -> impl Iterator<Item = &QueryTab> {
+        self.tabs.iter().filter(|t| {
+            !t.management_document()
+                && t.definition.is_none()
+                && (t.table_target.is_none() || t.dirty())
+        })
+    }
+
+    fn workspace_theme(&self) -> &'static str {
+        match self.theme {
+            egui::ThemePreference::Light => "light",
+            egui::ThemePreference::Dark => "dark",
+            _ => "system",
+        }
+    }
+
+    /// Compare persisted fields by reference before cloning SQL or history. Keep
+    /// this projection in sync with `workspace_snapshot`, including filtered tabs.
+    pub(super) fn workspace_matches(&self, saved: &Workspace) -> bool {
+        let Some(layout) = &saved.layout else {
+            return false;
+        };
+        if saved.version != sqlshop::workspace::WORKSPACE_VERSION
+            || saved.next_tab != self.next_tab
+            || saved.editor_height != self.editor_height
+            || layout.navigation != self.view.navigation
+            || layout.information != self.inspector_visible
+            || layout.information_force != self.view.information_force
+            || layout.toolbar != self.view.toolbar
+            || layout.status != self.view.status
+            || layout.focus != self.view.focus
+            || layout.connected_only != self.view.connected_only
+            || layout.theme != self.workspace_theme()
+            || saved.history != self.history
+        {
+            return false;
+        }
+        let active_id = self.tabs[self.active_tab].id;
+        let active_tab = self
+            .workspace_tabs()
+            .position(|tab| tab.id == active_id)
+            .unwrap_or(0);
+        if saved.active_tab != active_tab {
+            return false;
+        }
+        let mut saved_tabs = saved.tabs.iter();
+        for tab in self.workspace_tabs() {
+            let Some(saved) = saved_tabs.next() else {
+                return false;
+            };
+            if saved.id != tab.id
+                || saved.name != tab.name
+                || saved.sql != tab.sql
+                || saved.file_path != tab.file_path
+                || saved.saved_sql != tab.saved_sql
+                || saved.target != tab.target
+            {
+                return false;
+            }
+        }
+        saved_tabs.next().is_none()
+    }
+
     pub(super) fn workspace_snapshot(&self) -> Workspace {
         let tabs: Vec<_> = self
-            .tabs
-            .iter()
-            .filter(|t| {
-                !t.management_document()
-                    && t.definition.is_none()
-                    && (t.table_target.is_none() || t.dirty())
-            })
+            .workspace_tabs()
             .map(|t| SavedTab {
                 id: t.id,
                 name: t.name.clone(),
@@ -298,12 +355,7 @@ impl App {
                 status: self.view.status,
                 focus: self.view.focus,
                 connected_only: self.view.connected_only,
-                theme: match self.theme {
-                    egui::ThemePreference::Light => "light",
-                    egui::ThemePreference::Dark => "dark",
-                    _ => "system",
-                }
-                .into(),
+                theme: self.workspace_theme().into(),
             }),
             ..Workspace::default()
         }
@@ -320,20 +372,17 @@ impl App {
         let Some(store) = &self.workspace_store else {
             return false;
         };
-        let snapshot = self.workspace_snapshot();
-        let serialized = match serde_json::to_string(&snapshot) {
-            Ok(value) => value,
-            Err(error) => {
-                self.fail(format!("草稿序列化失败：{error}"));
-                return false;
-            }
-        };
-        if serialized == self.last_workspace {
+        if self
+            .last_workspace
+            .as_ref()
+            .is_some_and(|saved| self.workspace_matches(saved))
+        {
             return true;
         }
+        let snapshot = self.workspace_snapshot();
         match store.save(&snapshot) {
             Ok(()) => {
-                self.last_workspace = serialized;
+                self.last_workspace = Some(snapshot);
                 true
             }
             Err(error) => {
@@ -971,25 +1020,25 @@ impl App {
         }
     }
 
+    pub(super) fn table_draft_action_state(&self) -> (bool, bool) {
+        let actions = self.table_action_state(self.active_tab);
+        let inline_idle = self
+            .cell_editor
+            .as_ref()
+            .is_some_and(|editor| editor.tab == self.tabs[self.active_tab].id)
+            && !self.tab_busy(self.active_tab);
+        (
+            actions.can_submit() || (inline_idle && actions.ready && !actions.stale),
+            actions.can_revert() || inline_idle,
+        )
+    }
+
     pub(super) fn table_pagination(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.spacing_mut().button_padding.y = 4.0;
         ui.spacing_mut().interact_size.y = 24.0;
         let actions = self.table_action_state(self.active_tab);
-        let two_rows = table_footer_two_rows(ui.available_width())
-            || self.tabs[self.active_tab]
-                .output
-                .as_ref()
-                .and_then(|output| output.sets.get(self.tabs[self.active_tab].result_index))
-                .is_some_and(|set| !set.rows.is_empty());
         let can_insert_row = self.can_add_table_row(self.active_tab);
-        let inline_editing = self
-            .cell_editor
-            .as_ref()
-            .is_some_and(|editor| editor.tab == self.tabs[self.active_tab].id);
-        let inline_idle = inline_editing && !self.tab_busy(self.active_tab);
-        let can_submit = actions.can_submit() || (inline_idle && actions.ready && !actions.stale);
-        let can_revert = actions.can_revert() || inline_idle;
         let tab = &mut self.tabs[self.active_tab];
         let mut status = tab
             .target
@@ -1054,8 +1103,6 @@ impl App {
         if draft_count > 0 {
             status.push_str(&format!(" · {draft_label}"));
         }
-        let mut submit = false;
-        let mut revert = false;
         let mut refresh = false;
         let mut edit_buttons = |ui: &mut egui::Ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -1075,47 +1122,23 @@ impl App {
                 })
                 .clicked();
             ui.separator();
-            submit = ui
-                .add_enabled(can_submit, egui::Button::new("提交全部"))
-                .on_hover_text(format!("在同一事务中提交本标签的{draft_label}"))
-                .clicked();
-            revert = ui
-                .add_enabled(can_revert, egui::Button::new("撤销暂存"))
-                .on_hover_text("仅清除本标签的本地草稿，恢复数据库快照；不会撤销已提交的数据库写入")
-                .clicked();
-            ui.separator();
             refresh = ui
                 .add_enabled(actions.can_read(), egui::Button::new("刷新"))
                 .on_hover_text("重新读取当前页；存在暂存时请先提交或撤销暂存")
                 .clicked();
         };
         ui.separator();
-        if two_rows {
-            ui.horizontal_wrapped(|ui| {
-                edit_buttons(ui);
-                ui.separator();
-                table_record_controls(ui, tab, actions.idle);
-                if draft_count > 0 {
-                    ui.add_sized(
-                        [ui.available_width().max(0.0), 24.0],
-                        egui::Label::new(RichText::new(&draft_label).small()).truncate(),
-                    );
-                }
+        egui::ScrollArea::horizontal()
+            .id_salt(("table-footer", tab.id))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    edit_buttons(ui);
+                    ui.separator();
+                    (reload, last_page) = table_page_controls(ui, tab, actions.can_read());
+                    table_footer_status(ui, &status, &tab.source, actions.ready);
+                });
             });
-            ui.horizontal(|ui| {
-                (reload, last_page) = table_page_controls(ui, tab, actions.can_read());
-                table_footer_status(ui, &status, &tab.source, actions.ready);
-            });
-        } else {
-            ui.horizontal(|ui| {
-                edit_buttons(ui);
-                ui.separator();
-                table_record_controls(ui, tab, actions.idle);
-                ui.separator();
-                (reload, last_page) = table_page_controls(ui, tab, actions.can_read());
-                table_footer_status(ui, &status, &tab.source, actions.ready);
-            });
-        }
         reload |= refresh;
         let mut delete_snapshot = None;
         if delete_selected_rows && can_remove_insert {
@@ -1158,12 +1181,6 @@ impl App {
         if let Some(snapshot) = delete_snapshot {
             self.delete_rows = Some(snapshot);
         }
-        if revert {
-            self.discard_staged_cells(self.active_tab);
-        }
-        if submit {
-            self.submit_staged_cells(self.active_tab);
-        }
         if last_page {
             self.load_last_table_page(self.active_tab);
         } else if reload {
@@ -1172,6 +1189,13 @@ impl App {
     }
 
     pub(super) fn table_controls(&mut self, ui: &mut egui::Ui) {
+        if self
+            .cell_editor
+            .as_ref()
+            .is_some_and(|editor| editor.tab == self.tabs[self.active_tab].id)
+        {
+            return;
+        }
         let actions = self.table_action_state(self.active_tab);
         let enabled = actions.idle && actions.ready;
         let mut reload = false;
@@ -1292,7 +1316,7 @@ impl App {
                         });
                 })
                 .header_response
-                .on_hover_text("仅保存于本标签的本地草稿；在底部提交全部或撤销暂存");
+                .on_hover_text("仅保存于本标签的本地草稿；在表格上方提交全部或撤销暂存");
         }
         if reload {
             self.load_table(self.active_tab);
@@ -1649,79 +1673,6 @@ fn table_footer_status(ui: &mut egui::Ui, status: &str, source: &str, ready: boo
         egui::Label::new(RichText::new(status).small().color(color)).truncate(),
     )
     .on_hover_text(format!("{status}\n{source}"));
-}
-
-fn table_record_controls(ui: &mut egui::Ui, tab: &mut QueryTab, enabled: bool) {
-    let Some(set) = tab
-        .output
-        .as_ref()
-        .and_then(|output| output.sets.get(tab.result_index))
-    else {
-        return;
-    };
-    let rows = set.rows.len();
-    let selected = if tab.selected_insert.is_some() {
-        None
-    } else {
-        tab.selected_cell
-            .map(|(row, _)| row)
-            .or_else(|| tab.selected_rows.map(|(_, row)| row))
-            .filter(|row| *row < rows)
-    };
-    let mut destination = None;
-    ui.add_enabled_ui(enabled && rows > 0, |ui| {
-        if ui
-            .add_enabled(selected != Some(0), egui::Button::new("|‹"))
-            .on_hover_text("当前页第一条记录")
-            .clicked()
-        {
-            destination = Some(0);
-        }
-        if ui
-            .add_enabled(selected.is_none_or(|row| row > 0), egui::Button::new("‹"))
-            .on_hover_text("上一条记录（当前页）")
-            .clicked()
-        {
-            destination = Some(selected.unwrap_or(0).saturating_sub(1));
-        }
-        ui.label(format!(
-            "第 {} 条 / {} 条",
-            selected.map_or(0, |row| row + 1),
-            rows
-        ))
-        .on_hover_text("当前页的记录位置与总条数");
-        if ui
-            .add_enabled(
-                selected.is_none_or(|row| row + 1 < rows),
-                egui::Button::new("›"),
-            )
-            .on_hover_text("下一条记录（当前页）")
-            .clicked()
-        {
-            destination = Some(selected.map_or(0, |row| row + 1));
-        }
-        if ui
-            .add_enabled(selected != rows.checked_sub(1), egui::Button::new("›|"))
-            .on_hover_text("当前页最后一条记录")
-            .clicked()
-        {
-            destination = rows.checked_sub(1);
-        }
-    });
-    if let Some(row) = destination {
-        if let Some((_, column)) = tab.selected_cell {
-            tab.selected_cell = Some((row, column));
-            tab.cell_anchor = tab.selected_cell;
-            tab.selected_rows = None;
-        } else {
-            tab.selected_rows = Some((row, row));
-            tab.selected_cell = None;
-            tab.cell_anchor = None;
-        }
-        tab.selected_insert = None;
-        tab.insert_focus = None;
-        tab.grid_scroll_row = Some(row);
-    }
 }
 
 fn table_page_controls(ui: &mut egui::Ui, tab: &mut QueryTab, enabled: bool) -> (bool, bool) {

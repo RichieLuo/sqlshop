@@ -466,13 +466,23 @@ pub fn parse_nullable_csv(bytes: &[u8]) -> anyhow::Result<(Vec<String>, Vec<Vec<
 }
 
 pub fn export_csv(set: &ResultSet, path: &std::path::Path) -> anyhow::Result<()> {
+    export_csv_rows(set, 0..set.rows.len(), path)
+}
+
+pub fn export_csv_rows(
+    set: &ResultSet,
+    rows: impl IntoIterator<Item = usize>,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
     let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
     write_csv_row(
         &mut writer,
         &set.columns.iter().cloned().map(Some).collect::<Vec<_>>(),
     )?;
-    for row in &set.rows {
-        write_csv_row(&mut writer, row)?;
+    for index in rows {
+        if let Some(row) = set.rows.get(index) {
+            write_csv_row(&mut writer, row)?;
+        }
     }
     std::io::Write::flush(&mut writer)?;
     Ok(())
@@ -481,6 +491,33 @@ pub fn export_csv(set: &ResultSet, path: &std::path::Path) -> anyhow::Result<()>
 #[cfg(test)]
 mod csv_workflow_tests {
     use super::*;
+
+    #[test]
+    fn selected_csv_rows_preserve_order_nulls_and_escaping() {
+        let set = ResultSet {
+            columns: vec!["note".into()],
+            rows: vec![
+                vec![None],
+                vec![Some("中文,\"quote\"\r\n".into())],
+                vec![Some(String::new())],
+            ],
+            ..Default::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selected.csv");
+        export_csv_rows(&set, [1, 99, 0, 2, 1], &path).unwrap();
+        let (columns, rows) = parse_nullable_csv(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(columns, set.columns);
+        assert_eq!(
+            rows,
+            vec![
+                vec![InsertValue::Text("中文,\"quote\"\r\n".into())],
+                vec![InsertValue::Null],
+                vec![InsertValue::Text(String::new())],
+                vec![InsertValue::Text("中文,\"quote\"\r\n".into())],
+            ]
+        );
+    }
 
     #[test]
     fn single_column_null_records_are_not_skipped() {

@@ -18,6 +18,8 @@ pub(super) struct SelectionRefs<'a> {
 pub(super) struct PointerSelection {
     id: egui::Id,
     drag: Option<DragSelection>,
+    start: Option<(usize, usize)>,
+    blocked_press: bool,
     position: Option<egui::Pos2>,
     press_position: Option<egui::Pos2>,
     hovered: Option<(usize, usize, bool)>,
@@ -70,6 +72,8 @@ impl PointerSelection {
         Self {
             id,
             drag,
+            start: None,
+            blocked_press: false,
             position,
             press_position,
             hovered: None,
@@ -123,20 +127,66 @@ impl PointerSelection {
                 press_origin: self.press_position.unwrap(),
                 frame: ui.ctx().cumulative_frame_nr(),
             });
-            // Initialize at the press location even when press/move/release were
-            // coalesced into one frame. Finish resolves the endpoint after all
-            // visible cells have been visited, including reverse-direction drags.
-            apply(selection, anchor, row_heading, row, column);
-            ui.ctx().request_repaint();
+            // ScrollArea registers its floating bars after rendering the cells.
+            // Defer mutation until finish can reject presses owned by those bars.
+            self.start = Some((row, column));
         }
     }
 
-    pub fn finish(self, ui: &egui::Ui, selection: SelectionRefs<'_>) {
+    pub fn exclude_scrollbar<R>(
+        &mut self,
+        ui: &egui::Ui,
+        scroll: &egui::scroll_area::ScrollAreaOutput<R>,
+        axis: usize,
+    ) {
+        // egui 0.33 uses ScrollArea's id.with(axis) for the bar interaction.
+        // Use its actual clipped hit rectangle, including floating/nested bars,
+        // rather than subtracting a guessed width from the content viewport.
+        // Check the original press, not the endpoint: input may be coalesced.
+        let bar_id = scroll.id.with(axis);
+        let rect_id = self.id.with(("scrollbar-hit-rect", bar_id));
+        if let Some(response) = ui.ctx().read_response(bar_id) {
+            let frame = ui.ctx().cumulative_frame_nr();
+            let previous_rect = ui.data_mut(|data| {
+                let previous = data.get_temp::<(egui::Rect, egui::Rect, u64)>(rect_id);
+                data.insert_temp(rect_id, (response.interact_rect, scroll.inner_rect, frame));
+                previous
+                    .filter(|(_, viewport, previous_frame)| {
+                        *viewport == scroll.inner_rect && previous_frame.saturating_add(1) >= frame
+                    })
+                    .map(|(rect, _, _)| rect)
+            });
+            if self.pressed
+                && response.enabled()
+                && response.sense.senses_drag()
+                && self.press_position.is_some_and(|position| {
+                    // A floating bar may shrink when a coalesced move leaves it.
+                    // Its previous hit rect is the one visible at the press.
+                    (response.interact_rect.contains(position)
+                        || previous_rect.is_some_and(|rect| rect.contains(position)))
+                        && ui.ctx().layer_id_at(position) == Some(response.layer_id)
+                })
+            {
+                self.blocked_press = true;
+            }
+        }
+    }
+
+    pub fn finish(self, ui: &egui::Ui, mut selection: SelectionRefs<'_>) {
+        if self.blocked_press {
+            ui.data_mut(|data| data.remove::<DragSelection>(self.id));
+            return;
+        }
         if let Some(mut drag) = self.drag {
+            if let Some((row, column)) = self.start {
+                // Initialize even when press/move/release arrived in one frame.
+                apply(&mut selection, drag.anchor, drag.rows, row, column);
+                ui.ctx().request_repaint();
+            }
             if (self.down || self.released)
                 && let Some((row, column, _)) = self.hovered
             {
-                apply(selection, drag.anchor, drag.rows, row, column);
+                apply(&mut selection, drag.anchor, drag.rows, row, column);
                 ui.ctx().request_repaint();
             }
             if self.down {
@@ -150,7 +200,7 @@ impl PointerSelection {
 }
 
 fn apply(
-    selection: SelectionRefs<'_>,
+    selection: &mut SelectionRefs<'_>,
     anchor: (usize, usize),
     rows: bool,
     row: usize,

@@ -7,7 +7,7 @@ use sqlshop::{
     },
     model::{
         CellUpdate, CreateTableColumn, Credentials, Engine, InsertValue, Profile, QueryOutput,
-        ResultSet, SshAuth, Table, TableData, export_csv, parse_nullable_csv,
+        ResultSet, SshAuth, Table, TableData, export_csv, export_csv_rows, parse_nullable_csv,
     },
     sql_editor::{
         byte_to_char_index, char_to_byte_index, completion_word, completions,
@@ -739,7 +739,7 @@ pub struct App {
     history: Vec<HistoryEntry>,
     history_open: bool,
     history_search: String,
-    last_workspace: String,
+    last_workspace: Option<Workspace>,
     last_autosave: std::time::Instant,
     pending_history: HashMap<Uuid, HistoryEntry>,
     confirm_tab_action: Option<TabAction>,
@@ -836,7 +836,7 @@ impl App {
             history: Vec::new(),
             history_open: false,
             history_search: String::new(),
-            last_workspace: String::new(),
+            last_workspace: None,
             last_autosave: std::time::Instant::now(),
             pending_history: HashMap::new(),
             confirm_tab_action: None,
@@ -3170,12 +3170,13 @@ FROM users;"
                                     let connected = session.is_some_and(|s| s.connected.is_some());
                                     let busy = session.is_some_and(|s| s.busy);
                                     let databases =
-                                        session.map(|s| s.databases.clone()).unwrap_or_default();
+                                        session.map(|s| s.databases.as_slice()).unwrap_or_default();
                                     let active_database =
-                                        session.and_then(|s| s.active_database.clone());
+                                        session.and_then(|s| s.active_database.as_ref());
                                     let catalog_tables =
-                                        session.map(|s| s.tables.clone()).unwrap_or_default();
-                                    tree_render.entries = session.map(|s| s.tree_metadata.entries.clone()).unwrap_or_default();
+                                        session.map(|s| s.tables.as_slice()).unwrap_or_default();
+                                    let empty_entries = HashMap::new();
+                                    let tree_entries = session.map(|s| &s.tree_metadata.entries).unwrap_or(&empty_entries);
                                     let mut title = egui::text::LayoutJob::default();
                                     title.append(
                                         &profile.name,
@@ -3221,8 +3222,8 @@ FROM users;"
                                                 .weak(),
                                             );
                                         }
-                                        for database in &databases {
-                                            let active = active_database.as_ref() == Some(database);
+                                        for database in databases {
+                                            let active = active_database == Some(database);
                                             let protected_database = match profile.engine {
                                                 Engine::MySql => ["mysql", "information_schema", "performance_schema", "sys"].iter().any(|name| database.eq_ignore_ascii_case(name)),
                                                 Engine::Postgres => ["postgres", "template0", "template1"].iter().any(|name| database.eq_ignore_ascii_case(name)),
@@ -3281,6 +3282,7 @@ FROM users;"
                                                                 busy,
                                                                 &mut schema_dialog,
                                                                 &mut tree_render,
+                                                                tree_entries,
                                                             ) {
                                                                 preview = Some((
                                                                     profile.id,
@@ -3326,6 +3328,7 @@ FROM users;"
                                                                                 busy,
                                                                                 &mut schema_dialog,
                                                                                 &mut tree_render,
+                                                                                tree_entries,
                                                                             )
                                                                         {
                                                                             preview = Some((
@@ -3787,13 +3790,7 @@ FROM users;"
             return;
         }
         // Reserve pagination before rendering content, including failed or empty queries.
-        let records = self.tabs[self.active_tab]
-            .output
-            .as_ref()
-            .and_then(|output| output.sets.get(self.tabs[self.active_tab].result_index))
-            .is_some_and(|set| !set.rows.is_empty());
-        let (content, footer) =
-            table_workspace_rects_with_records(ui.available_rect_before_wrap(), records);
+        let (content, footer) = table_workspace_rects(ui.available_rect_before_wrap());
         ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(content));
             self.workspace_content(ui);
@@ -3866,6 +3863,7 @@ FROM users;"
             return;
         }
         ui.add_space(4.0);
+        let draft_actions = self.table_draft_action_state();
         let tab = &mut self.tabs[self.active_tab];
         if !table_tab {
             let can_locate_error = tab.last_executed_document.as_ref() == Some(&tab.sql)
@@ -3986,6 +3984,7 @@ FROM users;"
             tab,
             context_matches && !busy && !tab.table_snapshot_stale,
             self.cell_editor.as_mut(),
+            draft_actions,
         );
         if let Some(editor) = editor {
             self.cell_editor = Some(editor);
@@ -4008,6 +4007,12 @@ FROM users;"
                         }
                         Err(message) => self.fail(message),
                     }
+                }
+                GridAction::SubmitDrafts => {
+                    self.submit_staged_cells(self.active_tab);
+                }
+                GridAction::RevertDrafts => {
+                    self.discard_staged_cells(self.active_tab);
                 }
                 GridAction::DraftError(message) => self.fail(message),
                 GridAction::Browse(action) => self.apply_grid_browse(action),
@@ -4817,14 +4822,7 @@ FROM users;"
                 .and_then(|set| {
                     if let Some((tab_id, rows)) = &self.export_rows {
                         anyhow::ensure!(*tab_id == tab.id, "导出目标标签已改变");
-                        let selected = ResultSet {
-                            rows: rows
-                                .iter()
-                                .filter_map(|index| set.rows.get(*index).cloned())
-                                .collect(),
-                            ..set.clone()
-                        };
-                        export_csv(&selected, &destination)
+                        export_csv_rows(set, rows.iter().copied(), &destination)
                     } else {
                         export_csv(set, &destination)
                     }
@@ -5107,20 +5105,8 @@ impl eframe::App for App {
     }
 }
 
-#[cfg(test)]
 fn table_workspace_rects(available: egui::Rect) -> (egui::Rect, egui::Rect) {
-    table_workspace_rects_with_records(available, false)
-}
-
-fn table_workspace_rects_with_records(
-    available: egui::Rect,
-    records: bool,
-) -> (egui::Rect, egui::Rect) {
-    let footer_height = if records || table_footer_two_rows(available.width()) {
-        74.0
-    } else {
-        42.0
-    };
+    let footer_height = 42.0;
     let footer_top = (available.bottom() - footer_height).max(available.top());
     let content = egui::Rect::from_min_max(
         available.min,
@@ -5128,10 +5114,6 @@ fn table_workspace_rects_with_records(
     );
     let footer = egui::Rect::from_min_max(egui::pos2(available.left(), footer_top), available.max);
     (content, footer)
-}
-
-fn table_footer_two_rows(width: f32) -> bool {
-    width < 820.0
 }
 
 fn default_csv_export_path() -> String {
@@ -5204,6 +5186,8 @@ enum GridAction {
         movement: CellMovement,
     },
     PasteValues(String),
+    SubmitDrafts,
+    RevertDrafts,
     DraftError(String),
 }
 
@@ -5459,21 +5443,7 @@ fn row_context_menu(
             .button(format!("复制选中行 ({} 行, TSV)", rows.len()))
             .clicked()
         {
-            let selected = ResultSet {
-                rows: rows
-                    .iter()
-                    .filter_map(|index| set.rows.get(*index).cloned())
-                    .collect(),
-                ..set.clone()
-            };
-            ui.ctx().copy_text(selected_tsv(
-                &selected,
-                Some((0, 0)),
-                Some((
-                    selected.rows.len().saturating_sub(1),
-                    selected.columns.len().saturating_sub(1),
-                )),
-            ));
+            ui.ctx().copy_text(selected_rows_tsv(set, &rows));
             ui.close();
         }
         if ui
@@ -5503,7 +5473,8 @@ fn result_grid(
     tab: &mut QueryTab,
     can_edit: bool,
 ) -> (Option<CellEditor>, Option<GridAction>) {
-    result_grid_inline(ui, tab, can_edit, None)
+    let draft_actions = (can_edit && !tab.table_snapshot_stale, true);
+    result_grid_inline(ui, tab, can_edit, None, draft_actions)
 }
 
 fn result_grid_inline(
@@ -5511,6 +5482,7 @@ fn result_grid_inline(
     tab: &mut QueryTab,
     can_edit: bool,
     mut inline_editor: Option<&mut CellEditor>,
+    draft_actions: (bool, bool),
 ) -> (Option<CellEditor>, Option<GridAction>) {
     let can_edit = can_edit && !tab.table_snapshot_stale;
     let has_drafts = tab.has_table_drafts();
@@ -5544,6 +5516,27 @@ fn result_grid_inline(
                     .position(|name| name == &editor.change.column)?,
             ))
         });
+    let draft_summary = tab.draft_summary();
+    let draft_buttons = |ui: &mut egui::Ui| {
+        let mut action = None;
+        if ui
+            .add_enabled(draft_actions.0, egui::Button::new("提交全部"))
+            .on_hover_text(format!(
+                "先暂存当前编辑，再在同一事务中提交本标签的全部修改；{draft_summary}"
+            ))
+            .clicked()
+        {
+            action = Some(GridAction::SubmitDrafts);
+        }
+        if ui
+            .add_enabled(draft_actions.1, egui::Button::new("撤销暂存"))
+            .on_hover_text("取消当前编辑并清除本标签的本地草稿；不会撤销已提交的数据库写入")
+            .clicked()
+        {
+            action = Some(GridAction::RevertDrafts);
+        }
+        action
+    };
     if let Some(editor) = inline_editor.as_mut().filter(|editor| editor.tab == tab.id) {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("编辑 {}", editor.change.column)).small());
@@ -5566,6 +5559,10 @@ fn result_grid_inline(
                     cancel: true,
                     movement: CellMovement::Stay,
                 });
+            }
+            ui.separator();
+            if let Some(action) = draft_buttons(ui) {
+                row_action = Some(action);
             }
             ui.label(
                 RichText::new(if editor.expanded {
@@ -5623,6 +5620,16 @@ fn result_grid_inline(
                 });
         }
     }
+    if has_drafts
+        && inline_editor
+            .as_ref()
+            .is_none_or(|editor| editor.tab != tab.id)
+    {
+        ui.horizontal(|ui| {
+            row_action = draft_buttons(ui);
+            ui.label(RichText::new(&draft_summary).small().weak());
+        });
+    }
     let can_browse = can_edit
         && inline_editor.is_none()
         && target.is_some()
@@ -5648,11 +5655,13 @@ fn result_grid_inline(
         ))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            // Keep scrolled rows from painting over the fixed header.
+            ui.visuals_mut().clip_rect_margin = 0.0;
             ui.visuals_mut().selection.bg_fill = accent(ui).gamma_multiply(0.18);
             let height = ui.available_height().max(0.0);
             let body_height =
                 (height - GRID_HEADER_HEIGHT - ui.spacing().scroll.bar_width).max(0.0);
-            egui::ScrollArea::horizontal()
+            let horizontal_scroll = egui::ScrollArea::horizontal()
                 .id_salt(("result-grid-scroll", tab.id, tab.result_index))
                 .scroll_source(egui::scroll_area::ScrollSource { drag: false, ..Default::default() })
                 .auto_shrink([false, false])
@@ -5687,7 +5696,7 @@ fn result_grid_inline(
                         builder = builder.scroll_to_row(row, Some(egui::Align::Center));
                     }
                     if let Some((row, _)) = editing_location.filter(|_| inline_editor.as_ref().is_some_and(|editor| editor.focus)) {
-                        builder = builder.scroll_to_row(row, Some(egui::Align::Center));
+                        builder = builder.scroll_to_row(row, None);
                     }
                     if let Some(index) = tab.insert_focus.and_then(|id| tab.insert_drafts.iter().position(|draft| draft.id == id)) {
                         builder = builder.scroll_to_row(set.rows.len() + index, Some(egui::Align::BOTTOM));
@@ -5695,7 +5704,7 @@ fn result_grid_inline(
                     if reset_widths {
                         builder.reset();
                     }
-                    builder
+                    let vertical_scroll = builder
                         .header(GRID_HEADER_HEIGHT, |mut header| {
                             header.col(|ui| {
                                 grid_header_cell(ui, "#", "行号");
@@ -5783,19 +5792,21 @@ fn result_grid_inline(
                                     }
                                 });
                                 for (column_index, cell) in set.rows[row_index].iter().enumerate() {
-                                    let staged_value = metadata.and_then(|data| data.keys.get(row_index))
-                                        .and_then(|keys| staged_values.get(&(keys.as_slice(), set.columns[column_index].as_str())))
-                                        .copied();
                                     row.col(|ui| {
+                                        if editing_location != Some((row_index, column_index))
+                                            && !ui.is_sizing_pass()
+                                            && !ui.is_rect_visible(ui.available_rect_before_wrap()) {
+                                            ui.allocate_space(ui.available_rect_before_wrap().size());
+                                            return;
+                                        }
+                                        let staged_value = metadata.and_then(|data| data.keys.get(row_index))
+                                            .and_then(|keys| staged_values.get(&(keys.as_slice(), set.columns[column_index].as_str())))
+                                            .copied();
                                         if editing_location == Some((row_index, column_index))
                                             && let Some(editor) = inline_editor.as_mut()
                                             && !editor.expanded {
                                             let was_focus = editor.focus;
-                                            let response = ui.add_enabled(can_edit && !editor.is_null,
-                                                egui::TextEdit::singleline(&mut editor.text)
-                                                    .id(egui::Id::new(("inline-cell", tab.id)))
-                                                    .desired_width(f32::INFINITY)
-                                                    .font(egui::TextStyle::Monospace));
+                                            let response = grid_cell_input(ui, tab.id, editor, can_edit);
                                             if was_focus {
                                                 if !editor.is_null { response.request_focus(); }
                                                 editor.focus = false;
@@ -5843,21 +5854,6 @@ fn result_grid_inline(
                                         let editable = inline_editor.is_none() && grid_cell_eligible(can_edit, target, metadata, set, row_index, column_index);
                                         let begin_edit = response.double_clicked() && editable && inline_editor.is_none();
                                         let mut menu_edit = false;
-                                        let hint = if staged_value.is_some() {
-                                            format!("暂存值：{displayed:?}\n数据库快照：{cell:?}\n复制和导出使用数据库快照；双击可继续编辑")
-                                        } else if editable {
-                                            format!(
-                                                "{value}
-单击选格 · 拖动选择区域 · Shift+单击扩展 · 双击 / F2 / Enter 编辑 · 粘贴仅暂存"
-                                            )
-                                        } else if target.is_none() {
-                                            format!(
-                                                "{value}
-SQL 查询结果只读；双击左侧表名打开可编辑的表数据"
-                                            )
-                                        } else {
-                                            value.to_owned()
-                                        };
                                         if response.secondary_clicked() { tab.selected_insert = None; }
                                         if response.secondary_clicked()
                                             && !cell_in_selection(tab.cell_anchor, tab.selected_cell, row_index, column_index)
@@ -5868,7 +5864,18 @@ SQL 查询结果只读；双击左侧表名打开可编辑的表数据"
                                             tab.selected_cell = None;
                                             tab.cell_anchor = None;
                                         }
-                                        let response = response.on_hover_text(hint);
+                                        let response = response.on_hover_ui(|ui| {
+                                            if staged_value.is_some() {
+                                                ui.label(format!("暂存值：{displayed:?}\n数据库快照：{cell:?}\n复制和导出使用数据库快照；双击可继续编辑"));
+                                            } else {
+                                                ui.label(value);
+                                                if editable {
+                                                    ui.label("单击选格 · 拖动选择区域 · Shift+单击扩展 · 双击 / F2 / Enter 编辑 · 粘贴仅暂存");
+                                                } else if target.is_none() {
+                                                    ui.label("SQL 查询结果只读；双击左侧表名打开可编辑的表数据");
+                                                }
+                                            }
+                                        });
                                         response.context_menu(|ui| {
                                             if cell_in_selection(tab.cell_anchor, tab.selected_cell, row_index, column_index)
                                                 && let Some((end_row, end_column)) = tab.selected_cell {
@@ -5917,23 +5924,7 @@ SQL 查询结果只读；双击左侧表名打开可编辑的表数据"
                                                 ))
                                                 .clicked()
                                             {
-                                                let selected = ResultSet {
-                                                    rows: rows
-                                                        .iter()
-                                                        .filter_map(|index| {
-                                                            set.rows.get(*index).cloned()
-                                                        })
-                                                        .collect(),
-                                                    ..set.clone()
-                                                };
-                                                ui.ctx().copy_text(selected_tsv(
-                                                    &selected,
-                                                    Some((0, 0)),
-                                                    Some((
-                                                        selected.rows.len().saturating_sub(1),
-                                                        selected.columns.len().saturating_sub(1),
-                                                    )),
-                                                ));
+                                                ui.ctx().copy_text(selected_rows_tsv(set, &rows));
                                                 ui.close();
                                             }
                                             if ui
@@ -5988,9 +5979,11 @@ SQL 查询结果只读；双击左侧表名打开可编辑的表数据"
                                 }
                             });
                         });
+                    pointer_selection.exclude_scrollbar(ui, &vertical_scroll, 1);
                     resize_grid_columns(ui, widths_id, &header_rects, &mut widths);
                     ui.data_mut(|data| data.insert_temp(widths_id, widths));
                 });
+            pointer_selection.exclude_scrollbar(ui, &horizontal_scroll, 0);
         });
     pointer_selection.finish(
         ui,
@@ -6181,16 +6174,70 @@ fn selected_tsv(
         return String::new();
     };
     let (r0, c0) = anchor.unwrap_or((r1, c1));
-    let rows: Vec<Vec<String>> = set
-        .rows
+    let width = set.rows.iter().map(Vec::len).max().unwrap_or(0);
+    borrowed_rows_tsv(
+        set.rows
+            .iter()
+            .skip(r0.min(r1))
+            .take(r0.max(r1).saturating_sub(r0.min(r1)).saturating_add(1)),
+        c0.min(c1),
+        c0.max(c1),
+        width,
+    )
+}
+
+fn selected_rows_tsv(set: &ResultSet, rows: &[usize]) -> String {
+    let width = rows
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|value| value.clone().unwrap_or_else(|| "NULL".into()))
-                .collect()
-        })
-        .collect();
-    sqlshop::sql_editor::copy_tsv(&rows, r0.min(r1)..=r0.max(r1), c0.min(c1)..=c0.max(c1))
+        .filter_map(|index| set.rows.get(*index))
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
+    borrowed_rows_tsv(
+        rows.iter().filter_map(|index| set.rows.get(*index)),
+        0,
+        set.columns.len().saturating_sub(1),
+        width,
+    )
+}
+
+fn borrowed_rows_tsv<'a>(
+    rows: impl Iterator<Item = &'a Vec<Option<String>>>,
+    start_column: usize,
+    end_column: usize,
+    width: usize,
+) -> String {
+    if start_column >= width {
+        return String::new();
+    }
+    let mut output = String::new();
+    for (index, row) in rows.enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        for column in start_column..=end_column.min(width - 1) {
+            if column > start_column {
+                output.push('\t');
+            }
+            let value = row
+                .get(column)
+                .map(|value| value.as_deref().unwrap_or("NULL"))
+                .unwrap_or("");
+            if value.contains(['\t', '\n', '\r', '"']) {
+                output.push('"');
+                for character in value.chars() {
+                    if character == '"' {
+                        output.push('"');
+                    }
+                    output.push(character);
+                }
+                output.push('"');
+            } else {
+                output.push_str(value);
+            }
+        }
+    }
+    output
 }
 
 fn grid_cell_border(ui: &egui::Ui, rect: egui::Rect) {
@@ -6268,6 +6315,41 @@ fn grid_header_cell_marked(
         },
     );
     grid_cell_border(ui, rect);
+    response
+}
+
+fn grid_cell_input(
+    ui: &mut egui::Ui,
+    tab: Uuid,
+    editor: &mut CellEditor,
+    can_edit: bool,
+) -> egui::Response {
+    let rect = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(rect, 0, surface(ui));
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+    let vertical_margin = ((rect.height() - row_height) * 0.5).max(0.0).floor() as i8;
+    let response = ui
+        .scope(|ui| {
+            ui.set_enabled(can_edit && !editor.is_null);
+            ui.put(
+                rect,
+                egui::TextEdit::singleline(&mut editor.text)
+                    .id(egui::Id::new(("inline-cell", tab)))
+                    .frame(false)
+                    .margin(egui::Margin::symmetric(8, vertical_margin))
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Body),
+            )
+        })
+        .inner;
+    grid_cell_border(ui, rect);
+    ui.painter().rect_stroke(
+        rect,
+        0,
+        egui::Stroke::new(1.0, accent(ui)),
+        egui::StrokeKind::Inside,
+    );
     response
 }
 
@@ -6815,6 +6897,7 @@ fn table_buttons(
         busy,
         schema_dialog,
         &mut table_tree_ui::TreeRender::default(),
+        &HashMap::new(),
     )
 }
 
@@ -7643,7 +7726,91 @@ mod tests {
     }
 
     #[test]
-    fn table_footer_controls_remain_visible_at_narrow_workspace_widths() {
+    fn inline_cell_input_fills_cell_with_square_outline() {
+        let (app, _, _) = table_flow_fixture();
+        let mut editor = grid_cell_editor(&app.tabs[0], 0, 1, true).unwrap();
+        let ctx = app.context.clone();
+        let cell = egui::Rect::from_min_size(egui::pos2(20.0, 40.0), egui::vec2(160.0, 32.0));
+        let mut outline_color = egui::Color32::TRANSPARENT;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(cell), |ui| {
+                    outline_color = accent(ui);
+                    let response = grid_cell_input(ui, app.tabs[0].id, &mut editor, true);
+                    assert!((response.rect.width() - cell.width()).abs() < 0.5);
+                    assert!((response.rect.height() - cell.height()).abs() < 0.5);
+                });
+            });
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Rect(rect)
+                if rect.rect == cell
+                    && rect.corner_radius == egui::CornerRadius::ZERO
+                    && rect.stroke.color == outline_color
+                    && rect.stroke.width == 1.0
+        )));
+    }
+
+    #[test]
+    fn inline_editing_replaces_table_toolbar_without_moving_grid_header() {
+        let (mut app, _, _) = table_flow_fixture();
+        let ctx = app.context.clone();
+        install_font(&ctx);
+        let mut header_positions = Vec::new();
+        for editing in [false, true, false] {
+            app.cell_editor = editing.then(|| grid_cell_editor(&app.tabs[0], 0, 0, true).unwrap());
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 820.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.workspace_content(ui);
+                    });
+                },
+            );
+            let labels = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                labels
+                    .iter()
+                    .any(|text| text.galley.job.text == "结构 / DDL"),
+                !editing,
+            );
+            assert_eq!(
+                labels.iter().any(|text| text.galley.job.text == "展开编辑"),
+                editing,
+            );
+            header_positions.push(
+                labels
+                    .iter()
+                    .find(|text| text.galley.job.text == "#")
+                    .expect("grid header should render")
+                    .pos
+                    .y,
+            );
+        }
+        assert!(
+            header_positions
+                .iter()
+                .all(|y| (y - header_positions[0]).abs() < 0.5),
+            "grid header moved while toggling editing: {header_positions:?}",
+        );
+    }
+
+    #[test]
+    fn table_footer_controls_stay_on_one_line_at_all_workspace_widths() {
         for width in [406.0, 554.0, 934.0] {
             let (mut app, _, change) = table_flow_fixture();
             app.tabs[0].stage_cell(change);
@@ -7654,7 +7821,7 @@ mod tests {
             let available =
                 egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(width, 450.0));
             let (content, footer) = table_workspace_rects(available);
-            assert_eq!(footer.height(), if width < 820.0 { 74.0 } else { 42.0 });
+            assert_eq!(footer.height(), 42.0);
             assert!(content.bottom() < footer.top());
             let output = ctx.run(
                 egui::RawInput {
@@ -7673,17 +7840,13 @@ mod tests {
                     });
                 },
             );
-            for label in [
-                "+",
-                "−",
-                "提交全部",
-                "撤销暂存",
-                "刷新",
-                "上一页",
-                "下一页",
-                "每页",
-                "200",
-            ] {
+            // Narrow footers clip later controls until horizontally scrolled.
+            let expected = if width < 600.0 {
+                vec!["+", "−", "刷新", "上一页"]
+            } else {
+                vec!["+", "−", "刷新", "上一页", "下一页", "每页", "200"]
+            };
+            for label in expected {
                 let shape = output
                     .shapes
                     .iter()
@@ -7694,7 +7857,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing {label} at width {width}"));
                 let rect = egui::Rect::from_min_size(shape.pos, shape.galley.size());
                 assert!(
-                    footer.contains_rect(rect),
+                    rect.top() >= footer.top() && rect.bottom() <= footer.bottom(),
                     "{label} at {rect:?} outside footer {footer:?}, width {width}"
                 );
             }
@@ -7702,7 +7865,69 @@ mod tests {
     }
 
     #[test]
-    fn table_footer_submit_revert_and_refresh_share_busy_stale_and_offline_guards() {
+    fn table_footer_hides_draft_actions_and_record_navigation_without_changes() {
+        let (mut app, _, _) = table_flow_fixture();
+        let ctx = app.context.clone();
+        install_font(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.table_pagination(ui));
+        });
+        let labels = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for label in ["+", "−", "刷新", "首页", "上一页", "下一页", "末页"] {
+            assert!(labels.contains(&label), "missing {label}");
+        }
+        for label in ["提交全部", "撤销暂存", "|‹", "‹", "›", "›|"] {
+            assert!(!labels.contains(&label), "unexpected {label}");
+        }
+        assert!(!labels.iter().any(|label| label.contains("条 /")));
+    }
+
+    #[test]
+    fn table_draft_actions_render_above_grid_after_cell_editing_ends() {
+        let (mut app, _, change) = table_flow_fixture();
+        app.tabs[0].stage_cell(change);
+        let ctx = app.context.clone();
+        install_font(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let actions = app.table_draft_action_state();
+                result_grid_inline(ui, &mut app.tabs[0], true, None, actions);
+            });
+        });
+        let positions = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if ["提交全部", "撤销暂存"].contains(&text.galley.job.text.as_str()) =>
+                {
+                    Some(text.pos.y)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0], positions[1]);
+        assert!(positions[0] < 40.0, "draft actions must precede the grid");
+        let footer = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.table_pagination(ui));
+        });
+        assert!(!footer.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Text(text)
+                if ["提交全部", "撤销暂存"].contains(&text.galley.job.text.as_str())
+        )));
+    }
+
+    #[test]
+    fn table_draft_actions_above_grid_share_busy_stale_and_offline_guards() {
         fn click_button(app: &mut App, label: &str, time: f64) {
             let ctx = app.context.clone();
             let mut frame = |time, events| {
@@ -7717,7 +7942,25 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| app.table_pagination(ui));
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let draft_actions = app.table_draft_action_state();
+                            let (_, action) = result_grid_inline(
+                                ui,
+                                &mut app.tabs[0],
+                                draft_actions.0,
+                                app.cell_editor.as_mut(),
+                                draft_actions,
+                            );
+                            match action {
+                                Some(GridAction::SubmitDrafts) => {
+                                    app.submit_staged_cells(0);
+                                }
+                                Some(GridAction::RevertDrafts) => {
+                                    app.discard_staged_cells(0);
+                                }
+                                _ => {}
+                            }
+                        });
                     },
                 )
             };
@@ -7731,7 +7974,7 @@ mod tests {
                     }
                     _ => None,
                 })
-                .expect("footer button should render");
+                .expect("draft action should render above the grid");
             for pressed in [true, false] {
                 let _ = frame(
                     time + if pressed { 0.02 } else { 0.04 },
@@ -7773,7 +8016,7 @@ mod tests {
         assert!(!app.error);
         assert!(app.tabs[0].table_snapshot_stale);
         app.sessions.get_mut(&target.connection).unwrap().connected = Some(app.profiles[0].clone());
-        click_button(&mut app, "刷新", 4.0);
+        app.load_table(0);
         assert!(app.session_busy(target.connection));
         assert!(app.tabs[0].table_read_pending);
         assert!(app.tabs[0].output.is_some());
@@ -7906,7 +8149,7 @@ mod tests {
                     },
                 )
             };
-            let position = egui::pos2(550.0, 80.0);
+            let position = egui::pos2(550.0, 115.0);
             let _ = frame(time, vec![egui::Event::PointerMoved(position)]);
             let pointer_event = |pos, button, pressed| {
                 vec![
@@ -8231,6 +8474,220 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workspace_borrowed_comparison_tracks_all_persisted_fields() {
+        let mut app = session_test_app();
+        let mut saved = app.workspace_snapshot();
+        assert!(app.workspace_matches(&saved));
+        macro_rules! changed {
+            ($change:expr) => {
+                $change;
+                assert!(!app.workspace_matches(&saved), "{}", stringify!($change));
+                saved = app.workspace_snapshot();
+                assert!(app.workspace_matches(&saved));
+            };
+        }
+        changed!(app.tabs[0].sql.push_str("SELECT '草稿'"));
+        changed!(app.tabs[0].saved_sql.push_str("SELECT 1"));
+        changed!(app.tabs[0].name.push_str(" renamed"));
+        changed!(app.tabs[0].file_path = Some(PathBuf::from("draft.sql")));
+        changed!(app.tabs[0].id = Uuid::new_v4());
+        changed!(
+            app.tabs[0].target = Some(QueryTarget {
+                connection: Uuid::new_v4(),
+                database: Some("db".into()),
+                schema: Some("public".into()),
+            })
+        );
+        changed!(app.tabs[0].target.as_mut().unwrap().schema = Some("other".into()));
+        changed!(app.tabs[0].target.as_mut().unwrap().database = None);
+        changed!(app.tabs[0].target.as_mut().unwrap().connection = Uuid::new_v4());
+        changed!(app.next_tab += 1);
+        changed!(app.editor_height = Some(280.0));
+        changed!(app.view.navigation ^= true);
+        changed!(app.inspector_visible ^= true);
+        changed!(app.view.information_force ^= true);
+        changed!(app.view.toolbar ^= true);
+        changed!(app.view.status ^= true);
+        changed!(app.view.focus ^= true);
+        changed!(app.view.connected_only ^= true);
+        changed!(app.theme = egui::ThemePreference::Light);
+        changed!(app.theme = egui::ThemePreference::Dark);
+        changed!(app.theme = egui::ThemePreference::System);
+        changed!(app.history.push(HistoryEntry {
+            sql: "SELECT '历史'".into(),
+            target: app.tabs[0].target.clone().unwrap(),
+            source: "SQL 1".into(),
+            timestamp: 1,
+            success: false,
+        }));
+        changed!(app.history[0].sql.push_str("; SELECT 2"));
+        changed!(app.history[0].target.schema = Some("history_schema".into()));
+        changed!(app.history[0].source.push_str(" renamed"));
+        changed!(app.history[0].timestamp += 1);
+        changed!(app.history[0].success = true);
+        changed!(app.history.clear());
+        changed!(app.tabs.push(QueryTab::new(2)));
+        changed!(app.active_tab = 1);
+        changed!(app.tabs.swap(0, 1));
+        changed!(app.active_tab = 0);
+        changed!(app.tabs.pop());
+    }
+
+    #[test]
+    fn workspace_borrowed_comparison_uses_filtered_tab_order_and_active_mapping() {
+        let mut app = session_test_app();
+        let mut clean_table = QueryTab::new(2);
+        clean_table.table_target = Some(TableTarget {
+            connection: Uuid::new_v4(),
+            database: "db".into(),
+            schema: "public".into(),
+            name: "items".into(),
+        });
+        // A clean table browser is omitted even when it contains generated SQL.
+        clean_table.sql = "SELECT * FROM items".into();
+        clean_table.saved_sql = clean_table.sql.clone();
+        let mut management = QueryTab::new(3);
+        management.jobs = Some(management_ui::JobsDocument::new(None));
+        let mut definition = QueryTab::new(4);
+        definition.definition = Some(object_browser_host::DefinitionDocument {
+            connection: Uuid::new_v4(),
+            database: "db".into(),
+            object: object_browser_host::example_catalog().objects.remove(0),
+            sql: Some("CREATE TABLE items (id int)".into()),
+            error: None,
+            stale: false,
+        });
+        app.tabs
+            .extend([clean_table, management, definition, QueryTab::new(5)]);
+        app.active_tab = 4;
+        let saved = app.workspace_snapshot();
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.active_tab, 1);
+        assert!(app.workspace_matches(&saved));
+        app.tabs[2].sql.push_str("ignored management edit");
+        app.tabs[3].sql.push_str("ignored definition edit");
+        assert!(app.workspace_matches(&saved));
+        app.tabs.swap(1, 2);
+        assert!(app.workspace_matches(&saved));
+        app.active_tab = 2; // Omitted table maps to persisted index zero.
+        assert!(!app.workspace_matches(&saved));
+        let omitted_active = app.workspace_snapshot();
+        assert_eq!(omitted_active.active_tab, 0);
+        app.active_tab = 1; // Switching between omitted tabs does not change it.
+        assert!(app.workspace_matches(&omitted_active));
+        app.tabs[2].sql.push_str(" WHERE id = 1");
+        assert!(!app.workspace_matches(&omitted_active));
+        let dirty_table = app.workspace_snapshot();
+        assert_eq!(dirty_table.tabs.len(), 3);
+        assert!(app.workspace_matches(&dirty_table));
+        app.tabs[2].saved_sql = app.tabs[2].sql.clone();
+        assert!(app.workspace_matches(&omitted_active));
+        app.tabs.clear();
+        let mut omitted = QueryTab::new(6);
+        omitted.jobs = Some(management_ui::JobsDocument::new(None));
+        app.tabs.push(omitted);
+        app.active_tab = 0;
+        let empty = app.workspace_snapshot();
+        assert!(empty.tabs.is_empty());
+        assert_eq!(empty.active_tab, 0);
+        assert!(app.workspace_matches(&empty));
+    }
+
+    #[test]
+    fn workspace_autosave_first_save_and_idle_skip_preserve_cached_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = session_test_app();
+        app.workspace_store = Some(WorkspaceStore::new(directory.path().to_owned()));
+        app.tabs[0].sql = "SELECT 'large unchanged draft'".repeat(1000);
+        assert!(app.last_workspace.is_none());
+        assert!(app.autosave_workspace(true));
+        assert_eq!(
+            app.workspace_store.as_ref().unwrap().load().unwrap(),
+            app.workspace_snapshot()
+        );
+        let sql_ptr = app.last_workspace.as_ref().unwrap().tabs[0].sql.as_ptr();
+        // An attempted rewrite now fails: an idle save must never touch the store.
+        let path = directory.path().join("workspace.json");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.last_autosave = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        assert!(app.autosave_workspace(false));
+        assert!(app.autosave_workspace(true));
+        assert_eq!(
+            app.last_workspace.as_ref().unwrap().tabs[0].sql.as_ptr(),
+            sql_ptr
+        );
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn workspace_autosave_failed_save_retries_without_advancing_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.json");
+        let mut app = session_test_app();
+        app.workspace_store = Some(WorkspaceStore::new(directory.path().to_owned()));
+        std::fs::create_dir(&path).unwrap();
+        assert!(!app.autosave_workspace(true));
+        assert!(app.last_workspace.is_none());
+        std::fs::remove_dir(&path).unwrap();
+        assert!(app.autosave_workspace(true));
+        let previous = app.last_workspace.clone();
+        app.tabs[0].sql = "SELECT 'retry me'".into();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!app.autosave_workspace(true));
+        assert_eq!(app.last_workspace, previous);
+        assert!(!app.workspace_matches(app.last_workspace.as_ref().unwrap()));
+        std::fs::remove_dir(&path).unwrap();
+        app.last_autosave = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        assert!(app.autosave_workspace(false));
+        assert_eq!(
+            app.workspace_store.as_ref().unwrap().load().unwrap(),
+            app.workspace_snapshot()
+        );
+        assert!(app.workspace_matches(app.last_workspace.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn workspace_autosave_force_bypasses_interval_but_screenshot_and_disabled_store_remain_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = session_test_app();
+        app.workspace_store = Some(WorkspaceStore::new(directory.path().to_owned()));
+        assert!(app.autosave_workspace(true));
+        let previous = app.last_workspace.clone();
+        app.tabs[0].sql = "SELECT 'force'".into();
+        assert!(app.autosave_workspace(false));
+        assert_eq!(app.last_workspace, previous);
+        assert!(app.autosave_workspace(true));
+        assert_ne!(app.last_workspace, previous);
+        let previous = app.last_workspace.clone();
+        app.tabs[0].sql.push_str("; SELECT 2");
+        app.screenshot_path = Some(directory.path().join("screenshot.png"));
+        assert!(app.autosave_workspace(true));
+        assert_eq!(app.last_workspace, previous);
+        app.screenshot_path = None;
+        app.workspace_store = None;
+        assert!(!app.autosave_workspace(true));
+        assert_eq!(app.last_workspace, previous);
+    }
+
+    #[test]
+    fn workspace_autosave_corrupt_store_stays_disabled_and_preserves_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.json");
+        std::fs::write(&path, b"{corrupt").unwrap();
+        let mut app = session_test_app();
+        app.store = Some(Store {
+            directory: directory.path().to_owned(),
+        });
+        app.restore_workspace();
+        assert!(app.workspace_store.is_none());
+        assert!(!app.autosave_workspace(true));
+        assert!(app.last_workspace.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{corrupt");
+    }
+
     fn session_test_app() -> App {
         let context = egui::Context::default();
         App {
@@ -8288,7 +8745,7 @@ mod tests {
             history: Vec::new(),
             history_open: false,
             history_search: String::new(),
-            last_workspace: String::new(),
+            last_workspace: None,
             last_autosave: std::time::Instant::now(),
             pending_history: HashMap::new(),
             confirm_tab_action: None,
@@ -8976,6 +9433,181 @@ mod tests {
     }
 
     #[test]
+    fn grid_skips_text_layout_for_horizontally_hidden_cells() {
+        let ctx = egui::Context::default();
+        let mut tab = QueryTab::new(1);
+        tab.output = Some(QueryOutput {
+            sets: vec![ResultSet {
+                columns: (0..40).map(|column| format!("column-{column}")).collect(),
+                rows: vec![
+                    (0..40)
+                        .map(|column| Some(format!("hidden-value-{column}")))
+                        .collect(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 260.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| result_grid(ui, &mut tab, false));
+                },
+            );
+            let cells: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.job.text.starts_with("hidden-value-") =>
+                    {
+                        Some(text.galley.job.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(cells.contains(&"hidden-value-0"));
+            assert!(
+                cells.len() < 10,
+                "screen-external cells should not construct text shapes"
+            );
+            assert!(!cells.contains(&"hidden-value-39"));
+        }
+    }
+
+    #[test]
+    fn borrowed_tsv_matches_existing_copy_for_ragged_nullable_rows() {
+        let set = ResultSet {
+            columns: vec!["a".into(), "b".into(), "c".into()],
+            rows: vec![
+                vec![None, Some("中文\t\"quoted\"\r\n".into())],
+                vec![],
+                vec![
+                    Some(String::new()),
+                    Some("NULL".into()),
+                    Some("last".into()),
+                ],
+            ],
+            ..Default::default()
+        };
+        let materialized = set
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| value.clone().unwrap_or_else(|| "NULL".into()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for start_row in 0..5 {
+            for end_row in 0..5 {
+                for start_column in 0..5 {
+                    for end_column in 0..5 {
+                        assert_eq!(
+                            selected_tsv(
+                                &set,
+                                Some((start_row, start_column)),
+                                Some((end_row, end_column))
+                            ),
+                            sqlshop::sql_editor::copy_tsv(
+                                &materialized,
+                                start_row.min(end_row)..=start_row.max(end_row),
+                                start_column.min(end_column)..=start_column.max(end_column)
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            selected_rows_tsv(&set, &[2, 99, 0, 2]),
+            "\tNULL\tlast\nNULL\t\"中文\t\"\"quoted\"\"\r\n\"\t\n\tNULL\tlast"
+        );
+        assert!(selected_rows_tsv(&set, &[99]).is_empty());
+    }
+
+    #[test]
+    fn grid_scrolled_rows_are_clipped_below_headers_in_both_themes() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            let mut tab = QueryTab::new(1);
+            tab.output = Some(QueryOutput {
+                sets: vec![ResultSet {
+                    columns: vec!["CustomerName".into()],
+                    column_types: vec!["varchar(100)".into()],
+                    rows: (0..200)
+                        .map(|row| vec![Some(format!("customer-{row}"))])
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            tab.selected_rows = Some((110, 125));
+            // Centering in an odd-height viewport leaves a partially visible first row.
+            tab.grid_scroll_row = Some(118);
+            for _ in 0..2 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(480.0, 301.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            result_grid(ui, &mut tab, false);
+                            // The stricter clipping must stay local to the grid.
+                            assert_eq!(ui.visuals().clip_rect_margin, 3.0);
+                        });
+                    },
+                );
+                let header = output
+                    .shapes
+                    .iter()
+                    .find(|shape| {
+                        matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                        if text.galley.job.text == "CustomerName")
+                    })
+                    .expect("column header should be drawn");
+                let rows: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter(|shape| {
+                        matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                        if text.galley.job.text.starts_with("customer-"))
+                    })
+                    .collect();
+                assert!(!rows.is_empty());
+                assert!(
+                    rows.iter()
+                        .all(|shape| shape.clip_rect.top() >= header.clip_rect.bottom()),
+                    "scrolled rows must not paint over the header (dark={dark})"
+                );
+                assert!(
+                    rows.iter().any(|shape| {
+                        matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                        if text.galley.job.text == "customer-118")
+                    }),
+                    "the grid must actually scroll to the requested row"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn grid_scrollbar_drag_does_not_resize_columns() {
         for dark in [false, true] {
             let ctx = egui::Context::default();
@@ -9089,6 +9721,270 @@ mod tests {
                 after[0] < 302.0,
                 "header dragging must still resize the column"
             );
+        }
+    }
+
+    #[test]
+    fn grid_scrollbar_drags_preserve_selection_even_when_dragged_into_cells() {
+        for floating in [false, true] {
+            for axis in [0_usize, 1] {
+                for preselected in [false, true] {
+                    for coalesced in [false, true] {
+                        let ctx = egui::Context::default();
+                        ctx.style_mut(|style| {
+                            style.animation_time = 0.0;
+                            style.spacing.scroll = if floating {
+                                egui::style::ScrollStyle::floating()
+                            } else {
+                                egui::style::ScrollStyle::solid()
+                            };
+                        });
+                        let mut tab = QueryTab::new(1);
+                        if preselected {
+                            tab.cell_anchor = Some((2, 0));
+                            tab.selected_cell = Some((4, 1));
+                        }
+                        let expected = (
+                            tab.selected_rows,
+                            tab.selected_cell,
+                            tab.cell_anchor,
+                            tab.selected_insert,
+                        );
+                        let mut frame = |events| {
+                            let mut bars = [egui::Rect::NOTHING; 2];
+                            let mut content = egui::Rect::NOTHING;
+                            let mut offset = egui::Vec2::ZERO;
+                            let _ = ctx.run(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO, egui::vec2(316.0, 300.0),
+                                    )),
+                                    events,
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                        ui.visuals_mut().clip_rect_margin = 0.0;
+                                        let mut pointer = grid_selection_ui::PointerSelection::new(ui, &tab);
+                                        let horizontal = egui::ScrollArea::horizontal()
+                                            .scroll_source(egui::scroll_area::ScrollSource { drag: false, ..Default::default() })
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                let vertical = TableBuilder::new(ui)
+                                                    .drag_to_scroll(false)
+                                                    .resizable(false)
+                                                    .column(Column::exact(44.0))
+                                                    .column(Column::exact(302.0).clip(true))
+                                                    .column(Column::exact(110.0).clip(true))
+                                                    .min_scrolled_height(200.0)
+                                                    .max_scroll_height(200.0)
+                                                    .header(GRID_HEADER_HEIGHT, |mut row| {
+                                                        for _ in 0..3 {
+                                                            row.col(|ui| { grid_header_cell(ui, "column", "int"); });
+                                                        }
+                                                    })
+                                                    .body(|body| {
+                                                        body.rows(32.0, 100, |mut row| {
+                                                            let index = row.index();
+                                                            for column in 0_usize..3 {
+                                                                row.col(|ui| {
+                                                                    let response = grid_cell(ui, RichText::new("value"), false, false);
+                                                                    pointer.cell(ui, &response, grid_selection_ui::SelectionRefs {
+                                                                        rows: &mut tab.selected_rows,
+                                                                        cell: &mut tab.selected_cell,
+                                                                        anchor: &mut tab.cell_anchor,
+                                                                        insert: &mut tab.selected_insert,
+                                                                    }, (index, column.saturating_sub(1)), column == 0);
+                                                                });
+                                                            }
+                                                        });
+                                                    });
+                                                pointer.exclude_scrollbar(ui, &vertical, 1);
+                                                bars[1] = ctx.read_response(vertical.id.with(1_usize)).unwrap().interact_rect;
+                                                content = vertical.inner_rect.intersect(ui.clip_rect());
+                                                offset.y = vertical.state.offset.y;
+                                            });
+                                        pointer.exclude_scrollbar(ui, &horizontal, 0);
+                                        bars[0] = ctx.read_response(horizontal.id.with(0_usize)).unwrap().interact_rect;
+                                        offset.x = horizontal.state.offset.x;
+                                        pointer.finish(ui, grid_selection_ui::SelectionRefs {
+                                            rows: &mut tab.selected_rows,
+                                            cell: &mut tab.selected_cell,
+                                            anchor: &mut tab.cell_anchor,
+                                            insert: &mut tab.selected_insert,
+                                        });
+                                    });
+                                },
+                            );
+                            assert_eq!(
+                                (
+                                    tab.selected_rows,
+                                    tab.selected_cell,
+                                    tab.cell_anchor,
+                                    tab.selected_insert
+                                ),
+                                expected,
+                                "scrollbar changed selection: floating={floating}, axis={axis}, preselected={preselected}, coalesced={coalesced}",
+                            );
+                            (bars, content, offset)
+                        };
+                        frame(Vec::new());
+                        let (bars, content, _) = frame(Vec::new());
+                        let start = bars[axis].lerp_inside(egui::vec2(0.1, 0.1));
+                        // Hover expands floating bars before pressing their handle.
+                        frame(vec![egui::Event::PointerMoved(start)]);
+                        let button = |pos, pressed| egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        };
+                        if coalesced {
+                            frame(vec![
+                                button(start, true),
+                                egui::Event::PointerMoved(content.center()),
+                                button(content.center(), false),
+                            ]);
+                        } else {
+                            frame(vec![button(start, true)]);
+                            let delta = if axis == 0 {
+                                egui::vec2(60.0, 0.0)
+                            } else {
+                                egui::vec2(0.0, 60.0)
+                            };
+                            let (_, _, offset) =
+                                frame(vec![egui::Event::PointerMoved(start + delta)]);
+                            assert!(
+                                offset[axis] > 0.0,
+                                "scrollbar must actually scroll: {offset:?}"
+                            );
+                            frame(vec![egui::Event::PointerMoved(content.center())]);
+                            frame(vec![button(content.center(), false)]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_pointer_selection_preserves_cell_row_shift_and_coalesced_drags() {
+        for rows in [false, true] {
+            for shift in [false, true] {
+                for coalesced in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut tab = QueryTab::new(1);
+                    if shift {
+                        if rows {
+                            tab.selected_rows = Some((1, 2));
+                        } else {
+                            tab.cell_anchor = Some((1, 0));
+                            tab.selected_cell = Some((2, 1));
+                        }
+                    }
+                    let modifiers = if shift {
+                        egui::Modifiers::SHIFT
+                    } else {
+                        egui::Modifiers::NONE
+                    };
+                    let mut frame = |events| {
+                        let mut centers = [[egui::Pos2::ZERO; 3]; 4];
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                events,
+                                modifiers,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    let mut pointer =
+                                        grid_selection_ui::PointerSelection::new(ui, &tab);
+                                    TableBuilder::new(ui)
+                                        .drag_to_scroll(false)
+                                        .column(Column::exact(44.0))
+                                        .column(Column::exact(110.0))
+                                        .column(Column::exact(110.0))
+                                        .body(|body| {
+                                            body.rows(32.0, 4, |mut row| {
+                                                let index = row.index();
+                                                for column in 0_usize..3 {
+                                                    row.col(|ui| {
+                                                        let response = grid_cell(
+                                                            ui,
+                                                            RichText::new("value"),
+                                                            false,
+                                                            false,
+                                                        );
+                                                        centers[index][column] =
+                                                            response.rect.center();
+                                                        pointer.cell(
+                                                            ui,
+                                                            &response,
+                                                            grid_selection_ui::SelectionRefs {
+                                                                rows: &mut tab.selected_rows,
+                                                                cell: &mut tab.selected_cell,
+                                                                anchor: &mut tab.cell_anchor,
+                                                                insert: &mut tab.selected_insert,
+                                                            },
+                                                            (index, column.saturating_sub(1)),
+                                                            column == 0,
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                        });
+                                    pointer.finish(
+                                        ui,
+                                        grid_selection_ui::SelectionRefs {
+                                            rows: &mut tab.selected_rows,
+                                            cell: &mut tab.selected_cell,
+                                            anchor: &mut tab.cell_anchor,
+                                            insert: &mut tab.selected_insert,
+                                        },
+                                    );
+                                });
+                            },
+                        );
+                        (
+                            centers,
+                            tab.selected_rows,
+                            tab.selected_cell,
+                            tab.cell_anchor,
+                        )
+                    };
+                    let (centers, ..) = frame(Vec::new());
+                    let start = centers[3][if rows { 0 } else { 2 }];
+                    let end = centers[0][1]; // Row dragging also continues over data cells.
+                    let button = |pos, pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers,
+                    };
+                    let (_, selected_rows, selected_cell, anchor) = if coalesced {
+                        frame(vec![
+                            egui::Event::PointerMoved(start),
+                            button(start, true),
+                            egui::Event::PointerMoved(end),
+                            button(end, false),
+                        ])
+                    } else {
+                        frame(vec![egui::Event::PointerMoved(start), button(start, true)]);
+                        frame(vec![egui::Event::PointerMoved(end)]);
+                        frame(vec![button(end, false)])
+                    };
+                    if rows {
+                        assert_eq!(selected_rows, Some((if shift { 1 } else { 3 }, 0)));
+                        assert_eq!(selected_cell, None);
+                        assert_eq!(anchor, None);
+                    } else {
+                        assert_eq!(selected_rows, None);
+                        assert_eq!(selected_cell, Some((0, 0)));
+                        assert_eq!(anchor, Some(if shift { (1, 0) } else { (3, 1) }));
+                    }
+                }
+            }
         }
     }
 

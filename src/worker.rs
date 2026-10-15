@@ -994,22 +994,21 @@ impl QueryWorker {
                                         let mut failed_query_diagnostic = None;
                                         let mut failed_query_output = None;
                                         let result = tokio::time::timeout(Duration::from_secs(3600), async {
-                                            let result = cancellable_query(&mut current.session, &sql, tab, &mut cancellation_requests, &responses, &wake).await;
+                                            let result = cancellable_query(&mut current.session, &sql, tab, &mut cancellation_requests, &responses, &wake).await.map(|output| {
+                                                // Keep ownership outside the timed future so a failed
+                                                // probe or timeout cannot discard completed results.
+                                                failed_query_output = Some(output);
+                                            });
                                             if let Err(error) = &result {
                                                 failed_query_diagnostic = Some(crate::db::query_diagnostic(error, &sql));
                                                 failed_query_output = crate::db::query_partial_output(error);
-                                            } else if let Ok(output) = &result {
-                                                failed_query_output = Some(output.clone());
                                             }
                                             let state = tokio::time::timeout(Duration::from_secs(15), current.session.transaction_state()).await.map_err(|_| anyhow::anyhow!("事务尾响应超时，查询连接不再复用"))??;
                                             let _ = responses.send(QueryResponse::TransactionState { tab, state, verified: false });
                                             match result {
-                                                Ok(output) => {
-                                                    // The user SQL has completed. A later context
-                                                    // probe failure must not discard received data.
-                                                    failed_query_output = Some(output.clone());
+                                                Ok(()) => {
                                                     tokio::time::timeout(Duration::from_secs(15), current.refresh_database()).await.map_err(|_| anyhow::anyhow!("查询上下文观察超时，连接不再复用"))??;
-                                                    Ok::<_, anyhow::Error>(Ok(output))
+                                                    Ok::<_, anyhow::Error>(Ok(failed_query_output.take().expect("completed query output")))
                                                 }
                                                 Err(error) if crate::db::query_error_preserves_session(&error) && error.downcast_ref::<CancelTransportFailure>().is_none() => {
                                                     let diagnostic = crate::db::query_diagnostic(&error, &sql);

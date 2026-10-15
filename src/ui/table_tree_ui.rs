@@ -39,11 +39,69 @@ pub(super) fn key(database: &str, table: &Table) -> TreeKey {
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MetadataGroup {
+    name: String,
+    rows: Vec<usize>,
+}
+
+// Keep server order, including all rows of a composite index or foreign key.
+fn group_metadata(set: &ResultSet) -> Vec<MetadataGroup> {
+    let name_index = set
+        .columns
+        .iter()
+        .position(|name| name == "name")
+        .unwrap_or(0);
+    let mut positions = HashMap::new();
+    let mut groups: Vec<MetadataGroup> = Vec::new();
+    for (row_index, row) in set.rows.iter().enumerate() {
+        let Some(name) = row.get(name_index).and_then(Option::as_deref) else {
+            continue;
+        };
+        let group_index = *positions.entry(name).or_insert_with(|| {
+            groups.push(MetadataGroup {
+                name: name.into(),
+                rows: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        groups[group_index].rows.push(row_index);
+    }
+    groups
+}
+
+fn metadata_groups(data: &TableTreeDetails) -> [Vec<MetadataGroup>; 4] {
+    [
+        data.structure.as_ref().ok().map(|s| &s.columns),
+        data.structure.as_ref().ok().map(|s| &s.indexes),
+        data.structure.as_ref().ok().map(|s| &s.foreign_keys),
+        data.triggers.as_ref().ok(),
+    ]
+    .map(|set| set.map(group_metadata).unwrap_or_default())
+}
+
+fn metadata_detail(set: &ResultSet, rows: &[usize]) -> String {
+    rows.iter()
+        .map(|&index| {
+            set.columns
+                .iter()
+                .zip(set.rows[index].iter())
+                .filter_map(|(column, value)| {
+                    value.as_ref().map(|value| format!("{column}: {value}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[derive(Clone)]
 pub(super) struct TreeEntry {
     pub generation: Uuid,
     pub loading: bool,
     pub data: Option<Arc<TableTreeDetails>>,
+    groups: Arc<[Vec<MetadataGroup>; 4]>,
     pub error: Option<String>,
 }
 
@@ -64,7 +122,6 @@ impl TreeMetadata {
 
 #[derive(Default)]
 pub(super) struct TreeRender {
-    pub entries: HashMap<TreeKey, TreeEntry>,
     pub requests: Vec<(Uuid, String, Table, bool)>,
     pub action: Option<(Uuid, String, Table, TablePart, Option<String>)>,
     pub trigger: Option<object_browser_ui::BrowserAction>,
@@ -82,6 +139,7 @@ pub(super) fn tables(
     busy: bool,
     schema_dialog: &mut Option<SchemaDialog>,
     render: &mut TreeRender,
+    entries: &HashMap<TreeKey, TreeEntry>,
 ) -> Option<Table> {
     let mut preview = None;
     for &table in tables {
@@ -148,12 +206,12 @@ pub(super) fn tables(
             }
         });
         header.body(|ui| {
-            let entry = render.entries.get(&key(database, table)).cloned();
+            let entry = entries.get(&key(database, table));
             if entry.is_none() {
                 render.requests.push((connection, database.into(), table.clone(), false));
             }
             let data = entry.as_ref().and_then(|entry| entry.data.as_deref());
-            for part in [TablePart::Fields, TablePart::Indexes, TablePart::ForeignKeys, TablePart::Triggers] {
+            for (part_index, part) in [TablePart::Fields, TablePart::Indexes, TablePart::ForeignKeys, TablePart::Triggers].into_iter().enumerate() {
                 let result = data.map(|data| match part {
                     TablePart::Fields => data.structure.as_ref().map(|s| &s.columns),
                     TablePart::Indexes => data.structure.as_ref().map(|s| &s.indexes),
@@ -161,15 +219,8 @@ pub(super) fn tables(
                     TablePart::Triggers => data.triggers.as_ref(),
                 });
                 let set = result.as_ref().and_then(|result| result.as_ref().ok()).copied();
-                let name_index = set.and_then(|set| set.columns.iter().position(|name| name == "name")).unwrap_or(0);
-                let mut names = Vec::new();
-                if let Some(set) = set {
-                    for row in &set.rows {
-                        if let Some(name) = row.get(name_index).and_then(Option::as_deref)
-                            && !names.contains(&name) { names.push(name); }
-                    }
-                }
-                let caption = set.map_or_else(|| part.label().to_owned(), |set| format!("{} ({}){}", part.label(), names.len(), if set.truncated { "+" } else { "" }));
+                let groups = entry.map_or(&[][..], |entry| entry.groups[part_index].as_slice());
+                let caption = set.map_or_else(|| part.label().to_owned(), |set| format!("{} ({}){}", part.label(), groups.len(), if set.truncated { "+" } else { "" }));
                 let part_background = ui.painter().add(egui::Shape::Noop);
                 let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(),
                     ui.make_persistent_id(("table-part", connection, database, &table.schema, &table.name, part, render.generation)), render.fixture && table.name == "users");
@@ -190,28 +241,30 @@ pub(super) fn tables(
                         ui.colored_label(ui.visuals().warn_fg_color, "无法读取目录").on_hover_text(*error);
                         if ui.small_button("重试").clicked() { render.requests.push((connection, database.into(), table.clone(), true)); }
                     } else if let Some(set) = set {
-                        if names.is_empty() { ui.label(RichText::new("未返回可见对象").small().weak()); }
-                        for name in &names {
-                            let rows: Vec<_> = set.rows.iter().filter(|row| row.get(name_index).and_then(Option::as_deref) == Some(*name)).collect();
-                            let detail = rows.iter().map(|row| set.columns.iter().zip(row.iter()).filter_map(|(column, value)| value.as_ref().map(|value| format!("{column}: {value}"))).collect::<Vec<_>>().join("\n")).collect::<Vec<_>>().join("\n\n");
+                        if groups.is_empty() { ui.label(RichText::new("未返回可见对象").small().weak()); }
+                        let type_index = set.columns.iter().position(|name| name == "type");
+                        for group in groups {
+                            let name = group.name.as_str();
+                            let first_row = group.rows.first().map(|&index| &set.rows[index]);
                             let label = if part == TablePart::Fields {
-                                let type_index = set.columns.iter().position(|name| name == "type");
-                                let ty = rows.first().and_then(|row| type_index.and_then(|i| row.get(i))).and_then(Option::as_deref).unwrap_or("");
+                                let ty = first_row.and_then(|row| type_index.and_then(|i| row.get(i))).and_then(Option::as_deref).unwrap_or("");
                                 format!("{name}  {ty}")
-                            } else { (*name).to_owned() };
+                            } else { name.to_owned() };
                             let background = ui.painter().add(egui::Shape::Noop);
                             let response = ui.add(egui::Button::new((RichText::new(label).color(ui.visuals().text_color()), egui::Atom::grow())).frame(false)
-                                .min_size(egui::vec2(ui.available_width(), ui.spacing().interact_size.y))).on_hover_text(detail);
-                            selection.row(&response, background, TreeNode::TablePart(connection, database.into(), table.clone(), part, Some((*name).into())));
+                                .min_size(egui::vec2(ui.available_width(), ui.spacing().interact_size.y))).on_hover_ui(|ui| {
+                                    ui.label(metadata_detail(set, &group.rows));
+                                });
+                            selection.row(&response, background, TreeNode::TablePart(connection, database.into(), table.clone(), part, Some(name.into())));
                             if response.double_clicked() && !busy {
                                 if part == TablePart::Triggers {
-                                    let schema = rows.first().and_then(|row| row.first()).and_then(Option::as_deref).unwrap_or(&table.schema);
+                                    let schema = first_row.and_then(|row| row.first()).and_then(Option::as_deref).unwrap_or(&table.schema);
                                     render.trigger = Some(object_browser_ui::BrowserAction::OpenDefinition { connection, database: database.into(), object: sqlshop::object_catalog::CatalogObject {
-                                        schema: schema.into(), name: (*name).into(), kind: sqlshop::object_catalog::ObjectKind::Trigger,
+                                        schema: schema.into(), name: name.into(), kind: sqlshop::object_catalog::ObjectKind::Trigger,
                                         parent: Some(table.name.clone()), owner: None, comment: None, estimated_rows: None, size_bytes: None,
                                         created_at: None, updated_at: None, engine: None, signature: None,
                                     } });
-                                } else { render.action = Some((connection, database.into(), table.clone(), part, Some((*name).into()))); }
+                                } else { render.action = Some((connection, database.into(), table.clone(), part, Some(name.into()))); }
                             }
                         }
                         if set.truncated { ui.label(RichText::new("目录已截断，刷新或使用SQL查看完整目录").small().weak()); }
@@ -275,6 +328,7 @@ impl App {
             TreeEntry {
                 generation: Uuid::new_v4(),
                 loading: false,
+                groups: Arc::new(metadata_groups(&details)),
                 data: Some(Arc::new(details)),
                 error: None,
             },
@@ -332,6 +386,7 @@ impl App {
                 entry.loading = false;
                 match response.result {
                     Ok(data) => {
+                        entry.groups = Arc::new(metadata_groups(&data));
                         entry.data = Some(Arc::new(data));
                         entry.error = None;
                     }
@@ -407,6 +462,7 @@ impl App {
                             generation,
                             loading: result.is_ok(),
                             data: None,
+                            groups: Arc::new(Default::default()),
                             error: result.err().map(|error| error.to_string()),
                         },
                     );
@@ -435,5 +491,95 @@ impl App {
         {
             doc.select_tree_item(section, name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_groups_preserve_first_seen_order_and_composite_rows() {
+        let set = ResultSet {
+            columns: vec!["column".into(), "name".into()],
+            rows: vec![
+                vec![Some("b".into()), Some("idx_z".into())],
+                vec![Some("a".into()), Some("idx_a".into())],
+                vec![Some("c".into()), Some("idx_z".into())],
+                vec![Some("ignored".into()), None],
+                vec![],
+                vec![Some("empty name".into()), Some(String::new())],
+            ],
+            ..Default::default()
+        };
+        let groups = group_metadata(&set);
+        assert_eq!(
+            groups,
+            vec![
+                MetadataGroup {
+                    name: "idx_z".into(),
+                    rows: vec![0, 2]
+                },
+                MetadataGroup {
+                    name: "idx_a".into(),
+                    rows: vec![1]
+                },
+                MetadataGroup {
+                    name: String::new(),
+                    rows: vec![5]
+                },
+            ]
+        );
+        assert_eq!(
+            metadata_detail(&set, &groups[0].rows),
+            "column: b\nname: idx_z\n\ncolumn: c\nname: idx_z"
+        );
+    }
+
+    #[test]
+    fn metadata_groups_fall_back_to_first_column_and_handle_empty_results() {
+        let set = ResultSet {
+            columns: vec!["constraint".into()],
+            rows: vec![vec![Some("fk".into())], vec![None], vec![Some("fk".into())]],
+            ..Default::default()
+        };
+        assert_eq!(
+            group_metadata(&set),
+            vec![MetadataGroup {
+                name: "fk".into(),
+                rows: vec![0, 2]
+            }]
+        );
+        assert!(group_metadata(&ResultSet::default()).is_empty());
+        assert_eq!(metadata_detail(&set, &[1]), "");
+    }
+
+    #[test]
+    fn metadata_groups_keep_sections_independent_on_partial_failure() {
+        let details = TableTreeDetails {
+            structure: Err("unavailable".into()),
+            triggers: Ok(ResultSet {
+                columns: vec!["schema".into(), "name".into(), "definition".into()],
+                rows: vec![vec![
+                    Some("public".into()),
+                    Some("audit".into()),
+                    Some("BEGIN\nEND".into()),
+                ]],
+                ..Default::default()
+            }),
+        };
+        let groups = metadata_groups(&details);
+        assert!(groups[..3].iter().all(Vec::is_empty));
+        assert_eq!(
+            groups[3],
+            vec![MetadataGroup {
+                name: "audit".into(),
+                rows: vec![0]
+            }]
+        );
+        assert_eq!(
+            metadata_detail(details.triggers.as_ref().unwrap(), &[0]),
+            "schema: public\nname: audit\ndefinition: BEGIN\nEND"
+        );
     }
 }
