@@ -1,5 +1,20 @@
 # 对象工作区：原始资源与目录内容审计
 
+## 导航树交互补充（2026-10-15）
+
+本次复用N7有界反编译并重读本机原包帮助，没有启动或登录Navicat。`Info.plist`仍为17.3.11；本次重新计算主二进制SHA-256，仍为 `47b428be0693e9cb353ea1ba1ef056d6075b1e2fcd944b60d632da63f342a1f6`，与N7归档目标相符。
+
+| 已知行为 | 精确依据 | 对SQLShop的处理 |
+| --- | --- | --- |
+| 数据库/schema双击打开；表左箭头展开元素；具体元素双击进入设计器 | 原包 `Navicat Help/navigation_pane.html:20–23`，`preferences_gen.html:24–29` | 单击选择与明确激活分开，箭头一路展开即可浏览；分类容器双击只展开/折叠，具体叶子才打开设计 |
+| 已展开节点双击走折叠；其余节点按owner override或节点类型打开 | N7 `output/NAVConnectionTreeViewController_ibConnectionTreeDoubleClickAction_.c:19–47` | 连接/库/schema容器双击切换展开，折叠不强制切对象页；表保留双击开数据，是稳定操作入口的项目选择 |
+| 数据库有子项可直接展开，否则请求打开；普通对象走打开对象链，连接按状态展开或连接 | N7 `output/NAVConnectionTreeViewController_openConnectionTreeItem_.c:30–114` | 展开时按需连接/读取，未加载分支显示状态与明确重试入口，不要求先单击名称再展开 |
+| 选择更新浏览、信息和状态；打开对象为独立链 | N7 `output/NAVConnectionTreeViewController_outlineViewSelectionDidChange_.c:16–43`及 `MainObjectViewController_connectionTree_selectionDidChange_.c:876–884` | 普通选择只更新浏览模型，不强制离开活动文档；右键、拖动释放、箭头不再走通用打开路径 |
+
+以上N7文件相对 `/Users/richie/.local/share/rea/navicat-handoff/navicat-workflow-bounded-ghidra/`。owner override、所有节点数值映射与原应用实际可见标签切换仍未完全恢复。`navicat-objc-metadata.txt:1101626–1101628`存在树键盘handler（IMP `0x10125c55c`），本轮没有其函数体；SQLShop新增上下/左右/Home/End与Enter规则属于项目交互，不作为Navicat键盘复刻证据。在导航帮助、`preferences_*.html`及中文本地化的有界范围未找到单击展开偏好，不据此断言所有版本不存在该选项。
+
+本轮通过技能要求的独立证据/当前交互审查定位了混合整行折叠、行尾特殊命中与鼠标释放强制跳页，采用统一组件修复。没有新增或运行测试、没有执行数据库操作；检查范围见主清单。
+
 日期：2026-10-14。针对用户指出的“对象页内容太少”，沿用既有 N4 / N7 静态证据，补读原应用随附的中文帮助和本地化资源。没有启动 Navicat、登录、连接数据库或运行测试。
 
 ## 证据身份与边界

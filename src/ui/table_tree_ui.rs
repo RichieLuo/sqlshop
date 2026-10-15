@@ -143,131 +143,230 @@ pub(super) fn tables(
 ) -> Option<Table> {
     let mut preview = None;
     for &table in tables {
-        let background = ui.painter().add(egui::Shape::Noop);
-        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            ui.make_persistent_id((
-                "table-children",
-                connection,
-                database,
-                &table.schema,
-                &table.name,
-                &table.kind,
-                render.generation,
-            )),
+        let state_id = ui.make_persistent_id((
+            "table-children",
+            connection,
+            database,
+            &table.schema,
+            &table.name,
+            &table.kind,
+            render.generation,
+        ));
+        let header = tree_navigation_ui::branch(
+            ui,
+            selection,
+            TreeNode::Table(connection, database.into(), table.clone()),
+            state_id,
+            egui::WidgetText::from(table.name.as_str()),
             render.fixture && table.name == "users",
+            None,
+            false,
         );
-        let header = state.show_header(ui, |ui| {
-            let response = ui
-                .add(
-                    egui::Button::new((
-                        RichText::new(&table.name).color(ui.visuals().text_color()),
-                        egui::Atom::grow(),
-                    ))
-                    .frame(false)
-                    .min_size(egui::vec2(
-                        ui.available_width(),
-                        ui.spacing().interact_size.y,
-                    )),
-                )
-                .on_hover_text("单击选中 · 双击打开数据 · 左侧箭头展开字段、索引、外键和触发器");
-            selection.row(
-                &response,
-                background,
-                TreeNode::Table(connection, database.into(), table.clone()),
-            );
-            response.context_menu(|ui| {
-                if ui.button("刷新表节点").clicked() {
-                    render
-                        .requests
-                        .push((connection, database.into(), table.clone(), true));
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(
-                        !busy && !table.kind.contains("VIEW"),
-                        egui::Button::new("删除数据表…"),
-                    )
-                    .clicked()
-                {
-                    *schema_dialog = Some(SchemaDialog {
-                        action: SchemaDialogAction::DropTable {
-                            connection,
-                            database: database.into(),
-                            table: table.clone(),
-                        },
-                        name: String::new(),
-                    });
-                    ui.close();
-                }
-            });
-            if response.double_clicked() && !busy {
+        let response = header.response.clone();
+        response.context_menu(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("打开数据"))
+                .clicked()
+            {
                 preview = Some(table.clone());
+                ui.close();
+            }
+            if ui.add_enabled(!busy, egui::Button::new("设计表")).clicked() {
+                render.action = Some((
+                    connection,
+                    database.into(),
+                    table.clone(),
+                    TablePart::Fields,
+                    None,
+                ));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("刷新表节点").clicked() {
+                render
+                    .requests
+                    .push((connection, database.into(), table.clone(), true));
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    !busy && !table.kind.contains("VIEW"),
+                    egui::Button::new("删除数据表…"),
+                )
+                .clicked()
+            {
+                *schema_dialog = Some(SchemaDialog {
+                    action: SchemaDialogAction::DropTable {
+                        connection,
+                        database: database.into(),
+                        table: table.clone(),
+                    },
+                    name: String::new(),
+                });
+                ui.close();
             }
         });
+        if header.activated && !busy {
+            preview = Some(table.clone());
+        }
         header.body(|ui| {
             let entry = entries.get(&key(database, table));
             if entry.is_none() {
-                render.requests.push((connection, database.into(), table.clone(), false));
+                render
+                    .requests
+                    .push((connection, database.into(), table.clone(), false));
             }
             let data = entry.as_ref().and_then(|entry| entry.data.as_deref());
-            for (part_index, part) in [TablePart::Fields, TablePart::Indexes, TablePart::ForeignKeys, TablePart::Triggers].into_iter().enumerate() {
+            for (part_index, part) in [
+                TablePart::Fields,
+                TablePart::Indexes,
+                TablePart::ForeignKeys,
+                TablePart::Triggers,
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let result = data.map(|data| match part {
                     TablePart::Fields => data.structure.as_ref().map(|s| &s.columns),
                     TablePart::Indexes => data.structure.as_ref().map(|s| &s.indexes),
                     TablePart::ForeignKeys => data.structure.as_ref().map(|s| &s.foreign_keys),
                     TablePart::Triggers => data.triggers.as_ref(),
                 });
-                let set = result.as_ref().and_then(|result| result.as_ref().ok()).copied();
+                let set = result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .copied();
                 let groups = entry.map_or(&[][..], |entry| entry.groups[part_index].as_slice());
-                let caption = set.map_or_else(|| part.label().to_owned(), |set| format!("{} ({}){}", part.label(), groups.len(), if set.truncated { "+" } else { "" }));
-                let part_background = ui.painter().add(egui::Shape::Noop);
-                let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(),
-                    ui.make_persistent_id(("table-part", connection, database, &table.schema, &table.name, part, render.generation)), render.fixture && table.name == "users");
-                state.show_header(ui, |ui| {
-                    let response = ui.add(egui::Button::new((caption, egui::Atom::grow())).frame(false)
-                        .min_size(egui::vec2(ui.available_width(), ui.spacing().interact_size.y)));
-                    selection.row(&response, part_background, TreeNode::TablePart(connection, database.into(), table.clone(), part, None));
-                    if response.double_clicked() && part.section().is_some() && !busy {
-                        render.action = Some((connection, database.into(), table.clone(), part, None));
-                    }
-                }).body(|ui| {
+                let caption = set.map_or_else(
+                    || part.label().to_owned(),
+                    |set| {
+                        format!(
+                            "{} ({}){}",
+                            part.label(),
+                            groups.len(),
+                            if set.truncated { "+" } else { "" }
+                        )
+                    },
+                );
+                let part_id = ui.make_persistent_id((
+                    "table-part",
+                    connection,
+                    database,
+                    &table.schema,
+                    &table.name,
+                    part,
+                    render.generation,
+                ));
+                let part_header = tree_navigation_ui::branch(
+                    ui,
+                    selection,
+                    TreeNode::TablePart(connection, database.into(), table.clone(), part, None),
+                    part_id,
+                    caption.into(),
+                    render.fixture && table.name == "users",
+                    None,
+                    true,
+                );
+                part_header.body(|ui| {
                     if let Some(error) = entry.as_ref().and_then(|e| e.error.as_deref()) {
-                        ui.colored_label(ui.visuals().warn_fg_color, "读取失败").on_hover_text(error);
-                        if ui.small_button("重试").clicked() { render.requests.push((connection, database.into(), table.clone(), true)); }
+                        ui.colored_label(ui.visuals().warn_fg_color, "读取失败")
+                            .on_hover_text(error);
+                        if ui.small_button("重试").clicked() {
+                            render.requests.push((
+                                connection,
+                                database.into(),
+                                table.clone(),
+                                true,
+                            ));
+                        }
                     } else if entry.as_ref().is_none_or(|e| e.loading) {
                         ui.label(RichText::new("正在读取…").small().weak());
                     } else if let Some(Err(error)) = result.as_ref() {
-                        ui.colored_label(ui.visuals().warn_fg_color, "无法读取目录").on_hover_text(*error);
-                        if ui.small_button("重试").clicked() { render.requests.push((connection, database.into(), table.clone(), true)); }
+                        ui.colored_label(ui.visuals().warn_fg_color, "无法读取目录")
+                            .on_hover_text(*error);
+                        if ui.small_button("重试").clicked() {
+                            render.requests.push((
+                                connection,
+                                database.into(),
+                                table.clone(),
+                                true,
+                            ));
+                        }
                     } else if let Some(set) = set {
-                        if groups.is_empty() { ui.label(RichText::new("未返回可见对象").small().weak()); }
+                        if groups.is_empty() {
+                            ui.label(RichText::new("未返回可见对象").small().weak());
+                        }
                         let type_index = set.columns.iter().position(|name| name == "type");
                         for group in groups {
                             let name = group.name.as_str();
                             let first_row = group.rows.first().map(|&index| &set.rows[index]);
                             let label = if part == TablePart::Fields {
-                                let ty = first_row.and_then(|row| type_index.and_then(|i| row.get(i))).and_then(Option::as_deref).unwrap_or("");
+                                let ty = first_row
+                                    .and_then(|row| type_index.and_then(|i| row.get(i)))
+                                    .and_then(Option::as_deref)
+                                    .unwrap_or("");
                                 format!("{name}  {ty}")
-                            } else { name.to_owned() };
-                            let background = ui.painter().add(egui::Shape::Noop);
-                            let response = ui.add(egui::Button::new((RichText::new(label).color(ui.visuals().text_color()), egui::Atom::grow())).frame(false)
-                                .min_size(egui::vec2(ui.available_width(), ui.spacing().interact_size.y))).on_hover_ui(|ui| {
-                                    ui.label(metadata_detail(set, &group.rows));
-                                });
-                            selection.row(&response, background, TreeNode::TablePart(connection, database.into(), table.clone(), part, Some(name.into())));
-                            if response.double_clicked() && !busy {
+                            } else {
+                                name.to_owned()
+                            };
+                            let leaf = tree_navigation_ui::leaf(
+                                ui,
+                                selection,
+                                TreeNode::TablePart(
+                                    connection,
+                                    database.into(),
+                                    table.clone(),
+                                    part,
+                                    Some(name.into()),
+                                ),
+                                egui::WidgetText::from(label),
+                            );
+                            leaf.response.on_hover_ui(|ui| {
+                                ui.label(metadata_detail(set, &group.rows));
+                            });
+                            if leaf.activated && !busy {
                                 if part == TablePart::Triggers {
-                                    let schema = first_row.and_then(|row| row.first()).and_then(Option::as_deref).unwrap_or(&table.schema);
-                                    render.trigger = Some(object_browser_ui::BrowserAction::OpenDefinition { connection, database: database.into(), object: sqlshop::object_catalog::CatalogObject {
-                                        schema: schema.into(), name: name.into(), kind: sqlshop::object_catalog::ObjectKind::Trigger,
-                                        parent: Some(table.name.clone()), owner: None, comment: None, estimated_rows: None, size_bytes: None,
-                                        created_at: None, updated_at: None, engine: None, signature: None,
-                                    } });
-                                } else { render.action = Some((connection, database.into(), table.clone(), part, Some(name.into()))); }
+                                    let schema = first_row
+                                        .and_then(|row| row.first())
+                                        .and_then(Option::as_deref)
+                                        .unwrap_or(&table.schema);
+                                    render.trigger =
+                                        Some(object_browser_ui::BrowserAction::OpenDefinition {
+                                            connection,
+                                            database: database.into(),
+                                            object: sqlshop::object_catalog::CatalogObject {
+                                                schema: schema.into(),
+                                                name: name.into(),
+                                                kind: sqlshop::object_catalog::ObjectKind::Trigger,
+                                                parent: Some(table.name.clone()),
+                                                owner: None,
+                                                comment: None,
+                                                estimated_rows: None,
+                                                size_bytes: None,
+                                                created_at: None,
+                                                updated_at: None,
+                                                engine: None,
+                                                signature: None,
+                                            },
+                                        });
+                                } else {
+                                    render.action = Some((
+                                        connection,
+                                        database.into(),
+                                        table.clone(),
+                                        part,
+                                        Some(name.into()),
+                                    ));
+                                }
                             }
                         }
-                        if set.truncated { ui.label(RichText::new("目录已截断，刷新或使用SQL查看完整目录").small().weak()); }
+                        if set.truncated {
+                            ui.label(
+                                RichText::new("目录已截断，刷新或使用SQL查看完整目录")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
                     }
                 });
             }
@@ -288,7 +387,7 @@ impl App {
             tab.selected_cell = Some((2, 3));
             tab.selected_rows = None;
         }
-        if mode != "tree-details" {
+        if !matches!(mode.as_str(), "tree-details" | "tree-document") {
             return;
         }
         let Some(profile) = self.profiles.first() else {
@@ -333,7 +432,7 @@ impl App {
                 error: None,
             },
         );
-        self.browser_visible = true;
+        self.browser_visible = mode != "tree-document";
         self.browser_scope = Some(object_browser_ui::BrowserScope {
             connection,
             database: Some("app_dev".into()),
@@ -345,7 +444,17 @@ impl App {
             database: "app_dev".into(),
             table: table.clone(),
         });
-        self.tree_selection.selected = Some(TreeNode::Table(connection, "app_dev".into(), table));
+        self.tree_selection.selected = Some(if mode == "tree-document" {
+            TreeNode::TablePart(
+                connection,
+                "app_dev".into(),
+                table,
+                TablePart::Fields,
+                Some("name".into()),
+            )
+        } else {
+            TreeNode::Table(connection, "app_dev".into(), table)
+        });
         self.status = "离线结构树示例 · 未连接数据库".into();
     }
 

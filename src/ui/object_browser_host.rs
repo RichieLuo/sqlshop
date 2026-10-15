@@ -337,11 +337,21 @@ impl App {
         if !self.finish_object_navigation() {
             return;
         }
+        self.select_object_scope(scope, selected);
+        self.browser_visible = true;
+    }
+
+    // Selection updates the browser model without changing the visible document
+    // or ending/staging an inline cell edit. Activation owns navigation.
+    pub(super) fn select_object_scope(
+        &mut self,
+        scope: BrowserScope,
+        selected: Option<BrowserItem>,
+    ) {
         self.selected = Some(scope.connection);
         self.browser_state.set_scope(Some(&scope));
         self.browser_state.selected = selected;
         self.browser_scope = Some(scope);
-        self.browser_visible = true;
     }
 
     pub(super) fn show_selected_objects(&mut self) {

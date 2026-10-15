@@ -43,6 +43,7 @@ mod structure_ui;
 mod tab_bar_ui;
 mod table_insert_ui;
 mod table_tree_ui;
+mod tree_navigation_ui;
 mod window_chrome;
 mod workspace_ui;
 use catalog_ui::CatalogDialog;
@@ -437,6 +438,7 @@ enum TabAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TreeNode {
+    Group(Option<Uuid>),
     Connection(Uuid),
     Database(Uuid, String),
     Schema(Uuid, String, String),
@@ -514,6 +516,7 @@ fn column_type_options(engine: Engine) -> &'static [&'static str] {
 // Tree focus is independent of the connected server and active query database.
 #[derive(Default)]
 struct TreeSelection {
+    navigator: tree_navigation_ui::NavigationState,
     selected: Option<TreeNode>,
     rows: Vec<(egui::layers::ShapeIdx, egui::Rect, TreeNode)>,
 }
@@ -883,6 +886,7 @@ impl App {
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
                 Ok("catalog"
                     | "tree-details"
+                    | "tree-document"
                     | "grid-selection"
                     | "browser"
                     | "browser-offline"
@@ -919,6 +923,7 @@ impl App {
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
                 Ok("browser"
                     | "tree-details"
+                    | "tree-document"
                     | "browser-offline"
                     | "objects-rich"
                     | "objects-icons"
@@ -1167,6 +1172,7 @@ FROM users;"
             if matches!(
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
                 Ok("results"
+                    | "tree-document"
                     | "grid-selection"
                     | "grid-browse"
                     | "grid-filters"
@@ -2290,7 +2296,7 @@ FROM users;"
             }
             Response::Databases(databases) => {
                 self.status = format!(
-                    "已连接服务器 · {} 个数据库 · 点击数据库选择",
+                    "已连接服务器 · {} 个数据库 · 展开箭头或双击打开数据库",
                     databases.len()
                 );
                 // Discovery must not silently alter the worker's database context.
@@ -3093,9 +3099,11 @@ FROM users;"
         ui.separator();
         ui.add_space(6.0);
         let tree_before = self.tree_selection.selected.clone();
-        let mut clicked_node = None;
+        let mut tree_activation = None;
+        tree_navigation_ui::begin(ui, &mut self.tree_selection);
         let filter = self.filter.to_lowercase();
         let searching = !filter.is_empty();
+        let expand_search = self.tree_selection.navigator.search_changed(&filter);
         let connected_only = self.view.connected_only;
         let mut to_connect = None;
         let mut to_edit = None;
@@ -3120,7 +3128,10 @@ FROM users;"
         let mut tree_render = table_tree_ui::TreeRender {
             generation: tree_generation,
             fixture: self.screenshot_path.is_some()
-                && std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref() == Ok("tree-details"),
+                && matches!(
+                    std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
+                    Ok("tree-details" | "tree-document")
+                ),
             ..Default::default()
         };
         let expand_connection = self.expand_connection.take();
@@ -3141,448 +3152,407 @@ FROM users;"
                         .filter(|p| self.catalog.memberships.get(&p.id).copied() == *group_id)
                         .filter(|profile| {
                             let session = self.sessions.get(&profile.id);
-                            (!connected_only || session.is_some_and(|session| session.connected.is_some()))
-                                && (!searching || group_matches || profile.name.to_lowercase().contains(&filter)
+                            (!connected_only
+                                || session.is_some_and(|session| session.connected.is_some()))
+                                && (!searching
+                                    || group_matches
+                                    || profile.name.to_lowercase().contains(&filter)
                                     || session.is_some_and(|session| {
-                                        session.databases.iter().any(|database| database.to_lowercase().contains(&filter))
-                                            || session.tables.iter().any(|table| format!("{}.{}", table.schema, table.name).to_lowercase().contains(&filter))
+                                        session.databases.iter().any(|database| {
+                                            database.to_lowercase().contains(&filter)
+                                        }) || session.tables.iter().any(|table| {
+                                            format!("{}.{}", table.schema, table.name)
+                                                .to_lowercase()
+                                                .contains(&filter)
+                                        })
                                     }))
                         })
                         .cloned()
                         .collect();
                     visible_connections += members.len();
-                    if members.is_empty() && (searching || connected_only) { continue; }
+                    if members.is_empty() && (searching || connected_only) {
+                        continue;
+                    }
                     let expand_group =
                         expand_connection.is_some_and(|id| members.iter().any(|p| p.id == id));
-                    let group_header =
-                        egui::CollapsingHeader::new(format!("{} ({})", group_name, members.len()))
-                            .id_salt(("connection-group", group_id, tree_generation))
-                            .default_open(tree_generation == 0)
-                            .open(if expand_group || !filter.is_empty() {
-                                Some(true)
+                    let group_state_id =
+                        ui.make_persistent_id(("connection-group", group_id, tree_generation));
+                    let group_header = tree_navigation_ui::branch(
+                        ui,
+                        &mut self.tree_selection,
+                        TreeNode::Group(*group_id),
+                        group_state_id,
+                        format!("{} ({})", group_name, members.len()).into(),
+                        tree_generation == 0,
+                        if expand_group || expand_search {
+                            Some(true)
+                        } else {
+                            None
+                        },
+                        true,
+                    );
+                    let group_response = group_header.response.clone();
+                    group_header.body(|ui| {
+                        for profile in members {
+                            let filter = if group_matches
+                                || (searching && profile.name.to_lowercase().contains(&filter))
+                            {
+                                String::new()
                             } else {
-                                None
-                            })
-                            .show(ui, |ui| {
-                                for profile in members {
-                                    let filter = if group_matches || (searching && profile.name.to_lowercase().contains(&filter)) { String::new() } else { filter.clone() };
-                                    let session = self.sessions.get(&profile.id);
-                                    let connected = session.is_some_and(|s| s.connected.is_some());
-                                    let busy = session.is_some_and(|s| s.busy);
-                                    let databases =
-                                        session.map(|s| s.databases.as_slice()).unwrap_or_default();
-                                    let active_database =
-                                        session.and_then(|s| s.active_database.as_ref());
-                                    let catalog_tables =
-                                        session.map(|s| s.tables.as_slice()).unwrap_or_default();
-                                    let empty_entries = HashMap::new();
-                                    let tree_entries = session.map(|s| &s.tree_metadata.entries).unwrap_or(&empty_entries);
-                                    let mut title = egui::text::LayoutJob::default();
-                                    title.append(
-                                        &profile.name,
-                                        if connected {
-                                            28.0
+                                filter.clone()
+                            };
+                            let session = self.sessions.get(&profile.id);
+                            let connected = session.is_some_and(|s| s.connected.is_some());
+                            let busy = session.is_some_and(|s| s.busy);
+                            let databases =
+                                session.map(|s| s.databases.as_slice()).unwrap_or_default();
+                            let active_database = session.and_then(|s| s.active_database.as_ref());
+                            let catalog_tables =
+                                session.map(|s| s.tables.as_slice()).unwrap_or_default();
+                            let empty_entries = HashMap::new();
+                            let tree_entries = session
+                                .map(|s| &s.tree_metadata.entries)
+                                .unwrap_or(&empty_entries);
+                            let mut title = egui::text::LayoutJob::default();
+                            title.append(
+                                &profile.name,
+                                28.0,
+                                egui::TextFormat::simple(
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    ui.visuals().text_color(),
+                                ),
+                            );
+                            let server_state_id =
+                                ui.make_persistent_id(("server", profile.id, tree_generation));
+                            let server_header = tree_navigation_ui::branch(
+                                ui,
+                                &mut self.tree_selection,
+                                TreeNode::Connection(profile.id),
+                                server_state_id,
+                                title.into(),
+                                false,
+                                if expand_connection == Some(profile.id) || expand_search {
+                                    Some(true)
+                                } else {
+                                    None
+                                },
+                                true,
+                            );
+                            let header_response = server_header.response.clone();
+                            if (server_header.opened || server_header.activated)
+                                && !busy
+                                && !connected
+                            {
+                                to_connect = Some(profile.id);
+                            }
+                            if server_header.activated && (!connected || server_header.is_open()) {
+                                tree_activation = Some(TreeNode::Connection(profile.id));
+                            }
+                            server_header.body(|ui| {
+                                if !connected {
+                                    ui.label(
+                                        RichText::new(if busy {
+                                            "正在连接…"
                                         } else {
-                                            ui.spacing().indent + 28.0
-                                        },
-                                        egui::TextFormat::simple(
-                                            egui::TextStyle::Button.resolve(ui.style()),
-                                            ui.visuals().text_color(),
-                                        ),
+                                            "尚未连接"
+                                        })
+                                        .small()
+                                        .weak(),
                                     );
-                                    let background = ui.painter().add(egui::Shape::Noop);
-                                    let header_response =
-                                        if connected {
-                                            egui::CollapsingHeader::new(title)
-                                    .id_salt(("server", profile.id, tree_generation))
-                                    .open(if expand_connection == Some(profile.id) || searching {
-                                        Some(true)
-                                    } else {
-                                        None
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{} · {}:{}{}",
-                                                profile.engine.label(),
-                                                profile.host,
-                                                profile.port,
-                                                if profile.ssh.enabled { " · SSH" } else { "" }
-                                            ))
-                                            .small()
-                                            .weak(),
-                                        );
-                                        if databases.is_empty() {
+                                    if ui.add_enabled(!busy, egui::Button::new("连接")).clicked()
+                                    {
+                                        to_connect = Some(profile.id);
+                                    }
+                                    return;
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} · {}:{}{}",
+                                        profile.engine.label(),
+                                        profile.host,
+                                        profile.port,
+                                        if profile.ssh.enabled { " · SSH" } else { "" }
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                if databases.is_empty() {
+                                    ui.label(
+                                        RichText::new(if busy {
+                                            "正在读取数据库列表…"
+                                        } else {
+                                            "未发现可访问的数据库"
+                                        })
+                                        .weak(),
+                                    );
+                                }
+                                for database in databases {
+                                    let active = active_database == Some(database);
+                                    let protected_database = match profile.engine {
+                                        Engine::MySql => [
+                                            "mysql",
+                                            "information_schema",
+                                            "performance_schema",
+                                            "sys",
+                                        ]
+                                        .iter()
+                                        .any(|name| database.eq_ignore_ascii_case(name)),
+                                        Engine::Postgres => ["postgres", "template0", "template1"]
+                                            .iter()
+                                            .any(|name| database.eq_ignore_ascii_case(name)),
+                                        Engine::SqlServer => ["master", "model", "msdb", "tempdb"]
+                                            .iter()
+                                            .any(|name| database.eq_ignore_ascii_case(name)),
+                                    };
+                                    let matches_database =
+                                        database.to_lowercase().contains(&filter);
+                                    if !filter.is_empty() && !matches_database && !active {
+                                        continue;
+                                    }
+                                    let title =
+                                        RichText::new(database).color(ui.visuals().text_color());
+                                    let database_state_id = ui.make_persistent_id((
+                                        "database",
+                                        profile.id,
+                                        database,
+                                        tree_generation,
+                                    ));
+                                    let database_header = tree_navigation_ui::branch(
+                                        ui,
+                                        &mut self.tree_selection,
+                                        TreeNode::Database(profile.id, database.clone()),
+                                        database_state_id,
+                                        title.into(),
+                                        false,
+                                        if expand_database.as_ref()
+                                            == Some(&(profile.id, database.clone()))
+                                            || expand_search
+                                        {
+                                            Some(true)
+                                        } else {
+                                            None
+                                        },
+                                        true,
+                                    );
+                                    let database_response = database_header.response.clone();
+                                    if (database_header.opened || database_header.activated)
+                                        && !busy
+                                        && !active
+                                    {
+                                        to_select = Some((profile.id, database.clone()));
+                                    }
+                                    if database_header.activated
+                                        && (!active || database_header.is_open())
+                                    {
+                                        tree_activation =
+                                            Some(TreeNode::Database(profile.id, database.clone()));
+                                    }
+                                    database_header.body(|ui| {
+                                        if !active {
                                             ui.label(
                                                 RichText::new(if busy {
-                                                    "正在读取数据库列表…"
+                                                    "当前连接忙，请稍后打开数据库"
                                                 } else {
-                                                    "未发现可访问的数据库"
+                                                    "展开或双击打开数据库"
                                                 })
+                                                .small()
                                                 .weak(),
                                             );
-                                        }
-                                        for database in databases {
-                                            let active = active_database == Some(database);
-                                            let protected_database = match profile.engine {
-                                                Engine::MySql => ["mysql", "information_schema", "performance_schema", "sys"].iter().any(|name| database.eq_ignore_ascii_case(name)),
-                                                Engine::Postgres => ["postgres", "template0", "template1"].iter().any(|name| database.eq_ignore_ascii_case(name)),
-                                                Engine::SqlServer => ["master", "model", "msdb", "tempdb"].iter().any(|name| database.eq_ignore_ascii_case(name)),
-                                            };
-                                            let matches_database =
-                                                database.to_lowercase().contains(&filter);
-                                            if !filter.is_empty() && !matches_database && !active {
-                                                continue;
-                                            }
-                                            let title = RichText::new(database)
-                                                .color(ui.visuals().text_color());
-                                            let background = ui.painter().add(egui::Shape::Noop);
-                                            let database_header =
-                                                egui::CollapsingHeader::new(title)
-                                                    .id_salt(("database", profile.id, database, tree_generation))
-                                                    .open(
-                                                        if expand_database.as_ref()
-                                                            == Some(&(profile.id, database.clone())) || searching
-                                                        {
-                                                            Some(true)
-                                                        } else {
-                                                            None
-                                                        },
-                                                    )
-                                                    .show(ui, |ui| {
-                                                        if !active {
-                                                            ui.label(
-                                                                RichText::new(
-                                                                    "点击数据库名称加载表和视图",
-                                                                )
-                                                                .small()
-                                                                .weak(),
-                                                            );
-                                                            return;
-                                                        }
-                                                        let tables: Vec<_> = catalog_tables
-                                                            .iter()
-                                                            .filter(|table| {
-                                                                matches_database
-                                                                    || format!(
-                                                                        "{}.{}",
-                                                                        table.schema, table.name
-                                                                    )
-                                                                    .to_lowercase()
-                                                                    .contains(&filter)
-                                                            })
-                                                            .collect();
-                                                        if profile.engine == Engine::MySql {
-                                                            if let Some(table) = table_tree_ui::tables(
-                                                                ui,
-                                                                &tables,
-                                                                &mut self.tree_selection,
-                                                                profile.id,
-                                                                database,
-                                                                busy,
-                                                                &mut schema_dialog,
-                                                                &mut tree_render,
-                                                                tree_entries,
-                                                            ) {
-                                                                preview = Some((
-                                                                    profile.id,
-                                                                    database.clone(),
-                                                                    profile.engine,
-                                                                    table,
-                                                                ));
-                                                            }
-                                                        } else {
-                                                            let mut schemas: Vec<_> = tables
-                                                                .iter()
-                                                                .map(|table| &table.schema)
-                                                                .collect();
-                                                            schemas.sort();
-                                                            schemas.dedup();
-                                                            for schema in schemas {
-                                                                let schema_background = ui.painter().add(egui::Shape::Noop);
-                                                                let schema_header = egui::CollapsingHeader::new(schema)
-                                                                    .id_salt((
-                                                                        profile.id, database,
-                                                                        schema,
-                                                                        tree_generation,
-                                                                    ))
-                                                                    .default_open(true)
-                                                                    .show(ui, |ui| {
-                                                                        let schema_tables: Vec<_> =
-                                                                            tables
-                                                                                .iter()
-                                                                                .copied()
-                                                                                .filter(|table| {
-                                                                                    &table.schema
-                                                                                        == schema
-                                                                                })
-                                                                                .collect();
-                                                                        if let Some(table) =
-                                                                            table_tree_ui::tables(
-                                                                                ui,
-                                                                                &schema_tables,
-                                                                                &mut self
-                                                                                    .tree_selection,
-                                                                                profile.id,
-                                                                                database,
-                                                                                busy,
-                                                                                &mut schema_dialog,
-                                                                                &mut tree_render,
-                                                                                tree_entries,
-                                                                            )
-                                                                        {
-                                                                            preview = Some((
-                                                                                profile.id,
-                                                                                database.clone(),
-                                                                                profile.engine,
-                                                                                table,
-                                                                            ));
-                                                                        }
-                                                                    });
-                                                                self.tree_selection.row(&schema_header.header_response, schema_background,
-                                                                    TreeNode::Schema(profile.id, database.clone(), schema.to_string()));
-                                                                let schema_tail_response = row_tail_response(
-                                                                    ui,
-                                                                    &schema_header.header_response,
-                                                                    ("schema-row-tail", profile.id, database, schema),
-                                                                );
-                                                                if schema_tail_response.as_ref().is_some_and(|response| response.clicked() || response.secondary_clicked()) {
-                                                                    self.tree_selection.selected = Some(TreeNode::Schema(profile.id, database.clone(), schema.to_string()));
-                                                                    clicked_node = self.tree_selection.selected.clone();
-                                                                }
-                                                                schema_header.header_response.context_menu(|ui| {
-                                                                    if ui.add_enabled(!busy && active, egui::Button::new("在此 Schema 新建数据表…")).clicked() {
-                                                                        table_create = Some(new_table_create_form(
-                                                                            profile.id,
-                                                                            database.clone(),
-                                                                            schema.to_string(),
-                                                                            profile.engine,
-                                                                        ));
-                                                                        ui.close();
-                                                                    }
-                                                                });
-                                                                if let Some(response) = schema_tail_response {
-                                                                    response.context_menu(|ui| {
-                                                                        if ui.add_enabled(!busy && active, egui::Button::new("在此 Schema 新建数据表…")).clicked() {
-                                                                            table_create = Some(new_table_create_form(
-                                                                                profile.id,
-                                                                                database.clone(),
-                                                                                schema.to_string(),
-                                                                                profile.engine,
-                                                                            ));
-                                                                            ui.close();
-                                                                        }
-                                                                    });
-                                                                }
-                                                            }
-                                                        }
-                                                        if catalog_tables.is_empty() {
-                                                            ui.label(
-                                                                RichText::new(if busy {
-                                                                    "正在读取表目录…"
-                                                                } else {
-                                                                    "没有表或视图"
-                                                                })
-                                                                .weak(),
-                                                            );
-                                                        } else if tables.is_empty() {
-                                                            ui.label(
-                                                                RichText::new("没有匹配的表或视图")
-                                                                    .weak(),
-                                                            );
-                                                        }
-                                                    });
-                                            self.tree_selection.row(
-                                                &database_header.header_response,
-                                                background,
-                                                TreeNode::Database(profile.id, database.clone()),
-                                            );
-                                            let database_tail_response = row_tail_response(
-                                                ui,
-                                                &database_header.header_response,
-                                                ("database-row-tail", profile.id, database),
-                                            );
-                                            let database_row_tail_clicked =
-                                                database_tail_response.as_ref().is_some_and(
-                                                    egui::Response::clicked,
-                                                );
-                                            let database_row_tail_secondary_clicked =
-                                                database_tail_response.as_ref().is_some_and(
-                                                    egui::Response::secondary_clicked,
-                                                );
-                                            if database_row_tail_clicked
-                                                || database_row_tail_secondary_clicked
-                                            {
-                                                self.tree_selection.selected = Some(
-                                                    TreeNode::Database(
-                                                        profile.id,
-                                                        database.clone(),
-                                                    ),
-                                                );
-                                                clicked_node = self.tree_selection.selected.clone();
-                                                self.expand_database =
-                                                    Some((profile.id, database.clone()));
-                                            }
-                                            if (database_header.header_response.clicked()
-                                                || database_row_tail_clicked)
-                                                && !busy
-                                                && !active
+                                            if ui
+                                                .add_enabled(!busy, egui::Button::new("打开数据库"))
+                                                .clicked()
                                             {
                                                 to_select = Some((profile.id, database.clone()));
                                             }
-                                            database_header.header_response.context_menu(|ui| {
-                                                database_context_menu(
-                                                    ui,
+                                            return;
+                                        }
+                                        let tables: Vec<_> = catalog_tables
+                                            .iter()
+                                            .filter(|table| {
+                                                matches_database
+                                                    || format!("{}.{}", table.schema, table.name)
+                                                        .to_lowercase()
+                                                        .contains(&filter)
+                                            })
+                                            .collect();
+                                        if profile.engine == Engine::MySql {
+                                            if let Some(table) = table_tree_ui::tables(
+                                                ui,
+                                                &tables,
+                                                &mut self.tree_selection,
+                                                profile.id,
+                                                database,
+                                                busy,
+                                                &mut schema_dialog,
+                                                &mut tree_render,
+                                                tree_entries,
+                                            ) {
+                                                preview = Some((
                                                     profile.id,
+                                                    database.clone(),
                                                     profile.engine,
+                                                    table,
+                                                ));
+                                            }
+                                        } else {
+                                            let mut schemas: Vec<_> =
+                                                tables.iter().map(|table| &table.schema).collect();
+                                            schemas.sort();
+                                            schemas.dedup();
+                                            for schema in schemas {
+                                                let schema_state_id = ui.make_persistent_id((
+                                                    profile.id,
                                                     database,
-                                                    active,
-                                                    busy,
-                                                    protected_database,
-                                                    &mut schema_dialog,
-                                                    &mut table_create,
-                                                    &mut to_select,
-                                                    &mut refresh_tables,
-                                                );
-                                            });
-                                            if let Some(response) = database_tail_response {
-                                                response.context_menu(|ui| {
-                                                    database_context_menu(
-                                                        ui,
+                                                    schema,
+                                                    tree_generation,
+                                                ));
+                                                let schema_header = tree_navigation_ui::branch(
+                                                    ui,
+                                                    &mut self.tree_selection,
+                                                    TreeNode::Schema(
                                                         profile.id,
-                                                        profile.engine,
+                                                        database.clone(),
+                                                        schema.to_string(),
+                                                    ),
+                                                    schema_state_id,
+                                                    egui::WidgetText::from(schema.as_str()),
+                                                    true,
+                                                    expand_search.then_some(true),
+                                                    true,
+                                                );
+                                                let schema_response =
+                                                    schema_header.response.clone();
+                                                if schema_header.activated
+                                                    && schema_header.is_open()
+                                                {
+                                                    tree_activation = Some(TreeNode::Schema(
+                                                        profile.id,
+                                                        database.clone(),
+                                                        schema.to_string(),
+                                                    ));
+                                                }
+                                                schema_header.body(|ui| {
+                                                    let schema_tables: Vec<_> = tables
+                                                        .iter()
+                                                        .copied()
+                                                        .filter(|table| &table.schema == schema)
+                                                        .collect();
+                                                    if let Some(table) = table_tree_ui::tables(
+                                                        ui,
+                                                        &schema_tables,
+                                                        &mut self.tree_selection,
+                                                        profile.id,
                                                         database,
-                                                        active,
                                                         busy,
-                                                        protected_database,
                                                         &mut schema_dialog,
-                                                        &mut table_create,
-                                                        &mut to_select,
-                                                        &mut refresh_tables,
-                                                    );
+                                                        &mut tree_render,
+                                                        tree_entries,
+                                                    ) {
+                                                        preview = Some((
+                                                            profile.id,
+                                                            database.clone(),
+                                                            profile.engine,
+                                                            table,
+                                                        ));
+                                                    }
+                                                });
+                                                schema_response.context_menu(|ui| {
+                                                    if ui
+                                                        .add_enabled(
+                                                            !busy && active,
+                                                            egui::Button::new(
+                                                                "在此 Schema 新建数据表…",
+                                                            ),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        table_create = Some(new_table_create_form(
+                                                            profile.id,
+                                                            database.clone(),
+                                                            schema.to_string(),
+                                                            profile.engine,
+                                                        ));
+                                                        ui.close();
+                                                    }
                                                 });
                                             }
                                         }
-                                    })
-                                    .header_response
-                                        } else {
-                                            ui.add_sized(
-                                                [
-                                                    ui.available_width(),
-                                                    ui.spacing().interact_size.y,
-                                                ],
-                                                egui::Button::new(title)
-                                                    .frame(false)
-                                                    .right_text(""),
-                                            )
-                                        };
-                                    icons::paint_connection(
-                                        ui,
-                                        egui::Rect::from_center_size(
-                                            egui::pos2(
-                                                header_response.rect.left()
-                                                    + ui.spacing().indent
-                                                    + 10.0,
-                                                header_response.rect.center().y,
-                                            ),
-                                            egui::vec2(20.0, 20.0),
-                                        ),
-                                        profile.engine,
-                                        connected,
-                                    );
-                                    header_response.clone().on_hover_text(format!(
-                                        "{} · {}",
-                                        profile.engine.label(),
-                                        if connected { "已连接" } else { "未连接" },
-                                    ));
-                                    let connection_tail_response = row_tail_response(
-                                        ui,
-                                        &header_response,
-                                        ("connection-row-tail", profile.id),
-                                    );
-                                    let connection_row_tail_clicked =
-                                        connection_tail_response.as_ref().is_some_and(
-                                            egui::Response::clicked,
-                                        );
-                                    let connection_row_tail_secondary_clicked =
-                                        connection_tail_response.as_ref().is_some_and(
-                                            egui::Response::secondary_clicked,
-                                        );
-                                    self.tree_selection.row(
-                                        &header_response,
-                                        background,
-                                        TreeNode::Connection(profile.id),
-                                    );
-                                    if connection_row_tail_clicked
-                                        || connection_row_tail_secondary_clicked
-                                    {
-                                        self.tree_selection.selected =
-                                            Some(TreeNode::Connection(profile.id));
-                                        clicked_node = self.tree_selection.selected.clone();
-                                        self.selected = Some(profile.id);
-                                        if connected {
-                                            self.expand_connection = Some(profile.id);
+                                        if catalog_tables.is_empty() {
+                                            ui.label(
+                                                RichText::new(if busy {
+                                                    "正在读取表目录…"
+                                                } else {
+                                                    "没有表或视图"
+                                                })
+                                                .weak(),
+                                            );
+                                        } else if tables.is_empty() {
+                                            ui.label(RichText::new("没有匹配的表或视图").weak());
                                         }
-                                    }
-                                    if header_response.clicked()
-                                        || header_response.secondary_clicked()
-                                        || connection_row_tail_clicked
-                                        || connection_row_tail_secondary_clicked
-                                    {
-                                        self.selected = Some(profile.id);
-                                    }
-                                    if header_response.double_clicked() && !busy && !connected {
-                                        to_connect = Some(profile.id);
-                                    }
-                                    header_response.context_menu(|ui| {
-                                        connection_context_menu(
+                                    });
+                                    database_response.context_menu(|ui| {
+                                        database_context_menu(
                                             ui,
                                             profile.id,
-                                            connected,
+                                            profile.engine,
+                                            database,
+                                            active,
                                             busy,
-                                            self.catalog_store.is_some(),
-                                            self.catalog.memberships.get(&profile.id).copied(),
-                                            &buckets,
+                                            protected_database,
                                             &mut schema_dialog,
-                                            &mut disconnect,
-                                            &mut refresh_databases,
-                                            &mut to_connect,
-                                            &mut move_connection,
-                                            &mut to_edit,
-                                            &mut to_delete,
+                                            &mut table_create,
+                                            &mut to_select,
+                                            &mut refresh_tables,
                                         );
                                     });
-                                    if let Some(response) = connection_tail_response {
-                                        response.context_menu(|ui| {
-                                            connection_context_menu(
-                                                ui,
-                                                profile.id,
-                                                connected,
-                                                busy,
-                                                self.catalog_store.is_some(),
-                                                self.catalog.memberships.get(&profile.id).copied(),
-                                                &buckets,
-                                                &mut schema_dialog,
-                                                &mut disconnect,
-                                                &mut refresh_databases,
-                                                &mut to_connect,
-                                                &mut move_connection,
-                                                &mut to_edit,
-                                                &mut to_delete,
-                                            );
-                                        });
-                                    }
-                                }
-                                if self.profiles.iter().all(|p| {
-                                    self.catalog.memberships.get(&p.id).copied() != *group_id
-                                }) {
-                                    ui.label(
-                                        RichText::new("空分组 · 右键连接可移入").small().weak(),
-                                    );
                                 }
                             });
+                            icons::paint_connection(
+                                ui,
+                                egui::Rect::from_center_size(
+                                    egui::pos2(
+                                        header_response.rect.left() + 10.0,
+                                        header_response.rect.center().y,
+                                    ),
+                                    egui::vec2(20.0, 20.0),
+                                ),
+                                profile.engine,
+                                connected,
+                            );
+                            header_response.clone().on_hover_text(format!(
+                                "{} · {}",
+                                profile.engine.label(),
+                                if connected { "已连接" } else { "未连接" },
+                            ));
+                            header_response.context_menu(|ui| {
+                                connection_context_menu(
+                                    ui,
+                                    profile.id,
+                                    connected,
+                                    busy,
+                                    self.catalog_store.is_some(),
+                                    self.catalog.memberships.get(&profile.id).copied(),
+                                    &buckets,
+                                    &mut schema_dialog,
+                                    &mut disconnect,
+                                    &mut refresh_databases,
+                                    &mut to_connect,
+                                    &mut move_connection,
+                                    &mut to_edit,
+                                    &mut to_delete,
+                                );
+                            });
+                        }
+                        if self
+                            .profiles
+                            .iter()
+                            .all(|p| self.catalog.memberships.get(&p.id).copied() != *group_id)
+                        {
+                            ui.label(RichText::new("空分组 · 右键连接可移入").small().weak());
+                        }
+                    });
                     if let Some(id) = group_id {
-                        group_header.header_response.context_menu(|ui| {
+                        group_response.context_menu(|ui| {
                             ui.add_enabled_ui(self.catalog_store.is_some(), |ui| {
                                 if ui.button("重命名分组…").clicked() {
                                     group_dialog = Some(CatalogDialog::Group {
@@ -3601,24 +3571,28 @@ FROM users;"
                     }
                 }
                 if visible_connections == 0 && !self.profiles.is_empty() {
-                    ui.label(RichText::new(if searching { "没有匹配的连接或已读对象" } else { "当前没有已连接的服务器" }).weak());
-                }
-                if let Some(position) = ui.input(|input| {
-                    (input.pointer.button_released(egui::PointerButton::Primary)
-                        || input.pointer.button_released(egui::PointerButton::Secondary))
-                        .then(|| input.pointer.interact_pos()).flatten()
-                }) && let Some((_, _, node)) = self.tree_selection.rows.iter().find(|(_, rect, _)| rect.contains(position)) {
-                        clicked_node = Some(node.clone());
+                    ui.label(
+                        RichText::new(if searching {
+                            "没有匹配的连接或已读对象"
+                        } else {
+                            "当前没有已连接的服务器"
+                        })
+                        .weak(),
+                    );
                 }
                 self.tree_selection.paint(ui);
                 if let Some(node) = &self.tree_selection.selected {
-                    self.selected = Some(match node {
+                    let connection = match node {
+                        TreeNode::Group(_) => None,
                         TreeNode::Connection(id)
                         | TreeNode::Database(id, _)
                         | TreeNode::Schema(id, _, _)
                         | TreeNode::Table(id, _, _)
-                        | TreeNode::TablePart(id, _, _, _, _) => *id,
-                    });
+                        | TreeNode::TablePart(id, _, _, _, _) => Some(*id),
+                    };
+                    if let Some(connection) = connection {
+                        self.selected = Some(connection);
+                    }
                 }
                 if self.profiles.is_empty() {
                     ui.add_space(24.0);
@@ -3629,38 +3603,39 @@ FROM users;"
                     });
                 }
             });
-        if let Some(node) = clicked_node.or_else(|| {
+        if let Some(node) = tree_activation.clone().or_else(|| {
             (self.tree_selection.selected != tree_before)
                 .then(|| self.tree_selection.selected.clone())
                 .flatten()
         }) {
-            let (scope, item) = match node {
-                TreeNode::Connection(connection) => (
+            let scope = match node {
+                TreeNode::Group(_) => None,
+                TreeNode::Connection(connection) => Some((
                     object_browser_ui::BrowserScope {
                         connection,
                         database: None,
                         schema: None,
                     },
                     None,
-                ),
-                TreeNode::Database(connection, database) => (
+                )),
+                TreeNode::Database(connection, database) => Some((
                     object_browser_ui::BrowserScope {
                         connection,
                         database: Some(database),
                         schema: None,
                     },
                     None,
-                ),
-                TreeNode::Schema(connection, database, schema) => (
+                )),
+                TreeNode::Schema(connection, database, schema) => Some((
                     object_browser_ui::BrowserScope {
                         connection,
                         database: Some(database),
                         schema: Some(schema),
                     },
                     None,
-                ),
+                )),
                 TreeNode::Table(connection, database, table)
-                | TreeNode::TablePart(connection, database, table, _, _) => (
+                | TreeNode::TablePart(connection, database, table, _, _) => Some((
                     object_browser_ui::BrowserScope {
                         connection,
                         database: Some(database.clone()),
@@ -3671,9 +3646,15 @@ FROM users;"
                         database,
                         table,
                     }),
-                ),
+                )),
             };
-            self.show_object_scope(scope, item);
+            if let Some((scope, item)) = scope {
+                if tree_activation.is_some() {
+                    self.show_object_scope(scope, item);
+                } else {
+                    self.select_object_scope(scope, item);
+                }
+            }
         }
         if let Some((connection, group)) = move_connection {
             self.move_to_group(connection, group);
@@ -6331,7 +6312,9 @@ fn grid_cell_input(
     let vertical_margin = ((rect.height() - row_height) * 0.5).max(0.0).floor() as i8;
     let response = ui
         .scope(|ui| {
-            ui.set_enabled(can_edit && !editor.is_null);
+            if !can_edit || editor.is_null {
+                ui.disable();
+            }
             ui.put(
                 rect,
                 egui::TextEdit::singleline(&mut editor.text)
@@ -6720,24 +6703,6 @@ fn open_table_tab(
     (tabs.len() - 1, true)
 }
 
-fn row_tail_response(
-    ui: &mut egui::Ui,
-    row: &egui::Response,
-    id: impl std::hash::Hash,
-) -> Option<egui::Response> {
-    let rect = egui::Rect::from_min_max(
-        egui::pos2(row.rect.right(), row.rect.top()),
-        egui::pos2(ui.max_rect().right(), row.rect.bottom()),
-    );
-    if rect.width() <= 1.0 || rect.height() <= 1.0 {
-        return None;
-    }
-    Some(
-        ui.interact(rect, ui.id().with(id), egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn database_context_menu(
     ui: &mut egui::Ui,
@@ -6786,7 +6751,7 @@ fn database_context_menu(
     }
     ui.separator();
     if ui
-        .add_enabled(!busy && !active, egui::Button::new("选择数据库"))
+        .add_enabled(!busy && !active, egui::Button::new("打开数据库"))
         .clicked()
     {
         *to_select = Some((connection, database.to_owned()));
@@ -9908,7 +9873,9 @@ mod tests {
                                         .body(|body| {
                                             body.rows(32.0, 4, |mut row| {
                                                 let index = row.index();
-                                                for column in 0_usize..3 {
+                                                for (column, center) in
+                                                    centers[index].iter_mut().enumerate()
+                                                {
                                                     row.col(|ui| {
                                                         let response = grid_cell(
                                                             ui,
@@ -9916,8 +9883,7 @@ mod tests {
                                                             false,
                                                             false,
                                                         );
-                                                        centers[index][column] =
-                                                            response.rect.center();
+                                                        *center = response.rect.center();
                                                         pointer.cell(
                                                             ui,
                                                             &response,
@@ -10301,6 +10267,7 @@ mod tests {
         let ctx = egui::Context::default();
         let node = TreeNode::Connection(Uuid::new_v4());
         let mut selection = TreeSelection {
+            navigator: Default::default(),
             selected: Some(node.clone()),
             ..Default::default()
         };
