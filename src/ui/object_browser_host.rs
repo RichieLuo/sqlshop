@@ -538,29 +538,54 @@ impl App {
                 }),
             BrowserItem::Database { .. } | BrowserItem::CatalogObject { .. } => None,
         });
-        let structure = selected.as_ref().and_then(|selected| match selected {
-            BrowserItem::Object {
-                connection,
-                database,
-                table,
-            } => self.tabs.iter().find_map(|document| {
-                if !document.table_target.as_ref().is_some_and(|target| {
-                    target.connection == *connection
-                        && target.database == *database
-                        && target.schema == table.schema
-                        && target.name == table.name
-                }) {
+        let structure = selected
+            .as_ref()
+            .and_then(|selected| match selected {
+                BrowserItem::Object {
+                    connection,
+                    database,
+                    table,
+                } => self.tabs.iter().find_map(|document| {
+                    if !document.table_target.as_ref().is_some_and(|target| {
+                        target.connection == *connection
+                            && target.database == *database
+                            && target.schema == table.schema
+                            && target.name == table.name
+                    }) {
+                        return None;
+                    }
+                    document.design.as_ref().and_then(|design| {
+                        design
+                            .structure
+                            .as_ref()
+                            .map(|structure| (structure, design.stale))
+                    })
+                }),
+                BrowserItem::Database { .. } | BrowserItem::CatalogObject { .. } => None,
+            })
+            .or_else(|| {
+                let BrowserItem::Object {
+                    connection,
+                    database,
+                    table,
+                } = selected.as_ref()?
+                else {
                     return None;
-                }
-                document.design.as_ref().and_then(|design| {
-                    design
-                        .structure
-                        .as_ref()
-                        .map(|structure| (structure, design.stale))
-                })
-            }),
-            BrowserItem::Database { .. } | BrowserItem::CatalogObject { .. } => None,
-        });
+                };
+                let entry = self
+                    .sessions
+                    .get(connection)?
+                    .tree_metadata
+                    .entries
+                    .get(&table_tree_ui::key(database, table))?;
+                entry
+                    .data
+                    .as_ref()?
+                    .structure
+                    .as_ref()
+                    .ok()
+                    .map(|structure| (structure, false))
+            });
         let focused_column = if !self.browser_visible {
             tab.selected_cell.and_then(|(_, column)| {
                 tab.table_data

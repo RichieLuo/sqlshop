@@ -29,6 +29,7 @@ mod backup_ui;
 mod catalog_ui;
 mod compare_ui;
 mod grid_browse_ui;
+mod grid_selection_ui;
 mod icons;
 mod local_database_ui;
 mod management_ui;
@@ -41,6 +42,7 @@ mod recovery_ui;
 mod structure_ui;
 mod tab_bar_ui;
 mod table_insert_ui;
+mod table_tree_ui;
 mod window_chrome;
 mod workspace_ui;
 use catalog_ui::CatalogDialog;
@@ -439,6 +441,13 @@ enum TreeNode {
     Database(Uuid, String),
     Schema(Uuid, String, String),
     Table(Uuid, String, Table),
+    TablePart(
+        Uuid,
+        String,
+        Table,
+        table_tree_ui::TablePart,
+        Option<String>,
+    ),
 }
 
 enum SchemaDialogAction {
@@ -551,6 +560,7 @@ struct ConnectionSession {
     catalog_loading: bool,
     catalog_error: Option<String>,
     column_cache: HashMap<(String, String), Vec<String>>,
+    tree_metadata: table_tree_ui::TreeMetadata,
     completion_pending: Option<(QueryTarget, Table, u64)>,
     completion_generation: u64,
     completion_pause: bool,
@@ -565,6 +575,7 @@ struct ConnectionSession {
 impl ConnectionSession {
     fn clear_columns(&mut self) {
         self.column_cache.clear();
+        self.tree_metadata.entries.clear();
         self.completion_pending = None;
         self.completion_pause = false;
         self.completion_generation = self.completion_generation.wrapping_add(1);
@@ -625,6 +636,7 @@ impl ConnectionSession {
     }
 
     fn new(ctx: &egui::Context) -> Self {
+        let tree_metadata = table_tree_ui::TreeMetadata::new(ctx);
         let ctx = ctx.clone();
         Self {
             worker: Worker::start(move || ctx.request_repaint()),
@@ -636,6 +648,7 @@ impl ConnectionSession {
             catalog_loading: false,
             catalog_error: None,
             column_cache: HashMap::new(),
+            tree_metadata,
             completion_pending: None,
             completion_generation: 0,
             completion_pause: false,
@@ -869,6 +882,8 @@ impl App {
             && matches!(
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
                 Ok("catalog"
+                    | "tree-details"
+                    | "grid-selection"
                     | "browser"
                     | "browser-offline"
                     | "objects-rich"
@@ -903,6 +918,7 @@ impl App {
             let browser_fixture = matches!(
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
                 Ok("browser"
+                    | "tree-details"
                     | "browser-offline"
                     | "objects-rich"
                     | "objects-icons"
@@ -1151,6 +1167,7 @@ FROM users;"
             if matches!(
                 std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref(),
                 Ok("results"
+                    | "grid-selection"
                     | "grid-browse"
                     | "grid-filters"
                     | "inline-insert"
@@ -1464,6 +1481,7 @@ FROM users;"
             }
         }
         app.management_fixture();
+        app.table_tree_fixture();
         app
     }
 
@@ -1872,6 +1890,7 @@ FROM users;"
     }
 
     fn poll(&mut self) {
+        self.poll_tree_details();
         self.poll_management();
         self.poll_query_sessions();
         self.poll_table_recovery();
@@ -3098,12 +3117,21 @@ FROM users;"
             .collect();
         buckets.push((None, "未分组".into()));
         let tree_generation = self.view.tree_generation;
+        let mut tree_render = table_tree_ui::TreeRender {
+            generation: tree_generation,
+            fixture: self.screenshot_path.is_some()
+                && std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref() == Ok("tree-details"),
+            ..Default::default()
+        };
         let expand_connection = self.expand_connection.take();
         let expand_database = self.expand_database.take();
         egui::ScrollArea::vertical()
             .id_salt("connection-tree")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+                ui.spacing_mut().interact_size.y = 22.0;
                 let mut visible_connections = 0usize;
                 for (group_id, group_name) in &buckets {
                     let group_matches = searching && group_name.to_lowercase().contains(&filter);
@@ -3147,6 +3175,7 @@ FROM users;"
                                         session.and_then(|s| s.active_database.clone());
                                     let catalog_tables =
                                         session.map(|s| s.tables.clone()).unwrap_or_default();
+                                    tree_render.entries = session.map(|s| s.tree_metadata.entries.clone()).unwrap_or_default();
                                     let mut title = egui::text::LayoutJob::default();
                                     title.append(
                                         &profile.name,
@@ -3243,7 +3272,7 @@ FROM users;"
                                                             })
                                                             .collect();
                                                         if profile.engine == Engine::MySql {
-                                                            if let Some(table) = table_buttons(
+                                                            if let Some(table) = table_tree_ui::tables(
                                                                 ui,
                                                                 &tables,
                                                                 &mut self.tree_selection,
@@ -3251,6 +3280,7 @@ FROM users;"
                                                                 database,
                                                                 busy,
                                                                 &mut schema_dialog,
+                                                                &mut tree_render,
                                                             ) {
                                                                 preview = Some((
                                                                     profile.id,
@@ -3286,7 +3316,7 @@ FROM users;"
                                                                                 })
                                                                                 .collect();
                                                                         if let Some(table) =
-                                                                            table_buttons(
+                                                                            table_tree_ui::tables(
                                                                                 ui,
                                                                                 &schema_tables,
                                                                                 &mut self
@@ -3295,6 +3325,7 @@ FROM users;"
                                                                                 database,
                                                                                 busy,
                                                                                 &mut schema_dialog,
+                                                                                &mut tree_render,
                                                                             )
                                                                         {
                                                                             preview = Some((
@@ -3582,7 +3613,8 @@ FROM users;"
                         TreeNode::Connection(id)
                         | TreeNode::Database(id, _)
                         | TreeNode::Schema(id, _, _)
-                        | TreeNode::Table(id, _, _) => *id,
+                        | TreeNode::Table(id, _, _)
+                        | TreeNode::TablePart(id, _, _, _, _) => *id,
                     });
                 }
                 if self.profiles.is_empty() {
@@ -3624,7 +3656,8 @@ FROM users;"
                     },
                     None,
                 ),
-                TreeNode::Table(connection, database, table) => (
+                TreeNode::Table(connection, database, table)
+                | TreeNode::TablePart(connection, database, table, _, _) => (
                     object_browser_ui::BrowserScope {
                         connection,
                         database: Some(database.clone()),
@@ -3641,6 +3674,13 @@ FROM users;"
         }
         if let Some((connection, group)) = move_connection {
             self.move_to_group(connection, group);
+        }
+        self.request_tree_details(tree_render.requests);
+        if let Some(action) = tree_render.action {
+            self.open_tree_part(action);
+        }
+        if let Some(action) = tree_render.trigger {
+            self.handle_browser_action(action);
         }
         if let Some(dialog) = group_dialog {
             self.catalog_dialog = Some(dialog);
@@ -5598,6 +5638,7 @@ fn result_grid_inline(
             )
         })
         .collect();
+    let mut pointer_selection = grid_selection_ui::PointerSelection::new(ui, tab);
     let grid_response = egui::Frame::new()
         .fill(surface(ui))
         .corner_radius(6)
@@ -5613,6 +5654,7 @@ fn result_grid_inline(
                 (height - GRID_HEADER_HEIGHT - ui.spacing().scroll.bar_width).max(0.0);
             egui::ScrollArea::horizontal()
                 .id_salt(("result-grid-scroll", tab.id, tab.result_index))
+                .scroll_source(egui::scroll_area::ScrollSource { drag: false, ..Default::default() })
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let widths_id = ui
@@ -5631,6 +5673,7 @@ fn result_grid_inline(
                     let mut header_rects = Vec::new();
                     let mut builder = TableBuilder::new(ui)
                         .id_salt(("data-grid", tab.id, tab.result_index))
+                        .drag_to_scroll(false)
                         .striped(true)
                         .resizable(false)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -5716,18 +5759,11 @@ fn result_grid_inline(
                                         false,
                                     );
                                     if response.secondary_clicked() { tab.selected_insert = None; }
-                                    if response.clicked() {
-                                        tab.selected_insert = None;
-                                        tab.selected_rows = Some(row_selection(
-                                            tab.selected_rows,
-                                            row_index,
-                                            ui.input(|i| i.modifiers.shift),
-                                        ));
-                                        tab.selected_cell = None;
-                                        tab.cell_anchor = None;
+                                    if inline_editor.is_none() {
+                                        pointer_selection.cell(ui, &response, grid_selection_ui::SelectionRefs { rows: &mut tab.selected_rows, cell: &mut tab.selected_cell, anchor: &mut tab.cell_anchor, insert: &mut tab.selected_insert }, (row_index, 0), true);
                                     }
                                     let response = response.on_hover_text(
-                                        "单击任意行内容选中整行 · Shift + 单击连续选择多行 · 右键打开行操作 · ⌘/Ctrl+A 全选 · ⌘/Ctrl+C 复制",
+                                        "单击行号选中整行 · 拖动行号选择多行 · Shift+单击扩展选择 · 右键打开行操作 · ⌘/Ctrl+A 全选 · ⌘/Ctrl+C 复制",
                                     );
                                     let deletable = can_edit
                                         && !has_drafts
@@ -5801,30 +5837,8 @@ fn result_grid_inline(
                                             ),
                                             false,
                                         );
-                                        if response.clicked() {
-                                            tab.selected_insert = None;
-                                            let (extend, select_cell) = ui.input(|i| {
-                                                (
-                                                    i.modifiers.shift,
-                                                    i.modifiers.command || i.modifiers.ctrl,
-                                                )
-                                            });
-                                            if select_cell {
-                                                if !extend || tab.selected_cell.is_none() {
-                                                    tab.cell_anchor =
-                                                        Some((row_index, column_index));
-                                                }
-                                                tab.selected_cell = Some((row_index, column_index));
-                                                tab.selected_rows = None;
-                                            } else {
-                                                tab.selected_rows = Some(row_selection(
-                                                    tab.selected_rows,
-                                                    row_index,
-                                                    extend,
-                                                ));
-                                                tab.selected_cell = Some((row_index, column_index));
-                                                tab.cell_anchor = Some((row_index, column_index));
-                                            }
+                                        if inline_editor.is_none() {
+                                            pointer_selection.cell(ui, &response, grid_selection_ui::SelectionRefs { rows: &mut tab.selected_rows, cell: &mut tab.selected_cell, anchor: &mut tab.cell_anchor, insert: &mut tab.selected_insert }, (row_index, column_index), false);
                                         }
                                         let editable = inline_editor.is_none() && grid_cell_eligible(can_edit, target, metadata, set, row_index, column_index);
                                         let begin_edit = response.double_clicked() && editable && inline_editor.is_none();
@@ -5834,7 +5848,7 @@ fn result_grid_inline(
                                         } else if editable {
                                             format!(
                                                 "{value}
-双击 / F2 / Enter 编辑 · ⌘/Ctrl+Shift+单击选择区域 · 粘贴仅暂存，提交后写入"
+单击选格 · 拖动选择区域 · Shift+单击扩展 · 双击 / F2 / Enter 编辑 · 粘贴仅暂存"
                                             )
                                         } else if target.is_none() {
                                             format!(
@@ -5978,6 +5992,15 @@ SQL 查询结果只读；双击左侧表名打开可编辑的表数据"
                     ui.data_mut(|data| data.insert_temp(widths_id, widths));
                 });
         });
+    pointer_selection.finish(
+        ui,
+        grid_selection_ui::SelectionRefs {
+            rows: &mut tab.selected_rows,
+            cell: &mut tab.selected_cell,
+            anchor: &mut tab.cell_anchor,
+            insert: &mut tab.selected_insert,
+        },
+    );
     let pointer_over_grid = ui
         .ctx()
         .pointer_latest_pos()
@@ -6257,7 +6280,14 @@ fn grid_cell(ui: &mut egui::Ui, text: RichText, selected: bool, header: bool) ->
             accent(ui).gamma_multiply(if selected { 0.16 } else { 0.07 }),
         );
     }
-    let (_, response) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
+    let (_, response) = ui.allocate_exact_size(
+        rect.size(),
+        if header {
+            egui::Sense::click()
+        } else {
+            egui::Sense::click_and_drag()
+        },
+    );
     let galley = egui::WidgetText::from(text).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
@@ -6766,6 +6796,7 @@ fn connection_context_menu(
     }
 }
 
+#[cfg(test)]
 fn table_buttons(
     ui: &mut egui::Ui,
     tables: &[&Table],
@@ -6775,54 +6806,16 @@ fn table_buttons(
     busy: bool,
     schema_dialog: &mut Option<SchemaDialog>,
 ) -> Option<Table> {
-    let mut preview = None;
-    for table in tables {
-        let background = ui.painter().add(egui::Shape::Noop);
-        let button = egui::Button::new((
-            RichText::new(&table.name).color(ui.visuals().text_color()),
-            egui::Atom::grow(),
-        ))
-        .frame(false)
-        .min_size(egui::vec2(
-            ui.available_width(),
-            ui.spacing().interact_size.y,
-        ));
-        let response = ui
-            .add(button)
-            .on_hover_text(if table.kind.contains("VIEW") {
-                "视图 · 单击选中，双击打开（前 200 行）"
-            } else {
-                "数据表 · 单击选中，双击打开（前 200 行）"
-            });
-        selection.row(
-            &response,
-            background,
-            TreeNode::Table(connection, database.to_owned(), (*table).clone()),
-        );
-        response.context_menu(|ui| {
-            if ui
-                .add_enabled(
-                    !busy && !table.kind.contains("VIEW"),
-                    egui::Button::new("删除数据表…"),
-                )
-                .clicked()
-            {
-                *schema_dialog = Some(SchemaDialog {
-                    action: SchemaDialogAction::DropTable {
-                        connection,
-                        database: database.to_owned(),
-                        table: (*table).clone(),
-                    },
-                    name: String::new(),
-                });
-                ui.close();
-            }
-        });
-        if response.double_clicked() && !busy {
-            preview = Some((*table).clone());
-        }
-    }
-    preview
+    table_tree_ui::tables(
+        ui,
+        tables,
+        selection,
+        connection,
+        database,
+        busy,
+        schema_dialog,
+        &mut table_tree_ui::TreeRender::default(),
+    )
 }
 
 fn connection_heading(ui: &mut egui::Ui, form: &mut ConnectionForm) {
@@ -9471,7 +9464,7 @@ mod tests {
         let connection = Uuid::new_v4();
         let mut selection = TreeSelection::default();
         let mut frame = |time, pressed: Option<bool>, busy| {
-            let position = egui::pos2(20.0, 18.0);
+            let position = egui::pos2(50.0, 18.0);
             let mut events = vec![egui::Event::PointerMoved(position)];
             if let Some(pressed) = pressed {
                 events.push(egui::Event::PointerButton {

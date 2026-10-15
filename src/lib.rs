@@ -20,5 +20,6 @@ pub mod security;
 pub mod sql_editor;
 pub mod ssh;
 pub mod storage;
+pub mod table_metadata_worker;
 pub mod worker;
 pub mod workspace;

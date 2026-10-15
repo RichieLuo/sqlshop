@@ -66,6 +66,18 @@ impl Default for DesignDocument {
 }
 
 impl DesignDocument {
+    pub(super) fn select_tree_item(&mut self, section: DesignSection, name: Option<String>) {
+        self.section = section;
+        match section {
+            DesignSection::Fields => self.selected_field = name,
+            DesignSection::Indexes => self.selected_index = name,
+            DesignSection::ForeignKeys => self.selected_foreign_key = name,
+            _ => {}
+        }
+    }
+}
+
+impl DesignDocument {
     pub(super) fn dirty(&self) -> bool {
         if self.draft.action == 4 {
             return self.pending.is_some()
@@ -743,12 +755,17 @@ fn metadata_grid(
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             egui::ScrollArea::horizontal()
                 .id_salt(("structure-scroll", tab, section))
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: false,
+                    ..Default::default()
+                })
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let body_height =
                         (height - 28.0 - ui.spacing().scroll.bar_width - 2.0).max(0.0);
                     let mut builder = TableBuilder::new(ui)
                         .id_salt(("structure-table", tab, section))
+                        .drag_to_scroll(false)
                         .striped(true)
                         .resizable(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))

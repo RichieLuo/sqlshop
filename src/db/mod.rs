@@ -13,6 +13,7 @@ pub use security::{account_change_preview, security_change_sql};
 mod structure;
 mod structure_edit;
 mod table_edit;
+mod table_tree;
 pub use browser::{
     ColumnFilter, ColumnSort, FilterOperator, TableBrowseOptions, TablePage, TableStructure,
 };

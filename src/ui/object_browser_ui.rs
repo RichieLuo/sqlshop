@@ -1188,10 +1188,15 @@ fn render_detail_view(
         .show(ui, |ui| {
             egui::ScrollArea::horizontal()
                 .id_salt(("object-detail-scroll", scope.connection, &scope.database))
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: false,
+                    ..Default::default()
+                })
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(content_width.max(viewport_width));
                     let mut table = TableBuilder::new(ui)
+                        .drag_to_scroll(false)
                         .id_salt((
                             "object-browser",
                             scope.connection,
