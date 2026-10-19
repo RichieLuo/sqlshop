@@ -50,9 +50,23 @@ impl QueryTab {
 impl App {
     pub(super) fn management_menu(&mut self, ui: &mut egui::Ui) {
         use sqlshop::diagnostics::DiagnosticKind;
+        self.object_design_window();
         let ready = self.management_source().is_some();
         ui.menu_button("工具", |ui| {
             ui.add_enabled_ui(ready, |ui| {
+                if ui.button("新建视图 / 例程 / 触发器 / 序列…").clicked() {
+                    if let Some(source) = self.management_source() {
+                        self.open_object_designer(source, None, None, false);
+                    }
+                    ui.close();
+                }
+                if ui.button("Schema / 数据库管理…").clicked() {
+                    if let Some(source) = self.management_source() {
+                        self.open_object_designer(source, None, None, true);
+                    }
+                    ui.close();
+                }
+                ui.separator();
                 for kind in [
                     AdvancedKind::Plan,
                     AdvancedKind::Diagnostics(DiagnosticKind::Activity),

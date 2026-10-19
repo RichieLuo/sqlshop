@@ -1,8 +1,13 @@
 mod backup;
 mod browser;
 mod compare;
+mod design_edit;
 mod diagnostics;
 mod object_catalog;
+mod object_design;
+pub use design_edit::{
+    ConstraintDesign, ConstraintKind, DesignSnapshot, DesignerOperation, ReferenceAction,
+};
 mod query_context;
 mod query_control;
 pub use query_control::{QueryCancelHandle, is_query_cancelled};
@@ -184,6 +189,7 @@ pub struct Session {
     credentials: Credentials,
     raw_query_used: bool,
     mysql_server_uuid: Option<String>,
+    table_read_interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Session {
@@ -358,6 +364,7 @@ impl Session {
             credentials: credentials.clone(),
             raw_query_used: false,
             mysql_server_uuid: None,
+            table_read_interrupt: None,
         })
     }
 
@@ -674,6 +681,13 @@ impl Session {
             Driver::SqlServer(_) => {}
         }
         Ok(())
+    }
+
+    pub(crate) fn set_table_read_interrupt(
+        &mut self,
+        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.table_read_interrupt = flag;
     }
 
     pub(crate) async fn query_internal(&mut self, sql: &str) -> Result<QueryOutput> {

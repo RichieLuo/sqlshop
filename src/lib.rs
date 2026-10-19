@@ -12,6 +12,7 @@ pub mod jobs;
 pub mod local_database;
 pub mod model;
 pub mod object_catalog;
+pub mod object_design;
 pub mod oracle_database;
 pub mod query_control;
 pub mod recovery;

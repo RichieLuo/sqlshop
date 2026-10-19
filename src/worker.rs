@@ -245,15 +245,29 @@ fn operation_error(tab: Uuid, message: &str, disconnected: bool) -> Response {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TableReadExecution {
+    pub tab: Uuid,
+    pub execution: Uuid,
+    pub cancellable: bool,
+    pub requested: bool,
+    pub message: String,
+}
+
 pub struct Worker {
     sender: tokio::sync::mpsc::UnboundedSender<Request>,
     pub receiver: mpsc::Receiver<Response>,
+    read_state: std::sync::Arc<std::sync::Mutex<Option<TableReadExecution>>>,
+    read_cancellations: tokio::sync::mpsc::UnboundedSender<(Uuid, Uuid)>,
 }
 
 impl Worker {
     pub fn start(wake: impl Fn() + Send + 'static) -> Self {
         let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
         let (responses, receiver) = mpsc::channel();
+        let read_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_read_state = read_state.clone();
+        let (read_cancellations, mut read_cancel_requests) = tokio::sync::mpsc::unbounded_channel();
         std::thread::spawn(move || {
             // A worker owns one serialized connection. A current-thread runtime
             // keeps simultaneous connections from each allocating a CPU-sized pool.
@@ -427,7 +441,8 @@ impl Worker {
                                     operation_error(tab, "请先选择此表所属连接和数据库", false)
                                 } else {
                                     let connection = session.as_mut().ok_or_else(|| anyhow::anyhow!("请先连接数据库"))?;
-                                    Response::TablePage { tab, page: connection.table_page(&table, &options).await? }
+                                    let (page, _) = cancellable_table_read(connection, tab, &table, &options, false, &worker_read_state, &mut read_cancel_requests, &wake).await?;
+                                    Response::TablePage { tab, page }
                                 }
                             }
                             Request::ReadLastPage { tab, target, table, options } => {
@@ -435,7 +450,7 @@ impl Worker {
                                     operation_error(tab, "请先选择此表所属连接和数据库", false)
                                 } else {
                                     let connection = session.as_mut().ok_or_else(|| anyhow::anyhow!("请先连接数据库"))?;
-                                    let (page, offset) = connection.table_last_page(&table, &options).await?;
+                                    let (page, offset) = cancellable_table_read(connection, tab, &table, &options, true, &worker_read_state, &mut read_cancel_requests, &wake).await?;
                                     Response::TableLastPage { tab, page, offset }
                                 }
                             }
@@ -598,7 +613,7 @@ impl Worker {
                     let response = match result {
                         Ok(Ok(response)) => response,
                         Ok(Err(error)) if error.downcast_ref::<crate::db::EditRejected>().is_some() || error.downcast_ref::<crate::db::ObjectDefinitionRejected>().is_some()
-                            || (read_only_operation && crate::db::query_error_preserves_session(&error)) => {
+                            || (read_only_operation && error.downcast_ref::<CancelTransportFailure>().is_none() && crate::db::query_error_preserves_session(&error)) => {
                             match operation_tab {
                                 Some(tab) => operation_error(tab, &format!("{error:#}"), false),
                                 None => Response::Error { message: format!("{error:#}"), disconnected: false },
@@ -618,18 +633,185 @@ impl Worker {
                             }
                         }
                     };
+                    if let Ok(mut state) = worker_read_state.lock() { *state = None; }
                     if responses.send(response).is_err() { break; }
                     wake();
                 }
             });
         });
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            read_state,
+            read_cancellations,
+        }
+    }
+
+    pub fn table_read_execution(&self, tab: Uuid) -> Option<TableReadExecution> {
+        self.read_state
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|state| state.tab == tab)
+            .cloned()
+    }
+
+    pub fn cancel_table_read(&self, tab: Uuid, execution: Uuid) -> anyhow::Result<()> {
+        let mut state = self
+            .read_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("表读取控制状态不可用"))?;
+        let state = state
+            .as_mut()
+            .filter(|s| s.tab == tab && s.execution == execution && s.cancellable && !s.requested)
+            .ok_or_else(|| anyhow::anyhow!("此表读取已结束或不能安全停止"))?;
+        self.read_cancellations
+            .send((tab, execution))
+            .map_err(|_| anyhow::anyhow!("表读取线程已退出"))?;
+        state.requested = true;
+        state.message = "正在发送停止请求…".into();
+        Ok(())
     }
 
     pub fn send(&self, request: Request) -> anyhow::Result<()> {
         self.sender
             .send(request)
             .map_err(|_| anyhow::anyhow!("数据库工作线程已退出，请重启应用"))
+    }
+}
+
+// One cancellation generation covers metadata, COUNT and the requested page.
+// The control future is polled locally, so outer timeout/drop cannot leave an
+// independently running cancellation task targeting a future operation.
+#[allow(clippy::too_many_arguments)]
+async fn cancellable_table_read(
+    session: &mut Session,
+    tab: Uuid,
+    table: &Table,
+    options: &TableBrowseOptions,
+    last: bool,
+    state: &std::sync::Arc<std::sync::Mutex<Option<TableReadExecution>>>,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<(Uuid, Uuid)>,
+    wake: &impl Fn(),
+) -> anyhow::Result<(TablePage, u64)> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let execution = Uuid::new_v4();
+    if let Ok(mut state) = state.lock() {
+        *state = Some(TableReadExecution {
+            tab,
+            execution,
+            cancellable: false,
+            requested: false,
+            message: "正在准备表读取控制通道…".into(),
+        });
+    }
+    wake();
+    let _ = session.prepare_query_control().await;
+    let handle = session.cancel_handle().ok();
+    let active = Arc::new(AtomicBool::new(true));
+    if let Ok(mut state) = state.lock() {
+        *state = Some(TableReadExecution {
+            tab,
+            execution,
+            cancellable: handle.is_some(),
+            requested: false,
+            message: if handle.is_some() {
+                "正在读取表数据…"
+            } else {
+                "读取中；无法核实安全取消标识"
+            }
+            .into(),
+        });
+    }
+    wake();
+    struct Guard {
+        active: Arc<AtomicBool>,
+        handle: Option<crate::db::QueryCancelHandle>,
+        state: Arc<std::sync::Mutex<Option<TableReadExecution>>>,
+        execution: Uuid,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.active.store(false, Ordering::SeqCst);
+            if let Some(h) = &self.handle {
+                h.disarm();
+            }
+            if let Ok(mut s) = self.state.lock()
+                && s.as_ref().is_some_and(|s| s.execution == self.execution)
+            {
+                *s = None;
+            }
+        }
+    }
+    let guard = Guard {
+        active: active.clone(),
+        handle: handle.clone(),
+        state: state.clone(),
+        execution,
+    };
+    type Control = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>>>>;
+    let mut control: Option<Control> = None;
+    let mut requested = false;
+    let interrupted = Arc::new(AtomicBool::new(false));
+    session.set_table_read_interrupt(Some(interrupted.clone()));
+    let mut control_failed = None;
+    let result;
+    {
+        let read = async {
+            if last {
+                session.table_last_page(table, options).await
+            } else {
+                session
+                    .table_page(table, options)
+                    .await
+                    .map(|page| (page, options.offset))
+            }
+        };
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                value = &mut read => { result=value; break; }
+                Some((source,generation))=requests.recv() => {
+                    if source==tab && generation==execution && !requested && let Some(handle)=handle.clone() {
+                        requested=true;interrupted.store(true, Ordering::SeqCst);let active=active.clone();
+                        control=Some(Box::pin(async move { tokio::time::timeout(Duration::from_secs(30),handle.cancel_if_active(active)).await.map_err(|_|anyhow::anyhow!("停止控制通道超时"))? }));
+                    }
+                }
+                outcome=async { control.as_mut().expect("guarded control").await }, if control.is_some() => {
+                    control=None;
+                    let message=match outcome { Ok(true)=>"停止请求已发送，等待服务器确认…".into(),Ok(false)=>"本次读取已结束，未发送停止请求".into(),Err(error)=>{let message=format!("停止失败：{error:#}；等待本次读取结束");control_failed=Some(message.clone());message} };
+                    if let Ok(mut state)=state.lock() && let Some(state)=state.as_mut() && state.execution==execution {state.message=message;}
+                    wake();
+                }
+            }
+        }
+    }
+    active.store(false, Ordering::SeqCst);
+    if let Some(handle) = &handle {
+        handle.disarm();
+    }
+    if let Some(control) = control
+        && let Err(error) = control.await
+    {
+        control_failed = Some(format!("停止控制通道失败：{error:#}"));
+    }
+    drop(guard);
+    session.set_table_read_interrupt(None);
+    wake();
+    if let Some(message) = control_failed {
+        return Err(CancelTransportFailure(format!(
+            "{message}；原读取可能已完成，管理连接不再复用；请重新连接并刷新"
+        ))
+        .into());
+    }
+    match result {
+        Err(error) if crate::db::is_query_cancelled(&error) => {
+            Err(error.context("表读取已停止，服务器已确认；保留上次数据，重新刷新后可继续编辑"))
+        }
+        other => other,
     }
 }
 

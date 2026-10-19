@@ -796,9 +796,600 @@ pub fn copy_tsv(
     output
 }
 
+#[derive(Clone, Debug)]
+struct SqlLexeme<'a> {
+    text: &'a str,
+    range: Range<usize>,
+    opaque: bool,
+    comment: bool,
+}
+
+// The dialect lexer deliberately refuses ambiguous session-dependent quoting.
+// Formatting edits whitespace only, retaining literal prefixes and operators.
+fn editing_tokens(sql: &str, engine: Engine) -> Result<Vec<SqlLexeme<'_>>, String> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < sql.len() {
+        let start = offset;
+        let ch = sql[offset..].chars().next().unwrap();
+        if ch.is_whitespace() {
+            offset += ch.len_utf8();
+            continue;
+        }
+        let line_comment = (sql[offset..].starts_with("--")
+            && (engine != Engine::MySql
+                || sql
+                    .as_bytes()
+                    .get(offset + 2)
+                    .is_none_or(|b| b.is_ascii_whitespace() || *b < 32)))
+            || (engine == Engine::MySql && ch == '#');
+        let block_comment = sql[offset..].starts_with("/*");
+        let quoted = matches!(ch, '\'' | '"')
+            || (engine == Engine::MySql && ch == '`')
+            || (engine == Engine::SqlServer && ch == '[');
+        let dollar = if engine == Engine::Postgres && ch == '$' {
+            statement_dollar_delimiter(&sql[offset..])
+        } else {
+            None
+        };
+        if line_comment {
+            offset = sql[offset..]
+                .find(['\n', '\r'])
+                .map_or(sql.len(), |n| offset + n);
+        } else if block_comment {
+            offset = statement_comment_end(sql, offset, engine)?;
+        } else if let Some(delimiter) = dollar {
+            let body = offset + delimiter.len();
+            offset = sql[body..]
+                .find(delimiter)
+                .map(|n| body + n + delimiter.len())
+                .ok_or("PostgreSQL dollar quote 尚未闭合。")?;
+        } else if quoted {
+            let escape = engine == Engine::Postgres
+                && ch == '\''
+                && offset > 0
+                && matches!(sql.as_bytes()[offset - 1], b'E' | b'e')
+                && (offset == 1 || !sql[..offset - 1].chars().next_back().is_some_and(word_char));
+            offset = statement_quote_end(
+                sql,
+                offset,
+                escape,
+                engine == Engine::MySql || (engine == Engine::Postgres && ch == '\'' && !escape),
+            )?;
+        } else if word_char(ch) || ch == '@' {
+            offset += ch.len_utf8();
+            while let Some(ch) = sql[offset..].chars().next() {
+                if !word_char(ch) && ch != '@' {
+                    break;
+                }
+                offset += ch.len_utf8();
+            }
+        } else {
+            offset += ch.len_utf8();
+        }
+        tokens.push(SqlLexeme {
+            text: &sql[start..offset],
+            range: start..offset,
+            opaque: quoted || dollar.is_some(),
+            comment: line_comment || block_comment,
+        });
+    }
+    Ok(tokens)
+}
+
+/// A conservative whitespace formatter. Quoted values, comments, identifier
+/// spelling, and token adjacency are preserved exactly. This never parses or
+/// rewrites SQL expressions. Session-dependent ambiguous quotes are refused.
+pub fn format_sql(sql: &str, engine: Engine, compact: bool) -> Result<String, String> {
+    let tokens = editing_tokens(sql, engine)?;
+    let line_start = |offset: usize| {
+        sql[..offset]
+            .rfind(['\n', '\r'])
+            .map_or(0, |index| index + 1)
+    };
+    let batch_lines: std::collections::HashSet<_> = tokens
+        .iter()
+        .filter(|token| {
+            !token.opaque
+                && !token.comment
+                && (token.text.eq_ignore_ascii_case("GO")
+                    || token.text.eq_ignore_ascii_case("DELIMITER"))
+        })
+        .map(|token| line_start(token.range.start))
+        .collect();
+    let mut output = String::new();
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 {
+            let previous = &tokens[index - 1];
+            let gap = &sql[previous.range.end..token.range.start];
+            // Never split adjacent tokens: E'...', N'...', ::, ->>, numbers,
+            // executable comments and dialect operators must retain spelling.
+            if !gap.is_empty() {
+                let line_comment = previous.comment && !previous.text.starts_with("/*");
+                let batch_line = batch_lines.contains(&line_start(previous.range.end))
+                    || batch_lines.contains(&line_start(token.range.start));
+                let clause = !token.opaque
+                    && !token.comment
+                    && matches!(
+                        token.text.to_ascii_uppercase().as_str(),
+                        "SELECT"
+                            | "FROM"
+                            | "WHERE"
+                            | "HAVING"
+                            | "LIMIT"
+                            | "OFFSET"
+                            | "RETURNING"
+                            | "UNION"
+                            | "EXCEPT"
+                            | "INTERSECT"
+                            | "SET"
+                            | "VALUES"
+                            | "JOIN"
+                            | "LEFT"
+                            | "RIGHT"
+                            | "INNER"
+                            | "FULL"
+                            | "GROUP"
+                            | "ORDER"
+                    );
+                if line_comment
+                    || (batch_line && gap.contains(['\n', '\r']))
+                    || (!compact && (clause || previous.text == ";" || previous.text == ","))
+                {
+                    output.push('\n');
+                    if !compact {
+                        output.push_str(&"    ".repeat(depth.min(16)));
+                    }
+                } else {
+                    output.push(' ');
+                }
+            }
+        }
+        output.push_str(token.text);
+        if !token.opaque && !token.comment {
+            if token.text == "(" {
+                depth += 1;
+            }
+            if token.text == ")" {
+                depth = depth.saturating_sub(1);
+            }
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletionTable {
+    pub schema: String,
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+/// Context completion uses only metadata for this editor's bound connection.
+/// Aliases are resolved inside the current statement and visible parent scopes;
+/// sibling subqueries and previous statements cannot leak alias bindings.
+pub type SemanticCompletions = (Range<usize>, Vec<(String, CompletionKind)>);
+
+pub fn semantic_completions(
+    sql: &str,
+    cursor: usize,
+    engine: Engine,
+    tables: &[CompletionTable],
+    fallback_columns: &[String],
+) -> Option<SemanticCompletions> {
+    if cursor > sql.chars().count() {
+        return None;
+    }
+    let end = char_to_byte_index(sql, cursor);
+    let tokens = editing_tokens(sql, engine).ok()?;
+    let token = tokens.iter().find(|token| {
+        token.range.start < end && token.range.end >= end && !token.opaque && !token.comment
+    })?;
+    let range = if token.text == "." && token.range.end == end {
+        end..end
+    } else if token.text.chars().all(word_char)
+        && token
+            .text
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+    {
+        token.range.clone()
+    } else {
+        return None;
+    };
+    let prefix = &sql[range.start..end];
+    let significant: Vec<_> = tokens.iter().filter(|token| !token.comment).collect();
+    // The nearest containing parenthesis scope at the cursor, plus ancestors.
+    let mut scope = Vec::new();
+    let mut scopes = Vec::new();
+    let mut statement = 0usize;
+    let mut cursor_scope = Vec::new();
+    let mut cursor_statement = 0usize;
+    for (index, token) in significant.iter().enumerate() {
+        if token.range.start <= end {
+            cursor_scope = scope.clone();
+            cursor_statement = statement;
+        }
+        scopes.push((statement, scope.clone()));
+        if !token.opaque {
+            match token.text {
+                "(" => scope.push(index),
+                ")" => {
+                    scope.pop();
+                }
+                ";" => {
+                    statement += 1;
+                    scope.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+    let unquote = |text: &str| -> String {
+        if text.starts_with('"') {
+            text[1..text.len() - 1].replace("\"\"", "\"")
+        } else if text.starts_with('`') {
+            text[1..text.len() - 1].replace("``", "`")
+        } else if text.starts_with('[') {
+            text[1..text.len() - 1].replace("]]", "]")
+        } else if engine == Engine::Postgres {
+            text.to_lowercase()
+        } else {
+            text.to_owned()
+        }
+    };
+    let identifier_matches = |left: &str, right: &str| {
+        if engine == Engine::Postgres {
+            left == right
+        } else {
+            left.eq_ignore_ascii_case(right)
+        }
+    };
+    let qualifier = sql[..range.start].strip_suffix('.').and_then(|text| {
+        let token = significant
+            .iter()
+            .rev()
+            .find(|token| token.range.end <= text.len())?;
+        (token.range.end == text.len()).then(|| unquote(token.text))
+    });
+    let mut aliases: Vec<(String, String, Option<String>, usize)> = Vec::new();
+    for (index, token) in significant.iter().enumerate() {
+        let (statement, scope) = &scopes[index];
+        if *statement != cursor_statement
+            || !cursor_scope.starts_with(scope)
+            || token.opaque
+            || !matches!(
+                token.text.to_ascii_uppercase().as_str(),
+                "FROM" | "JOIN" | "UPDATE" | "INTO"
+            )
+        {
+            continue;
+        }
+        let mut next = index + 1;
+        let Some(table) = significant.get(next) else {
+            continue;
+        };
+        if table.text == "(" {
+            continue;
+        }
+        let mut name = unquote(table.text);
+        let mut schema = None;
+        next += 1;
+        if significant.get(next).is_some_and(|token| token.text == ".") {
+            schema = Some(name);
+            next += 1;
+            let Some(table) = significant.get(next) else {
+                continue;
+            };
+            name = unquote(table.text);
+            next += 1;
+        }
+        aliases.push((name.clone(), name.clone(), schema.clone(), scope.len()));
+        if significant
+            .get(next)
+            .is_some_and(|token| token.text.eq_ignore_ascii_case("AS"))
+        {
+            next += 1;
+        }
+        if let Some(alias) = significant.get(next)
+            && (alias.opaque || alias.text.chars().all(word_char))
+            && !is_keyword(alias.text)
+        {
+            aliases.push((unquote(alias.text), name, schema, scope.len()));
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Some(qualifier) = qualifier {
+        let binding = aliases
+            .iter()
+            .filter(|(alias, _, _, _)| identifier_matches(alias, &qualifier))
+            .max_by_key(|(_, _, _, depth)| depth);
+        for table in tables {
+            if let Some((_, name, schema, _)) = binding {
+                if !identifier_matches(&table.name, name)
+                    || schema
+                        .as_ref()
+                        .is_some_and(|schema| !identifier_matches(&table.schema, schema))
+                {
+                    continue;
+                }
+                for column in &table.columns {
+                    candidates.push((column.clone(), CompletionKind::Field));
+                }
+            } else if identifier_matches(&table.schema, &qualifier) {
+                candidates.push((table.name.clone(), CompletionKind::Table));
+            } else if identifier_matches(&table.name, &qualifier) {
+                for column in &table.columns {
+                    candidates.push((column.clone(), CompletionKind::Field));
+                }
+            }
+        }
+    } else {
+        let names = tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect::<Vec<_>>();
+        let scoped_columns = tables
+            .iter()
+            .filter(|table| {
+                aliases.iter().any(|(_, name, schema, _)| {
+                    identifier_matches(&table.name, name)
+                        && schema
+                            .as_ref()
+                            .is_none_or(|schema| identifier_matches(&table.schema, schema))
+                })
+            })
+            .flat_map(|table| table.columns.iter().cloned())
+            .collect::<Vec<_>>();
+        candidates = completions(
+            prefix,
+            if aliases.is_empty() {
+                fallback_columns
+            } else {
+                &scoped_columns
+            },
+            &names,
+        );
+        for table in tables {
+            if !table.schema.is_empty() {
+                candidates.push((table.schema.clone(), CompletionKind::Table));
+            }
+        }
+    }
+    candidates.retain(|(name, _)| {
+        name.len() > prefix.len() && name.to_lowercase().starts_with(&prefix.to_lowercase())
+    });
+    candidates.sort_by_key(|(name, _)| name.to_lowercase());
+    candidates.dedup_by(|a, b| {
+        if engine == Engine::Postgres {
+            a.0 == b.0
+        } else {
+            a.0.eq_ignore_ascii_case(&b.0)
+        }
+    });
+    candidates.truncate(24);
+    for (name, kind) in &mut candidates {
+        if *kind != CompletionKind::Keyword
+            && (is_keyword(name)
+                || (engine == Engine::Postgres && name.chars().any(char::is_uppercase))
+                || !name
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+                || !name.chars().all(word_char))
+        {
+            *name = match engine {
+                Engine::MySql => format!("`{}`", name.replace('`', "``")),
+                Engine::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+                Engine::SqlServer => format!("[{}]", name.replace(']', "]]")),
+            };
+        }
+    }
+    Some((range, candidates))
+}
+
+/// Non-overlapping source spans for a collapsible outline of multiline
+/// comments and parenthesized code; literal contents never become fold markers.
+pub fn folding_ranges(sql: &str, engine: Engine) -> Result<Vec<Range<usize>>, String> {
+    let tokens = editing_tokens(sql, engine)?;
+    let mut stack = Vec::new();
+    let mut ranges = Vec::new();
+    for token in tokens {
+        if token.comment && token.text.contains('\n') {
+            ranges.push(token.range.clone());
+        }
+        if !token.opaque && !token.comment {
+            if token.text == "(" {
+                stack.push(token.range.start);
+            }
+            if token.text == ")"
+                && let Some(start) = stack.pop()
+                && sql[start..token.range.end].contains('\n')
+            {
+                ranges.push(start..token.range.end);
+            }
+        }
+    }
+    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+    let mut end = 0;
+    ranges.retain(|range| {
+        if range.start < end {
+            false
+        } else {
+            end = range.end;
+            true
+        }
+    });
+    Ok(ranges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatting_preserves_dialect_tokens_and_comment_boundaries() {
+        for (engine, sql) in [
+            (
+                Engine::Postgres,
+                "select E'\\\\🦀', $$a  b\nc$$, x::int from public.t -- tail\nwhere id > 1;",
+            ),
+            (
+                Engine::SqlServer,
+                "SELECT N'a  b', [中]]文], #temp.x FROM #temp;\nGO\nSELECT 2;",
+            ),
+            (
+                Engine::MySql,
+                "select `名``称`, 'a  b', 1--2 from t # comment\nwhere id=1;",
+            ),
+        ] {
+            let tokens = editing_tokens(sql, engine)
+                .unwrap()
+                .iter()
+                .map(|token| token.text.to_owned())
+                .collect::<Vec<_>>();
+            for compact in [true, false] {
+                let formatted = format_sql(sql, engine, compact).unwrap();
+                assert_eq!(
+                    editing_tokens(&formatted, engine)
+                        .unwrap()
+                        .iter()
+                        .map(|token| token.text.to_owned())
+                        .collect::<Vec<_>>(),
+                    tokens
+                );
+                assert_eq!(format_sql(&formatted, engine, compact).unwrap(), formatted);
+            }
+        }
+        assert!(format_sql("SELECT 'a\\b'", Engine::MySql, false).is_err());
+        assert!(format_sql("SELECT /* open", Engine::Postgres, false).is_err());
+        for (engine, sql) in [
+            (Engine::SqlServer, "SELECT 1;\n/* batch */ GO 2\nSELECT 3;"),
+            (
+                Engine::MySql,
+                "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;",
+            ),
+        ] {
+            let compact = format_sql(sql, engine, true).unwrap();
+            assert_eq!(compact.lines().count(), sql.lines().count());
+        }
+    }
+
+    #[test]
+    fn semantic_completion_resolves_schema_aliases_and_scope() {
+        let tables = vec![
+            CompletionTable {
+                schema: "public".into(),
+                name: "users".into(),
+                columns: vec!["user_id".into()],
+            },
+            CompletionTable {
+                schema: "sales".into(),
+                name: "orders".into(),
+                columns: vec!["order_id".into()],
+            },
+        ];
+        let check = |sql: &str, marker: &str| {
+            let cursor = sql.find(marker).unwrap() + marker.len();
+            semantic_completions(
+                sql,
+                byte_to_char_index(sql, cursor),
+                Engine::Postgres,
+                &tables,
+                &[],
+            )
+            .unwrap()
+            .1
+        };
+        assert_eq!(
+            check("SELECT u. FROM public.users AS u", "u."),
+            [("user_id".into(), CompletionKind::Field)]
+        );
+        assert_eq!(
+            check("SELECT sales. FROM public.users", "sales."),
+            [("orders".into(), CompletionKind::Table)]
+        );
+        assert_eq!(
+            check("SELECT u.us FROM public.users u", "u.us"),
+            [("user_id".into(), CompletionKind::Field)]
+        );
+        assert!(check("SELECT 1 FROM public.users u; SELECT u.", "u.").is_empty());
+        assert!(check("SELECT (SELECT 1 FROM public.users u), (SELECT u.)", "u.").is_empty());
+        assert_eq!(
+            check(
+                "SELECT (SELECT u. FROM sales.orders u) FROM public.users u",
+                "u."
+            ),
+            [("order_id".into(), CompletionKind::Field)]
+        );
+        assert_eq!(
+            check("SELECT (SELECT u.) FROM public.users u", "u."),
+            [("user_id".into(), CompletionKind::Field)]
+        );
+        assert!(semantic_completions("SELECT 'u.'", 10, Engine::Postgres, &tables, &[]).is_none());
+        assert_eq!(
+            check("SELECT us FROM public.users", "SELECT us")
+                .into_iter()
+                .filter(|(_, kind)| *kind != CompletionKind::Keyword)
+                .collect::<Vec<_>>(),
+            [
+                ("user_id".into(), CompletionKind::Field),
+                ("users".into(), CompletionKind::Table)
+            ]
+        );
+        let weird = vec![CompletionTable {
+            schema: "public".into(),
+            name: "users".into(),
+            columns: vec!["odd name".into(), "select".into()],
+        }];
+        let sql = "SELECT u. FROM public.users u";
+        assert_eq!(
+            semantic_completions(sql, 9, Engine::Postgres, &weird, &[])
+                .unwrap()
+                .1,
+            [
+                ("\"odd name\"".into(), CompletionKind::Field),
+                ("\"select\"".into(), CompletionKind::Field)
+            ]
+        );
+        assert!(semantic_completions("x.", usize::MAX, Engine::Postgres, &tables, &[]).is_none());
+        let cases = vec![CompletionTable {
+            schema: "public".into(),
+            name: "users".into(),
+            columns: vec!["Name".into(), "name".into()],
+        }];
+        assert_eq!(
+            semantic_completions(sql, 9, Engine::Postgres, &cases, &[])
+                .unwrap()
+                .1,
+            [
+                ("\"Name\"".into(), CompletionKind::Field),
+                ("name".into(), CompletionKind::Field)
+            ]
+        );
+        let sql = "SELECT u. FROM sales.orders u JOIN public.users AS \"U\" ON true";
+        assert_eq!(
+            semantic_completions(sql, 9, Engine::Postgres, &tables, &[])
+                .unwrap()
+                .1,
+            [("order_id".into(), CompletionKind::Field)]
+        );
+    }
+
+    #[test]
+    fn folds_ignore_literal_parentheses_and_keep_utf8_ranges() {
+        let sql = "SELECT '(\n)', (SELECT 中文\n FROM t); /* 中\n文 */";
+        let ranges = folding_ranges(sql, Engine::Postgres).unwrap();
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &sql[range.clone()])
+                .collect::<Vec<_>>(),
+            ["(SELECT 中文\n FROM t)", "/* 中\n文 */"]
+        );
+    }
 
     fn statement_at(sql: &str, byte_cursor: usize, engine: Engine) -> Option<&str> {
         let range =

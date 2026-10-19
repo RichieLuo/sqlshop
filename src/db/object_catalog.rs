@@ -379,11 +379,15 @@ const PG_TRIGGERS: &str = r#"SELECT n.nspname::text,t.tgname::text,'TRIGGER',pg_
     AND has_schema_privilege(n.oid,'USAGE') AND has_table_privilege(c.oid,'SELECT')
     ORDER BY n.nspname,c.relname,t.tgname LIMIT 1001"#;
 
+// PostgreSQL can evaluate WHERE predicates before the relkind filter. The
+// privilege function raises on non-sequences (including TOAST relations), so
+// CASE must guard its argument rather than relying on predicate order.
 const PG_SEQUENCES: &str = r#"SELECT n.nspname::text,c.relname::text,'SEQUENCE',pg_get_userbyid(c.relowner)::text,
     obj_description(c.oid,'pg_class')::text,NULL,NULL,NULL,NULL,NULL,NULL,NULL
     FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
     WHERE c.relkind='S' AND n.nspname<>'information_schema' AND n.nspname!~'^pg_'
-    AND has_schema_privilege(n.oid,'USAGE') AND has_sequence_privilege(c.oid,'USAGE,SELECT')
+    AND has_schema_privilege(n.oid,'USAGE')
+    AND CASE WHEN c.relkind='S' THEN has_sequence_privilege(c.oid,'USAGE,SELECT') ELSE false END
     ORDER BY n.nspname,c.relname LIMIT 1001"#;
 
 const MSSQL_RELATIONS: &str = r#"SELECT TOP (1001) s.name,o.name,CASE WHEN o.type='V' THEN 'VIEW' ELSE 'TABLE' END,

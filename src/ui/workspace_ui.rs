@@ -235,6 +235,7 @@ impl App {
                 self.next_tab = workspace.next_tab.max(self.tabs.len() + 1);
                 self.editor_height = workspace.editor_height;
                 self.history = workspace.history;
+                self.table_grid_layouts = workspace.table_grid_layouts;
                 if let Some(layout) = workspace.layout {
                     self.view.navigation = layout.navigation;
                     self.inspector_visible = layout.information;
@@ -298,6 +299,7 @@ impl App {
             || layout.connected_only != self.view.connected_only
             || layout.theme != self.workspace_theme()
             || saved.history != self.history
+            || saved.table_grid_layouts != self.table_grid_layouts
         {
             return false;
         }
@@ -346,6 +348,7 @@ impl App {
             active_tab,
             next_tab: self.next_tab,
             history: self.history.clone(),
+            table_grid_layouts: self.table_grid_layouts.clone(),
             editor_height: self.editor_height,
             layout: Some(sqlshop::workspace::WorkspaceLayout {
                 navigation: self.view.navigation,
@@ -1039,6 +1042,13 @@ impl App {
         ui.spacing_mut().interact_size.y = 24.0;
         let actions = self.table_action_state(self.active_tab);
         let can_insert_row = self.can_add_table_row(self.active_tab);
+        let read_worker = self.tabs[self.active_tab]
+            .target
+            .as_ref()
+            .and_then(|t| self.sessions.get(&t.connection))
+            .map(|s| &s.worker);
+        let read_state = read_worker
+            .and_then(|worker| worker.table_read_execution(self.tabs[self.active_tab].id));
         let tab = &mut self.tabs[self.active_tab];
         let mut status = tab
             .target
@@ -1104,6 +1114,7 @@ impl App {
             status.push_str(&format!(" · {draft_label}"));
         }
         let mut refresh = false;
+        let read_tab_id = tab.id;
         let mut edit_buttons = |ui: &mut egui::Ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.spacing_mut().button_padding.x = 8.0;
@@ -1126,6 +1137,22 @@ impl App {
                 .add_enabled(actions.can_read(), egui::Button::new("刷新"))
                 .on_hover_text("重新读取当前页；存在暂存时请先提交或撤销暂存")
                 .clicked();
+            if let (Some(worker), Some(read)) = (read_worker, &read_state) {
+                if ui
+                    .add_enabled(
+                        read.cancellable && !read.requested,
+                        egui::Button::new("■ 停止读取"),
+                    )
+                    .on_hover_text(
+                        "停止本次分页/统计；取消确认后保留上次数据，若已完成则显示本次结果",
+                    )
+                    .clicked()
+                    && let Err(error) = worker.cancel_table_read(read_tab_id, read.execution)
+                {
+                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                }
+                ui.label(RichText::new(&read.message).small().weak());
+            }
         };
         ui.separator();
         egui::ScrollArea::horizontal()
@@ -1347,6 +1374,9 @@ impl App {
     }
 
     pub(super) fn discard_staged_cells(&mut self, index: usize) -> bool {
+        if self.tab_busy(index) {
+            return false;
+        }
         if self
             .cell_editor
             .as_ref()
@@ -1538,6 +1568,7 @@ impl App {
         }
         if self.confirm_exit {
             let busy = self.any_busy();
+            let object_dirty = self.object_design_dirty();
             let mut exit = false;
             let mut discard_exit = false;
             let mut cancel = false;
@@ -1547,7 +1578,10 @@ impl App {
                 ui.horizontal(|ui| {
                     cancel = ui.button("取消").clicked();
                     exit = ui
-                        .add_enabled(!busy, egui::Button::new("保存草稿并退出"))
+                        .add_enabled(
+                            !busy && !object_dirty,
+                            egui::Button::new("保存 SQL 草稿并退出"),
+                        )
                         .clicked();
                     discard_exit = ui
                         .add_enabled(!busy, egui::Button::new("不保存草稿，直接退出"))
@@ -1555,6 +1589,9 @@ impl App {
                 });
                 if busy {
                     ui.label("正在执行数据库操作，请返回并停止查询或等待任务结束后退出。");
+                }
+                if object_dirty {
+                    ui.label("对象设计器有未保存内容，请先保存或复制草稿；直接退出会丢弃。");
                 }
             });
             if cancel {

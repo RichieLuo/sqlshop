@@ -7,6 +7,7 @@ use sqlshop::{
     worker::{QueryRequest, QueryResponse, QueryWorker, Request, Response, Worker},
 };
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -23,23 +24,40 @@ async fn packet(socket: &mut TcpStream, tag: u8, data: &[u8]) -> std::io::Result
     socket.write_all(data).await
 }
 
-async fn rows(
+async fn row_description(
     socket: &mut TcpStream,
     columns: &[&str],
-    rows: &[Vec<String>],
+    formats: &[i16],
 ) -> std::io::Result<()> {
     let mut description = (columns.len() as i16).to_be_bytes().to_vec();
-    for column in columns {
+    for (index, column) in columns.iter().enumerate() {
         description.extend(column.as_bytes());
         description.push(0);
         description.extend(0u32.to_be_bytes());
         description.extend(0i16.to_be_bytes());
-        description.extend(25u32.to_be_bytes()); // builtin TEXT, text transfer format
+        description.extend(25u32.to_be_bytes()); // builtin TEXT; binary TEXT also uses UTF-8
         description.extend((-1i16).to_be_bytes());
         description.extend((-1i32).to_be_bytes());
-        description.extend(0i16.to_be_bytes());
+        description.extend(
+            formats
+                .get(if formats.len() == 1 { 0 } else { index })
+                .copied()
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
     }
-    packet(socket, b'T', &description).await?;
+    packet(socket, b'T', &description).await
+}
+
+async fn rows(
+    socket: &mut TcpStream,
+    columns: &[&str],
+    rows: &[Vec<String>],
+    simple: bool,
+) -> std::io::Result<()> {
+    if simple {
+        row_description(socket, columns, &[]).await?;
+    }
     for row in rows {
         let mut data = (row.len() as i16).to_be_bytes().to_vec();
         for cell in row {
@@ -49,7 +67,58 @@ async fn rows(
         packet(socket, b'D', &data).await?;
     }
     packet(socket, b'C', format!("SELECT {}\0", rows.len()).as_bytes()).await?;
-    packet(socket, b'Z', b"I").await
+    // Extended queries become ready only at Sync, after CloseComplete, etc.
+    if simple {
+        packet(socket, b'Z', b"I").await?;
+    }
+    Ok(())
+}
+
+fn cstring(body: &mut &[u8]) -> Result<String> {
+    let end = body
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| anyhow::anyhow!("Unterminated protocol string"))?;
+    let value = std::str::from_utf8(&body[..end])?.to_owned();
+    *body = &body[end + 1..];
+    Ok(value)
+}
+
+fn take<'a>(body: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
+    anyhow::ensure!(length <= body.len(), "Truncated protocol message");
+    let (value, rest) = body.split_at(length);
+    *body = rest;
+    Ok(value)
+}
+
+fn result_rows(
+    sql: &str,
+    database: &str,
+    allowed: &[String],
+) -> (&'static [&'static str], Vec<Vec<String>>) {
+    if sql.contains("sqlshop_slow_query") {
+        (&["origin"], vec![vec![database.into()]])
+    } else if sql.contains("FROM pg_database") {
+        (
+            &["datname"],
+            allowed.iter().map(|db| vec![db.clone()]).collect(),
+        )
+    } else if sql.contains("current_database()") {
+        (&["current_database"], vec![vec![database.into()]])
+    } else if sql.contains("current_schema()") {
+        (&["current_schema"], vec![vec!["public".into()]])
+    } else if sql.contains("information_schema.tables") {
+        (
+            &["table_schema", "table_name", "table_type"],
+            vec![vec![
+                "public".into(),
+                format!("{database}_table"),
+                "BASE TABLE".into(),
+            ]],
+        )
+    } else {
+        (&["connection_test"], vec![vec!["1".into()]])
+    }
 }
 
 async fn serve(
@@ -90,45 +159,142 @@ async fn serve(
     packet(&mut socket, b'S', b"client_encoding\0UTF8\0").await?;
     packet(&mut socket, b'K', &[0; 8]).await?;
     packet(&mut socket, b'Z', b"I").await?;
+    let mut statements = HashMap::<String, (String, Vec<u32>)>::new();
+    let mut portals = HashMap::<String, (String, Vec<i16>)>::new();
     while let Ok(tag) = socket.read_u8().await {
         let length = socket.read_u32().await? as usize;
-        let mut body = vec![0; length - 4];
-        socket.read_exact(&mut body).await?;
-        if tag == b'X' {
-            break;
-        }
-        anyhow::ensure!(tag == b'Q', "Unexpected protocol tag {tag}");
-        let sql = String::from_utf8_lossy(&body);
+        anyhow::ensure!(
+            (4..65_536).contains(&length),
+            "Invalid frontend message length"
+        );
+        let mut payload = vec![0; length - 4];
+        socket.read_exact(&mut payload).await?;
+        let mut body = payload.as_slice();
+        let (sql, simple) = match tag {
+            b'X' => break,
+            b'Q' => {
+                let sql = cstring(&mut body)?;
+                portals.remove("");
+                (sql, true)
+            }
+            b'P' => {
+                let name = cstring(&mut body)?;
+                let sql = cstring(&mut body)?;
+                let count = u16::from_be_bytes(take(&mut body, 2)?.try_into()?) as usize;
+                let mut types = Vec::with_capacity(count);
+                for _ in 0..count {
+                    types.push(u32::from_be_bytes(take(&mut body, 4)?.try_into()?));
+                }
+                anyhow::ensure!(body.is_empty(), "Trailing Parse data");
+                statements.insert(name, (sql, types));
+                packet(&mut socket, b'1', &[]).await?; // ParseComplete
+                continue;
+            }
+            b'D' => {
+                let kind = take(&mut body, 1)?[0];
+                let name = cstring(&mut body)?;
+                anyhow::ensure!(body.is_empty(), "Trailing Describe data");
+                match kind {
+                    b'S' => {
+                        let (sql, types) = statements
+                            .get(&name)
+                            .ok_or_else(|| anyhow::anyhow!("Unknown statement"))?;
+                        let mut parameters = (types.len() as u16).to_be_bytes().to_vec();
+                        for oid in types {
+                            parameters.extend(oid.to_be_bytes());
+                        }
+                        packet(&mut socket, b't', &parameters).await?; // ParameterDescription
+                        let (columns, _) = result_rows(sql, &database, &allowed);
+                        row_description(&mut socket, columns, &[]).await?;
+                    }
+                    b'P' => {
+                        let (sql, formats) = portals
+                            .get(&name)
+                            .ok_or_else(|| anyhow::anyhow!("Unknown portal"))?;
+                        let (columns, _) = result_rows(sql, &database, &allowed);
+                        row_description(&mut socket, columns, formats).await?;
+                    }
+                    _ => anyhow::bail!("Invalid Describe kind"),
+                }
+                continue;
+            }
+            b'B' => {
+                let portal = cstring(&mut body)?;
+                let name = cstring(&mut body)?;
+                let (sql, types) = statements
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown statement"))?;
+                let count = u16::from_be_bytes(take(&mut body, 2)?.try_into()?) as usize;
+                let _parameter_formats = take(&mut body, count * 2)?;
+                let count = u16::from_be_bytes(take(&mut body, 2)?.try_into()?) as usize;
+                anyhow::ensure!(count == types.len(), "Bind parameter count mismatch");
+                for _ in 0..count {
+                    let length = i32::from_be_bytes(take(&mut body, 4)?.try_into()?);
+                    anyhow::ensure!(length >= -1, "Invalid parameter length");
+                    if length >= 0 {
+                        take(&mut body, length as usize)?;
+                    }
+                }
+                let count = u16::from_be_bytes(take(&mut body, 2)?.try_into()?) as usize;
+                let mut formats = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let format = i16::from_be_bytes(take(&mut body, 2)?.try_into()?);
+                    anyhow::ensure!(matches!(format, 0 | 1), "Invalid result format");
+                    formats.push(format);
+                }
+                anyhow::ensure!(body.is_empty(), "Trailing Bind data");
+                portals.insert(portal, (sql.clone(), formats));
+                packet(&mut socket, b'2', &[]).await?; // BindComplete
+                continue;
+            }
+            b'E' => {
+                let portal = cstring(&mut body)?;
+                let max_rows = u32::from_be_bytes(take(&mut body, 4)?.try_into()?);
+                anyhow::ensure!(
+                    body.is_empty() && max_rows == 0,
+                    "Fixture expects unlimited Execute"
+                );
+                let (sql, _) = portals
+                    .get(&portal)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown portal"))?;
+                (sql.clone(), false)
+            }
+            b'C' => {
+                let kind = take(&mut body, 1)?[0];
+                let name = cstring(&mut body)?;
+                anyhow::ensure!(body.is_empty(), "Trailing Close data");
+                match kind {
+                    b'S' => {
+                        statements.remove(&name);
+                    }
+                    b'P' => {
+                        portals.remove(&name);
+                    }
+                    _ => anyhow::bail!("Invalid Close kind"),
+                }
+                packet(&mut socket, b'3', &[]).await?; // CloseComplete
+                continue;
+            }
+            b'S' => {
+                anyhow::ensure!(body.is_empty(), "Sync data must be empty");
+                packet(&mut socket, b'Z', b"I").await?;
+                continue;
+            }
+            b'H' => {
+                anyhow::ensure!(body.is_empty(), "Flush data must be empty");
+                continue;
+            }
+            _ => anyhow::bail!("Unexpected protocol tag {tag}"),
+        };
         if sql.contains("sqlshop_drop_transport") {
             return Ok(());
-        } else if sql.contains("sqlshop_slow_query") {
+        }
+        if sql.contains("sqlshop_slow_query") {
             slow_started.notify_one();
             slow_release.notified().await;
-            rows(&mut socket, &["origin"], &[vec![database.clone()]]).await?;
-        } else if sql.contains("FROM pg_database") {
-            let result: Vec<_> = allowed.iter().map(|db| vec![db.clone()]).collect();
-            rows(&mut socket, &["datname"], &result).await?;
-        } else if sql.contains("current_database()") {
-            rows(
-                &mut socket,
-                &["current_database"],
-                &[vec![database.clone()]],
-            )
-            .await?;
-        } else if sql.contains("information_schema.tables") {
-            rows(
-                &mut socket,
-                &["table_schema", "table_name", "table_type"],
-                &[vec![
-                    "public".into(),
-                    format!("{database}_table"),
-                    "BASE TABLE".into(),
-                ]],
-            )
-            .await?;
-        } else {
-            rows(&mut socket, &["connection_test"], &[vec!["1".into()]]).await?;
         }
+        let (columns, result) = result_rows(&sql, &database, &allowed);
+        rows(&mut socket, columns, &result, simple).await?;
     }
     Ok(())
 }
@@ -197,14 +363,31 @@ async fn query_transport_failure_discards_only_its_session_without_retry() -> Re
     let fixture = Fixture::start(&["postgres", "app"]).await?;
     let profile = fixture.profile();
     let tab = uuid::Uuid::new_v4();
-    let target = sqlshop::workspace::QueryTarget {
+    let mut target = sqlshop::workspace::QueryTarget {
         schema: None,
         connection: profile.id,
         database: Some("app".into()),
     };
     let worker = QueryWorker::start(tab, || {});
-    let receive = || worker.receiver.recv_timeout(Duration::from_secs(5));
-    let send = |sql: &str| {
+    // Execution/transaction observations precede the terminal result. They do
+    // not represent a second execution and must not replace the transport check.
+    let receive = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = worker
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?;
+            if !matches!(
+                event,
+                QueryResponse::ExecutionStarted { .. }
+                    | QueryResponse::CancelStatus { .. }
+                    | QueryResponse::TransactionState { .. }
+            ) {
+                return Ok::<_, std::sync::mpsc::RecvTimeoutError>(event);
+            }
+        }
+    };
+    let send = |sql: &str, target: &sqlshop::workspace::QueryTarget| {
         worker.send(QueryRequest::Run {
             profile: profile.clone(),
             credentials: Credentials::default(),
@@ -212,19 +395,35 @@ async fn query_transport_failure_discards_only_its_session_without_retry() -> Re
             sql: sql.into(),
         })
     };
-    send("SELECT 1")?;
-    assert!(
-        matches!(receive()?, QueryResponse::Finished { tab: origin, database: Some(db), .. } if origin == tab && db == "app")
-    );
+    send("SELECT 1", &target)?;
+    match receive()? {
+        QueryResponse::Finished {
+            tab: origin,
+            database: Some(db),
+            schema,
+            ..
+        } => {
+            assert_eq!(origin, tab);
+            assert_eq!(db, "app");
+            assert_eq!(schema.as_deref(), Some("public"));
+            target.schema = schema;
+        }
+        QueryResponse::Error { message, .. } => {
+            panic!("Expected first query completion: {message}")
+        }
+        _ => panic!("Expected first query completion"),
+    }
     let before = fixture.attempts.lock().unwrap().len();
-    send("SELECT sqlshop_drop_transport")?;
+    send("SELECT sqlshop_drop_transport", &target)?;
     assert!(
         matches!(receive()?, QueryResponse::Error { tab: origin, connected: false, database: None, .. } if origin == tab)
     );
     assert_eq!(fixture.attempts.lock().unwrap().len(), before);
     assert!(worker.receiver.try_recv().is_err());
     // Only a new, explicitly submitted operation establishes a fresh session.
-    send("SELECT 1")?;
+    // The disconnected actor has no observed schema; rediscover its default.
+    target.schema = None;
+    send("SELECT 1", &target)?;
     assert!(
         matches!(receive()?, QueryResponse::Finished { tab: origin, database: Some(db), .. } if origin == tab && db == "app")
     );

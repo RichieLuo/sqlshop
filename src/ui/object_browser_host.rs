@@ -224,13 +224,23 @@ impl App {
         let ready = self.target_ready(&target) && !self.session_busy(connection);
         let mut refresh = false;
         let mut draft = false;
+        let mut design = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!(
                 "{} · {}",
                 object.display_name(),
                 object.kind.label()
             ));
-            ui.label(RichText::new("只读定义").small().weak());
+            if let Some(profile) = self.profiles.iter().find(|p| p.id == connection) {
+                design = ui
+                    .add_enabled(
+                        ready
+                            && sql.is_some()
+                            && sqlshop::object_design::supported(profile.engine, object.kind, true),
+                        egui::Button::new("设计 / 保存定义…"),
+                    )
+                    .clicked();
+            }
             refresh = ui
                 .add_enabled(ready, egui::Button::new("刷新定义"))
                 .clicked();
@@ -291,6 +301,15 @@ impl App {
                 });
         } else if error.is_none() {
             ui.label(RichText::new("尚未取得可见定义").weak());
+        }
+        if design && let Some(profile) = self.profiles.iter().find(|p| p.id == connection).cloned()
+        {
+            self.open_object_designer(
+                sqlshop::advanced::AdvancedSource::new(profile, target.clone()),
+                Some(object.clone()),
+                sql.clone(),
+                false,
+            );
         }
         if refresh {
             if let Some(document) = self.tabs[self.active_tab].definition.as_mut() {

@@ -4,6 +4,10 @@ use anyhow::{Result, ensure};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StructureChange {
+    Designer {
+        operation: Box<super::DesignerOperation>,
+        snapshot: super::DesignSnapshot,
+    },
     AddColumn {
         name: String,
         data_type: String,
@@ -196,6 +200,10 @@ pub fn structure_change_sql(
         engine.quote(&table.name)
     );
     Ok(match change {
+        StructureChange::Designer {
+            operation,
+            snapshot,
+        } => super::design_edit::designer_sql(engine, table, operation, snapshot)?,
         StructureChange::AddColumn {
             name,
             data_type,
@@ -352,7 +360,13 @@ pub fn structure_change_sql(
                             matches!(requested, "VARCHAR" | "NVARCHAR" | "CHAR" | "NCHAR"),
                             "字符字段仅支持保持原类型并扩大长度；请使用 SQL"
                         );
-                        ty.push_str(&format!(" COLLATE {}", engine.quote(collation)));
+                        ensure!(
+                            collation
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                            "排序规则名称无效"
+                        );
+                        ty.push_str(&format!(" COLLATE {collation}"));
                     }
                     format!("ALTER TABLE {qualified} ALTER COLUMN {column} {ty} {null_sql}")
                 }
@@ -405,7 +419,7 @@ pub fn structure_change_sql(
 }
 
 impl Session {
-    async fn ensure_column_alter_dependencies_safe(
+    pub(super) async fn ensure_column_alter_dependencies_safe(
         &mut self,
         table: &Table,
         name: &str,
@@ -522,6 +536,13 @@ impl Session {
         let columns = &structure.columns.rows;
         let indexes = &structure.indexes.rows;
         match change {
+            StructureChange::Designer {
+                operation,
+                snapshot,
+            } => {
+                self.validate_designer_operation(table, operation, snapshot, &structure)
+                    .await?;
+            }
             StructureChange::AddColumn { name, .. } => {
                 ensure!(
                     !columns.iter().any(|row| field(row, 1) == name),

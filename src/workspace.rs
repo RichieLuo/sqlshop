@@ -72,6 +72,35 @@ impl Default for WorkspaceLayout {
     }
 }
 
+/// Presentation preferences only: no row values or credentials are persisted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct GridColumnLayout {
+    pub columns: Vec<GridColumnPreference>,
+    pub frozen_through: Option<ColumnIdentity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ColumnIdentity {
+    pub name: String,
+    pub occurrence: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GridColumnPreference {
+    pub identity: ColumnIdentity,
+    pub hidden: bool,
+    pub width: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TableGridLayout {
+    pub connection: Uuid,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+    pub layout: GridColumnLayout,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Workspace {
     pub version: u32,
@@ -83,6 +112,8 @@ pub struct Workspace {
     pub editor_height: Option<f32>,
     #[serde(default)]
     pub layout: Option<WorkspaceLayout>,
+    #[serde(default)]
+    pub table_grid_layouts: Vec<TableGridLayout>,
 }
 
 impl Default for Workspace {
@@ -95,6 +126,7 @@ impl Default for Workspace {
             history: Vec::new(),
             editor_height: None,
             layout: None,
+            table_grid_layouts: Vec::new(),
         }
     }
 }

@@ -415,6 +415,7 @@ impl App {
         };
         let details = TableTreeDetails {
             structure: Ok(TableStructure {
+            constraints: ResultSet::default(),
                 columns: set(&["ordinal", "name", "type", "nullable"], &[&["1", "id", "integer", "false"], &["2", "name", "varchar(100)", "true"], &["3", "department_id", "integer", "true"]]),
                 indexes: set(&["name", "column", "primary", "unique"], &[&["users_pkey", "id", "true", "true"], &["idx_users_name", "name", "false", "false"], &["idx_users_name", "department_id", "false", "false"]]),
                 foreign_keys: set(&["name", "column", "referenced_schema", "referenced_table", "referenced_column"], &[&["fk_users_department", "department_id", "public", "departments", "id"]]),

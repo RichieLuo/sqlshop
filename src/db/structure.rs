@@ -42,11 +42,29 @@ impl Session {
     pub async fn table_structure(&mut self, table: &Table) -> Result<TableStructure> {
         // Also verifies visibility/existence before constructing identifiers.
         self.table_columns(table).await?;
-        match self.profile.engine {
-            Engine::MySql => self.mysql_structure(table).await,
-            Engine::Postgres => self.postgres_structure(table).await,
-            Engine::SqlServer => self.sqlserver_structure(table).await,
-        }
+        let mut structure = match self.profile.engine {
+            Engine::MySql => self.mysql_structure(table).await?,
+            Engine::Postgres => self.postgres_structure(table).await?,
+            Engine::SqlServer => self.sqlserver_structure(table).await?,
+        };
+        let sql = match self.profile.engine {
+            Engine::MySql => {
+                "SELECT CAST(CONSTRAINT_NAME AS CHAR CHARACTER SET utf8mb4), CAST(CONSTRAINT_TYPE AS CHAR) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY CONSTRAINT_NAME"
+            }
+            Engine::Postgres => {
+                "SELECT con.conname::text, CASE con.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'u' THEN 'UNIQUE' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'c' THEN 'CHECK' ELSE con.contype::text END, pg_get_constraintdef(con.oid,true)::text FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2 ORDER BY con.conname"
+            }
+            Engine::SqlServer => {
+                "SELECT o.name, CASE o.type WHEN 'PK' THEN N'PRIMARY KEY' WHEN 'UQ' THEN N'UNIQUE' WHEN 'F' THEN N'FOREIGN KEY' WHEN 'C' THEN N'CHECK' ELSE o.type_desc END, CASE WHEN o.type='C' THEN OBJECT_DEFINITION(o.object_id) END FROM sys.objects o JOIN sys.objects t ON t.object_id=o.parent_object_id JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE s.name=@P1 AND t.name=@P2 AND o.type IN ('PK','UQ','F','C') ORDER BY o.name"
+            }
+        };
+        let labels: &[&str] = if self.profile.engine == Engine::MySql {
+            &["name", "kind"]
+        } else {
+            &["name", "kind", "definition"]
+        };
+        structure.constraints = self.metadata_set(table, sql, labels).await?;
+        Ok(structure)
     }
 
     async fn mysql_structure(&mut self, table: &Table) -> Result<TableStructure> {
@@ -116,6 +134,7 @@ impl Session {
             .context("SHOW CREATE 未返回定义")?
             .clone();
         Ok(TableStructure {
+            constraints: ResultSet::default(),
             columns,
             indexes,
             foreign_keys,
@@ -220,6 +239,7 @@ impl Session {
             }
         }
         Ok(TableStructure {
+            constraints: ResultSet::default(),
             columns,
             indexes,
             foreign_keys,
@@ -283,6 +303,7 @@ impl Session {
                     .context("无权读取视图定义，或视图已加密")?,
             );
             return Ok(TableStructure {
+                constraints: ResultSet::default(),
                 columns,
                 indexes,
                 foreign_keys,
@@ -453,6 +474,7 @@ impl Session {
             }
         }
         Ok(TableStructure {
+            constraints: ResultSet::default(),
             columns,
             indexes,
             foreign_keys,

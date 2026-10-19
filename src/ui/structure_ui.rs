@@ -1,4 +1,6 @@
 use super::*;
+#[path = "structure_advanced_ui.rs"]
+mod advanced;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(super) enum DesignSection {
@@ -6,6 +8,7 @@ pub(super) enum DesignSection {
     Fields,
     Indexes,
     ForeignKeys,
+    Constraints,
     Relations,
     Ddl,
 }
@@ -17,6 +20,7 @@ pub(super) struct DesignDraft {
     data_type: String,
     size: String,
     selected_column: String,
+    index_columns: Vec<String>,
     selected_index: String,
     nullable: bool,
     original_column: Vec<Option<String>>,
@@ -38,10 +42,12 @@ pub(super) struct DesignDocument {
     pub status: String,
     pub section: DesignSection,
     draft: DesignDraft,
+    advanced: advanced::AdvancedDraft,
     editor_open: bool,
     selected_field: Option<String>,
     selected_index: Option<String>,
     selected_foreign_key: Option<String>,
+    selected_constraint: Option<String>,
     find: String,
     pending: Option<PendingChange>,
 }
@@ -55,10 +61,12 @@ impl Default for DesignDocument {
             status: "尚未读取表结构".into(),
             section: DesignSection::Fields,
             draft: DesignDraft::default(),
+            advanced: advanced::AdvancedDraft::default(),
             editor_open: false,
             selected_field: None,
             selected_index: None,
             selected_foreign_key: None,
+            selected_constraint: None,
             find: String::new(),
             pending: None,
         }
@@ -79,6 +87,9 @@ impl DesignDocument {
 
 impl DesignDocument {
     pub(super) fn dirty(&self) -> bool {
+        if self.advanced.open {
+            return true;
+        }
         if self.draft.action == 4 {
             return self.pending.is_some()
                 || (self.editor_open
@@ -98,7 +109,8 @@ impl DesignDocument {
                     || !self.draft.data_type.is_empty()
                     || !self.draft.size.is_empty()
                     || !self.draft.selected_column.is_empty()
-                    || !self.draft.selected_index.is_empty()))
+                    || !self.draft.selected_index.is_empty()
+                    || !self.draft.index_columns.is_empty()))
     }
 
     pub(super) fn received(&mut self, structure: TableStructure, changed: bool) {
@@ -138,6 +150,7 @@ impl DesignDocument {
 
     fn reset_draft(&mut self) {
         self.draft = DesignDraft::default();
+        self.advanced = advanced::AdvancedDraft::default();
         self.editor_open = false;
         self.pending = None;
     }
@@ -241,6 +254,7 @@ impl DesignDocument {
         })
         .collect();
         let structure = TableStructure {
+            constraints: ResultSet::default(),
             columns: ResultSet {
                 columns: [
                     "ordinal",
@@ -348,6 +362,9 @@ impl DesignDocument {
                     sql,
                 });
             }
+        }
+        if mode == "structure-advanced" {
+            doc.advanced = advanced::AdvancedDraft::example(table);
         }
         doc
     }
@@ -532,6 +549,7 @@ impl App {
                     (DesignSection::Fields, "字段", doc.structure.as_ref().map_or(0, |s| s.columns.rows.len())),
                     (DesignSection::Indexes, "索引", doc.structure.as_ref().map_or(0, |s| s.indexes.rows.len())),
                     (DesignSection::ForeignKeys, "外键", doc.structure.as_ref().map_or(0, |s| s.foreign_keys.rows.len())),
+                    (DesignSection::Constraints, "约束", doc.structure.as_ref().map_or(0, |s| s.constraints.rows.len())),
                     (DesignSection::Relations, "关系图", 0),
                     (DesignSection::Ddl, "DDL", 0),
                 ] {
@@ -555,6 +573,10 @@ impl App {
             else if doc.stale && !busy { ui.label(RichText::new("当前结构需要重新读取，设计输入保留。").weak()); }
             if doc.structure.is_some() && doc.pending.is_none() {
                 ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(editable && !doc.dirty(), egui::Button::new("字段与约束设计…")).clicked() {
+                        doc.advanced.open = true;
+                        doc.editor_open = false;
+                    }
                     let actions: &[(usize, &str)] = match doc.section {
                         DesignSection::Fields => &[(0, "＋ 新增字段"), (4, "编辑字段"), (1, "− 删除字段")],
                         DesignSection::Indexes => &[(2, "＋ 新增索引"), (3, "− 删除索引")],
@@ -585,6 +607,11 @@ impl App {
                         if ui.add_enabled(!busy, egui::Button::new("返回编辑")).clicked() { doc.pending = None; }
                     });
                 });
+            } else if doc.advanced.open {
+                if let (Some(structure), Some(engine)) = (&doc.structure, engine)
+                    && let Some((change, sql)) = advanced::show(ui, &mut doc.advanced, structure, engine, &table, editable) {
+                    doc.pending = Some(PendingChange {target: target.clone(), table: table.clone(), change, sql});
+                }
             } else if doc.editor_open {
                 let structure = doc.structure.as_ref().unwrap();
                 let column_names = structure.columns.columns.iter().position(|name| name == "name").map(|i| structure.columns.rows.iter().filter_map(|row| row.get(i).and_then(Option::as_deref)).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
@@ -622,7 +649,8 @@ impl App {
                                 1 => { ui.label(&draft.selected_column); }
                                 2 => {
                                     ui.label("索引名"); ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(160.0));
-                                    egui::ComboBox::from_id_salt("index-column").selected_text(if draft.selected_column.is_empty() { "选择字段" } else { &draft.selected_column }).show_ui(ui, |ui| { for name in &column_names { ui.selectable_value(&mut draft.selected_column, name.clone(), name); } });
+                                    ui.menu_button("选择索引字段", |ui| { for name in &column_names { let mut selected = draft.index_columns.contains(name); if ui.checkbox(&mut selected, name).changed() { if selected { draft.index_columns.push(name.clone()); } else { draft.index_columns.retain(|column| column != name); } } } });
+                                    ui.label(format!("顺序：{}", draft.index_columns.join(", ")));
                                 }
                                 _ => { ui.label(&draft.selected_index); }
                             }
@@ -631,13 +659,13 @@ impl App {
                     let change = match draft.action {
                         0 => Some(StructureChange::AddColumn { name: draft.name.clone(), data_type: draft.data_type.clone(), size: draft.size.clone() }),
                         1 if column_names.contains(&draft.selected_column) => Some(StructureChange::DropColumn { name: draft.selected_column.clone() }),
-                        2 if column_names.contains(&draft.selected_column) => Some(StructureChange::CreateIndex { name: draft.name.clone(), columns: vec![draft.selected_column.clone()] }),
+                        2 if !draft.index_columns.is_empty() && draft.index_columns.iter().all(|column| column_names.contains(column)) => Some(StructureChange::CreateIndex { name: draft.name.clone(), columns: draft.index_columns.clone() }),
                         3 if index_names.contains(&draft.selected_index) => Some(StructureChange::DropIndex { name: draft.selected_index.clone() }),
                         4 if column_names.contains(&draft.name) => Some(StructureChange::AlterColumn { name: draft.name.clone(), data_type: draft.data_type.clone(), size: draft.size.clone(), nullable: draft.nullable, original_column: draft.original_column.clone() }),
                         _ => None,
                     };
                     let result = engine.zip(change).map(|(engine, change)| structure_change_sql(engine, &table, &change).map(|sql| PendingChange { target: target.clone(), table: table.clone(), change, sql }));
-                    if draft.action == 4 && let Some(Err(error)) = &result { ui.label(RichText::new(error.to_string()).small().weak()); }
+                    if let Some(Err(error)) = &result { ui.label(RichText::new(error.to_string()).small().weak()); }
                     let editing_existing = draft.action == 4;
                     let changed = draft.baseline.as_ref().is_some_and(|(data_type, size, nullable)| data_type != &draft.data_type || size != &draft.size || nullable != &draft.nullable);
                     let preview = result.and_then(Result::ok).filter(|_| !editing_existing || changed);
@@ -645,7 +673,7 @@ impl App {
                         if (ui.add_enabled(editable && preview.is_some(), egui::Button::new("预览修改 SQL")).on_hover_text("⌘ / Ctrl + S：生成 SQL 预览，确认后执行").clicked() || save_shortcut) && preview.is_some() { doc.pending = preview; }
                         if ui.add_enabled(!busy, egui::Button::new("取消编辑")).clicked() { doc.reset_draft(); }
                     });
-                    ui.label(RichText::new(if editing_existing { "支持普通字段的安全扩大及可空设置；依赖、生成列和复杂属性按能力限制，原默认值不会静默删除。" } else { "当前支持可空无默认值的新字段、单字段普通索引；完整改列及约束编辑待补。" }).small().weak());
+                    ui.label(RichText::new(if editing_existing { "支持普通字段的安全扩大及可空设置；依赖、生成列和复杂属性按能力限制，原默认值不会静默删除。" } else { "此处支持基础字段及复合普通索引；改名、默认值、类型转换及约束请使用“字段与约束设计”。" }).small().weak());
                 });
             }
             ui.separator();
@@ -658,6 +686,7 @@ impl App {
                     }
                     DesignSection::Indexes => { metadata_grid(ui, id, doc.section, &structure.indexes, &mut doc.selected_index, &doc.find); }
                     DesignSection::ForeignKeys => { metadata_grid(ui, id, doc.section, &structure.foreign_keys, &mut doc.selected_foreign_key, &doc.find); }
+                    DesignSection::Constraints => { metadata_grid(ui, id, doc.section, &structure.constraints, &mut doc.selected_constraint, &doc.find); }
                     DesignSection::Relations => { super::compare_ui::show_er(ui, &table, structure); }
                     DesignSection::Ddl => { egui::ScrollArea::both().id_salt("design-ddl").auto_shrink([false, false]).show(ui, |ui| { ui.add(egui::Label::new(RichText::new(&structure.ddl).monospace()).selectable(true)); }); }
                 }

@@ -62,38 +62,65 @@ impl App {
     }
 }
 
+pub(super) struct DraftColumnLayout<'a> {
+    pub visible_columns: &'a [usize],
+    pub frozen_count: usize,
+    pub horizontal_offset: f32,
+    pub frozen_boundary: f32,
+    pub viewport_rect: egui::Rect,
+}
+
 pub(super) fn render_draft_row(
     row: &mut egui_extras::TableRow<'_, '_>,
     draft: &mut InsertDraft,
     columns: &[sqlshop::model::TableColumn],
+    layout: DraftColumnLayout<'_>,
     enabled: bool,
     selected: &mut Option<Uuid>,
     focus: &mut Option<Uuid>,
 ) -> bool {
+    let DraftColumnLayout {
+        visible_columns,
+        frozen_count,
+        horizontal_offset,
+        frozen_boundary,
+        viewport_rect,
+    } = layout;
     let mut remove = false;
     row.set_selected(*selected == Some(draft.id));
     row.col(|ui| {
-        let response = grid_cell(ui, RichText::new("＋").color(accent(ui)), false, false);
-        if response.clicked() {
-            *selected = Some(draft.id);
-        }
-        response
-            .on_hover_text("新增草稿，尚未写入数据库；填写后提交全部，或撤销暂存")
-            .context_menu(|ui| {
-                if ui
-                    .add_enabled(enabled, egui::Button::new("移除此新增行"))
-                    .clicked()
-                {
-                    remove = true;
-                    ui.close();
+        grid_columns_ui::cell(
+            ui,
+            frozen_count > 0,
+            horizontal_offset,
+            frozen_boundary,
+            viewport_rect,
+            |ui| {
+                let response = grid_cell(ui, RichText::new("＋").color(accent(ui)), false, false);
+                if response.clicked() {
+                    *selected = Some(draft.id);
                 }
-            });
+                response
+                    .on_hover_text("新增草稿，尚未写入数据库；填写后提交全部，或撤销暂存")
+                    .context_menu(|ui| {
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("移除此新增行"))
+                            .clicked()
+                        {
+                            remove = true;
+                            ui.close();
+                        }
+                    });
+            },
+        )
     });
-    let first_editable = columns
-        .iter()
-        .position(|column| column.editable && column.kind != sqlshop::model::CellKind::Unsupported);
-    for (index, (column, value)) in columns.iter().zip(&mut draft.values).enumerate() {
-        row.col(|ui| {
+    let first_editable = visible_columns.iter().copied().find(|&index| {
+        columns[index].editable && columns[index].kind != sqlshop::model::CellKind::Unsupported
+    });
+    for (display_index, &index) in visible_columns.iter().enumerate() {
+        let column = &columns[index];
+        let value = &mut draft.values[index];
+        row.col(|ui| grid_columns_ui::cell(ui, display_index < frozen_count, horizontal_offset, frozen_boundary, viewport_rect, |ui| {
             if !column.editable || column.kind == sqlshop::model::CellKind::Unsupported {
                 grid_cell(ui, RichText::new("默认值").italics().weak(), false, false)
                     .on_hover_text("自增、生成或不支持编辑的列，由数据库处理默认值");
@@ -129,7 +156,7 @@ pub(super) fn render_draft_row(
                     });
                 });
             grid_cell_border(ui, rect);
-        });
+        }));
     }
     // A table containing only generated columns still accepts DEFAULT VALUES.
     if *focus == Some(draft.id) && first_editable.is_none() {

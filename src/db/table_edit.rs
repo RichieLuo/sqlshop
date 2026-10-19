@@ -76,6 +76,16 @@ impl Session {
         parameters: &[&str],
         columns: Option<&[TableColumn]>,
     ) -> Result<QueryOutput> {
+        if self
+            .table_read_interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err(EditRejected(
+                "表读取已停止，后续请求未发送；保留上次数据，请刷新后继续编辑".into(),
+            )
+            .into());
+        }
         let start = Instant::now();
         let rows = match &mut self.driver {
             Driver::MySql(connection) => {

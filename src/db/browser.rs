@@ -70,6 +70,7 @@ impl TablePage {
 }
 #[derive(Clone, Debug)]
 pub struct TableStructure {
+    pub constraints: ResultSet,
     pub columns: ResultSet,
     pub indexes: ResultSet,
     pub foreign_keys: ResultSet,

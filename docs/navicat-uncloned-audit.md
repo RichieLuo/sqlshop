@@ -1,5 +1,43 @@
 # 原功能缺口：随包帮助与本轮实现边界审阅
 
+## 2026-10-19 REA 复核：实施前核心缺口
+
+后续实施：用户排除第5、6项后，其余五组已按本批范围落地，支持范围和联测记录见[授权实施计划](sqlshop-rebuild-plan.md#2026-10-19-授权实施计划)。以下保留实施前的审计快照，不代表实施后的缺口列表。
+
+核对工作区提交 `c4ae776` 的源码及本机 Navicat Premium Lite 17.3.11。此次只做静态审计，没有启动原应用、连接数据库或验证真实读写；下列“缺失”指专用入口和实现范围，不把手写 SQL 算作设计器，也不把未联测算作未实现。
+
+### 本轮证据与覆盖
+
+- **R19**：REA `decode_interface_builder`，Evidence `ev_4f8e9e6903efeab0146b2087c211b3ed5047b021ba67fef64a4e69c2e931e4e4`。定向解析 9 个 NIB，2323 个图节点、1013 条边；所选归档的对象、连接和层级覆盖完整，`truncated=false`。这不代表整个应用覆盖完整。
+- 原通用 Mach-O 被当前 Ghidra 后端拒绝；ARM64 方法搜索触发全量自动分析后主动终止，没有产生可用于结论的新反编译证据。随后在临时派生包中放入既有 ARM64 切片和原包逐字节复制的 9 个资源，仅用于 REA 静态归档解码，未运行派生包。
+- ARM64 切片 SHA-256 为 `f200508a133605213e0b7bc0bec9dd670f48d495f79c5994a1da9ac2ef5e359d`。资源原始路径与 SHA-256 保存在 `/Users/richie/.local/share/rea/navicat-handoff/navicat-gap-audit-20261019-derivation.json`；完整 REA 记录保存在同目录 `navicat-gap-audit-20261019-evidence.json`。
+- **H19**：重新读取原包中文帮助中的 `query_editor.html`、`data_rdbms.html`、`mysql_table.html`、`postgresql_table.html`、`con_ssl_settings.html`、`import_wizard.html`、`export_wizard.html`、`query_builder.html`。帮助描述与 R19 控件连接均不证明 Lite 运行时已启用全部选项；本次没有确认原程序内部保存算法。
+
+### 高频缺口（建议实施顺序）
+
+| 顺序 | 核心功能 | 当前实现与尚缺范围 | 证据与源码边界 |
+| --- | --- | --- | --- |
+| 1 | 完整字段、约束与索引设计 | 已有增列、有限改列及普通索引；缺已有字段改名、默认值编辑、通用类型变更、主键/唯一/CHECK/外键的完整新增修改删除，以及生成列等属性。外键页目前是元数据显示，不能称外键设计已完成。 | R19：MySQL `_defaultValueComboBox`、`_expressionComboTextField`、自增等控件；PG 默认值、identity、序列属性；外键延迟选项与 CHECK/索引表格。`src/db/structure_edit.rs:6` 的变更枚举只有 AddColumn/AlterColumn/DropColumn/CreateIndex/DropIndex；`:299` 限制改列范围；`src/ui/structure_ui.rs:660` 外键页只显示元数据。 |
+| 2 | SQL 编辑器的日常编码能力 | 已有高亮、查找替换和关键词/表列前缀候选；缺 SQL 美化/简化、schema/别名上下文补全和代码折叠。前缀候选不等于语义补全。 | H19 `query_editor.html` 描述格式化、点号范围候选、代码折叠。`src/sql_editor.rs:630` 仅接收 prefix/columns/tables 并做 starts_with；本轮搜索 `src/` 未发现专用格式化实现。原算法和完整 Lite 启用范围未知。 |
+| 3 | 数据网格列管理 | 已有拖宽；缺列显隐/列选择、冻结/解冻、单列及全列适宽和对应设置管理。对象浏览列表已有列显隐，不能用来代替数据网格的实现。 | R19 `TableViewViewController.nib` 存在 `_columnSelectionTableView`、`ibHideColumn:`、`ibFreezeColumn:`、`ibUnfreezeAllColumns:`、`ibSizeColumnToFit:`、`ibSizeAllColumnsToFit:`。对照 `src/ui.rs` 数据网格及 `src/ui/grid_browse_ui.rs`；现有 `hidden_columns` 位于 `src/ui/object_browser_ui.rs`。连接事实不证明这些动作运行时启用。 |
+| 4 | Schema 与非表对象的创建、编辑、保存 | 已有对象目录、只读定义及转查询草稿；缺专用 schema 创建/删除/属性管理，以及视图、函数、过程、触发器等完整设计保存流程。 | R19 MySQL 视图模块有 definer、SQL SECURITY、算法与 CHECK OPTION 控件；过程等范围沿用此前帮助证据，未新增其代码调查。`src/ui/object_browser_host.rs:233` 明确只读；`src/db/object_catalog.rs` 读取定义；本轮 `src/` 未找到 CREATE/DROP SCHEMA 管理链。 |
+| 5 | 多格式导入导出与可复用向导配置 | 已有 CSV 映射/预览/导入和 CSV 导出；缺 TXT/XML/JSON 等格式及 SQL 数据脚本导出、可复用的导入导出配置。查询结果 CSV 仍限已收集的前 1000 行，完整表 CSV 是另一条路径。 | H19 明确写出 Lite 可导入 TXT/CSV/XML/JSON，可导出 TXT/CSV/HTML/XML/SQL/JSON。`src/ui.rs:4605` 导入文件过滤仅 CSV；数据输出走 `export_csv`/`export_csv_rows`。这里只要求原帮助列出的文本格式，不把 Excel 等高版本格式列为 Lite 核心缺口。 |
+| 6 | 连接证书配置 | 已有 TLS 开关及信任服务器证书选项；缺连接级自定义 CA、客户端证书与私钥配置。 | H19 `con_ssl_settings.html` 描述 CA/客户端证书等引擎相关选项；`src/model.rs:71` 和 `src/db/mod.rs:261` 等连接分支当前没有相应配置链。具体应按引擎分别实现，不能复制一套选项到所有数据库。 |
+| 7 | 表加载的真正停止 | SQL 查询标签已有真实协议取消，不再属于“完全未复刻”；表分页读取/末页统计尚未接到取消通道。 | R19 表查看器有 `_stopButton` → `ibStop:` 连接；`src/worker.rs:425`、`:433` 的分页请求与 `:1085` 的查询取消路径分开。原表停止的内部协议及运行效果仍未知。 |
+
+### 已有基础、仍不完整的扩展范围
+
+- 比较同步：每侧完整范围上限 1000 行；同引擎 UPDATE+INSERT，保留目标独有行。缺大表/全库迁移、删除同步、跨引擎自动类型映射与复杂约束部署，见 `src/compare.rs:9`、`:434`、`:917`。
+- 备份/调度/模型：已有官方工具备份恢复、应用开启时 SQL 计划与只读外键关系图；仍缺日志链/PITR、应用关闭后的系统调度、完整模型正反向工程。可视化查询创建器、模型和多项自动化在原帮助标为更高版本功能，不作为已确认 Lite 核心阻塞。
+- 执行计划与权限：已有真实基础后端；仍缺完整计划图形、节点筛选/图像导出，以及高级账号属性、DENY/GRANT OPTION 和 DROP LOGIN。不能再笼统列成“执行计划/权限管理未实现”。
+- SQLite/Oracle：已有独立连接/文件、SQL 与定义文档，尚未与主工作区完整网格、树及设计器统一；不再列成“引擎完全缺失”。
+
+建议优先补字段/约束设计 → SQL 编辑器 → 网格列管理 → 对象设计 → 多格式导入导出。证书配置和表加载停止可按实际使用需求前移。每一项原行为只核对到静态证据；查询取消、断线恢复、权限变更、备份与同步等已实现路径仍需单独实库验收。
+
+H19 新增帮助文件 SHA-256：`import_wizard.html` 为 `5fffc6c9c4a1612f77c29e70962bb10d363e071ddb995c371fbf7dbd2dd0137d`；`export_wizard.html` 为 `8e30786c5b1db3a053de9c04eabcc1e06d5dbc56a40112293f09a214d47a7eac`；`query_builder.html` 为 `9ca2329971d8837aa971b114b278cef6786e2b21d69d8a4f34fd22ee6c595849`。其他沿用下文指纹。
+
+---
+
 更新：2026-10-14。
 
 本次直接读取 `/Applications/Navicat Premium Lite.app/Contents/Resources/zh-Hans.lproj/Navicat Help/` 的中文帮助，结合 SQLShop 源码静态审阅。没有登录原软件，没有重新运行 Ghidra，没有数据库测试或真实账号变更。既有 REA / bounded Ghidra 证据仍以 [二进制发现](navicat-binary-findings.md) 与 [交接文档](navicat-rebuild-handoff.md) 为准；本文件的帮助摘要不充当新的 REA evidence ID。
