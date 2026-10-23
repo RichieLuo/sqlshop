@@ -690,7 +690,7 @@ impl App {
                     DesignSection::Relations => { super::compare_ui::show_er(ui, &table, structure); }
                     DesignSection::Ddl => { egui::ScrollArea::both().id_salt("design-ddl").auto_shrink([false, false]).show(ui, |ui| { ui.add(egui::Label::new(RichText::new(&structure.ddl).monospace()).selectable(true)); }); }
                 }
-            } else { ui.label(if busy { "正在读取表结构…" } else { "暂无表结构，连接对应数据库后点击刷新结构。" }); }
+            } else { ui.label(if busy { "正在读取表结构…" } else { "尚未读取表结构" }); }
         });
         if refresh {
             self.load_structure(index);

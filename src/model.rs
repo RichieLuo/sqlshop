@@ -87,7 +87,7 @@ impl Default for Profile {
             sqlserver_auth: SqlServerAuth::Password,
             sqlserver_instance: String::new(),
             database: String::new(),
-            tls: true,
+            tls: false,
             trust_certificate: false,
             remember_password: true,
             ssh: SshConfig::default(),

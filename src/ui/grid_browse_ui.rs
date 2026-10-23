@@ -108,9 +108,7 @@ pub(super) fn cell_filter_controls(
                     ui.close();
                 }
             }
-            ui.separator();
-            ui.label("添加到筛选条件，点击“应用”后读取数据库。");
-        });
+        }).response.on_hover_text("添加筛选条件，应用后重新读取数据");
     });
     action
 }

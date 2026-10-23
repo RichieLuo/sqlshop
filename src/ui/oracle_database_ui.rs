@@ -193,7 +193,6 @@ impl OracleDocument {
         ui.spacing_mut().button_padding.y = 4.0;
         ui.horizontal_wrapped(|ui| {
             ui.strong("Oracle");
-            ui.weak("服务 / TNS · 用户名密码 · 独立持久会话");
             if self.busy {
                 ui.spinner();
             }
@@ -220,7 +219,9 @@ impl OracleDocument {
                         ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
                         ui.end_row();
                     });
-                connect = ui.button("连接 Oracle").clicked();
+                connect = ui.button("连接 Oracle")
+                    .on_hover_text("需要本机安装架构匹配的 Oracle Instant Client。")
+                    .clicked();
             });
         }
         if connect {
@@ -232,9 +233,6 @@ impl OracleDocument {
             if self.busy {
                 self.password.clear();
             }
-        }
-        if !self.connected {
-            ui.weak("Oracle 连接需要本机已安装且架构相符的 Oracle Instant Client。连接时驱动动态加载；缺少依赖会显示实际错误。");
         }
         let mut operation = None;
         ui.horizontal_wrapped(|ui| {
@@ -327,10 +325,10 @@ impl OracleDocument {
             });
         }
         if self.catalog_stale {
-            ui.weak("显示的目录尚未刷新，或来自上次会话；请刷新后操作。");
+            ui.weak("目录未刷新或已过期。");
         }
         if self.objects_truncated {
-            ui.weak("对象超过 2000 个，当前显示前 2000 个。");
+            ui.weak("目录已截断，仅显示前 2000 项。");
         }
         let filter = self.filter.to_lowercase();
         let mut selected = None;
@@ -438,8 +436,8 @@ impl OracleDocument {
                     self.connected && !self.busy,
                     egui::Button::new("执行当前内容"),
                 )
+                .on_hover_text("执行一条 SQL 或完整 PL/SQL；普通 SQL 不带结尾分号，不拆分脚本。")
                 .clicked();
-            ui.weak("一条 SQL 或完整 PL/SQL。普通 SQL 不带结尾分号；不拆分脚本。");
         });
         if open
             && let Some(path) = rfd::FileDialog::new()
@@ -493,7 +491,7 @@ impl OracleDocument {
         }
         if let Some(pending) = self.pending_sql.clone() {
             ui.label(
-                "该语句可能修改数据或结构。Oracle DDL 会隐式提交已有事务；请核对下面这条原始语句。",
+                "将执行以下写入或结构变更；Oracle DDL 会隐式提交已有事务。",
             );
             egui::CollapsingHeader::new("待执行原文")
                 .default_open(true)
@@ -540,7 +538,8 @@ impl OracleDocument {
             ui.label(format!("服务器报告行数：{affected}"));
         }
         if set.truncated {
-            ui.weak("结果为有限预览：最多 1000 行、16 MiB；二进制 / LOB 单格最多 8 KiB，特殊类型明确标注。");
+            ui.weak("结果已截断。")
+                .on_hover_text("最多 1000 行、16 MiB；二进制 / LOB 单格最多 8 KiB。");
         }
         if set.columns.is_empty() {
             return;
@@ -584,7 +583,7 @@ impl OracleDocument {
     }
     fn definition(&mut self, ui: &mut egui::Ui) {
         let Some((object, text, truncated)) = &self.definition else {
-            ui.label("在对象页选择对象，再点击“读取定义”。");
+            ui.label("暂无对象定义。");
             return;
         };
         ui.horizontal_wrapped(|ui| {
@@ -597,7 +596,7 @@ impl OracleDocument {
             }
         });
         if *truncated {
-            ui.weak("DDL 超过 16 MiB，显示内容已截断，不能作为完整恢复脚本使用。");
+            ui.weak("DDL 已截断（超过 16 MiB），不可用于完整恢复。");
         }
         egui::ScrollArea::both()
             .id_salt("oracle-definition")

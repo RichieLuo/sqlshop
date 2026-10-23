@@ -1,6 +1,77 @@
 use eframe::egui::{self, Color32};
 use sqlshop::model::Engine;
 
+pub(super) fn paint_redis_connection(ui: &egui::Ui, rect: egui::Rect, connected: bool) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let scale = rect.width() / 24.0;
+    let point = |x: f32, y: f32| rect.min + egui::vec2(x, y) * scale;
+    let painter = ui.painter();
+    let red = if ui.visuals().dark_mode {
+        Color32::from_rgb(239, 92, 83)
+    } else {
+        Color32::from_rgb(190, 42, 36)
+    };
+    let edge = if ui.visuals().dark_mode {
+        Color32::from_rgb(165, 47, 44)
+    } else {
+        Color32::from_rgb(143, 30, 27)
+    };
+    // Three stacked red lozenges distinguish Redis without changing its connection name.
+    for y in [14.0, 9.0, 4.0] {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                point(2.0, y + 3.0),
+                point(12.0, y - 0.5),
+                point(22.0, y + 3.0),
+                point(22.0, y + 5.0),
+                point(12.0, y + 8.5),
+                point(2.0, y + 5.0),
+            ],
+            edge,
+            egui::Stroke::NONE,
+        ));
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                point(2.0, y + 3.0),
+                point(12.0, y - 0.5),
+                point(22.0, y + 3.0),
+                point(12.0, y + 6.5),
+            ],
+            red,
+            egui::Stroke::NONE,
+        ));
+    }
+    let mark = Color32::from_rgb(255, 237, 225);
+    painter.line_segment(
+        [point(7.0, 7.0), point(11.0, 8.0)],
+        egui::Stroke::new(1.5 * scale, mark),
+    );
+    painter.circle_filled(point(14.0, 6.5), 1.0 * scale, mark);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            point(14.0, 8.5),
+            point(17.0, 7.5),
+            point(19.0, 8.5),
+            point(16.0, 9.5),
+        ],
+        mark,
+        egui::Stroke::NONE,
+    ));
+    let center = rect.right_bottom() - egui::vec2(0.5, 0.5);
+    painter.circle_filled(center, 3.5, super::surface(ui));
+    if connected {
+        painter.circle_filled(center, 2.5, super::accent(ui));
+    } else {
+        painter.circle_stroke(
+            center,
+            2.0,
+            egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+        );
+    }
+}
+
 pub(super) fn paint_connection(ui: &egui::Ui, rect: egui::Rect, engine: Engine, connected: bool) {
     if !ui.is_rect_visible(rect) {
         return;

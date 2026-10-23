@@ -1,4 +1,7 @@
-use crate::model::{Credentials, Profile};
+use crate::{
+    model::{Credentials, Profile},
+    redis_database::RedisProfile,
+};
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, Generate, KeyInit, Payload},
@@ -44,6 +47,69 @@ impl Store {
     pub fn save(&self, profiles: &[Profile]) -> Result<()> {
         self.atomic_write("connections.json", &serde_json::to_vec_pretty(profiles)?)
             .context("保存连接配置失败")
+    }
+
+    pub fn load_redis(&self) -> Result<Vec<RedisProfile>> {
+        let data = match fs::read(self.directory.join("redis-connections.json")) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("读取 Redis 连接配置失败"),
+        };
+        serde_json::from_slice(&data).context("Redis 连接配置损坏，请检查 redis-connections.json")
+    }
+
+    pub fn save_redis(&self, profiles: &[RedisProfile]) -> Result<()> {
+        self.atomic_write(
+            "redis-connections.json",
+            &serde_json::to_vec_pretty(profiles)?,
+        )
+        .context("保存 Redis 连接配置失败")
+    }
+
+    pub fn redis_credentials(&self, profile: &RedisProfile) -> Result<Option<Credentials>> {
+        Ok(self
+            .read_credentials()?
+            .remove(&profile.id)
+            .map(|saved| Credentials {
+                database_password: if profile.remember_password {
+                    saved.database_password
+                } else {
+                    String::new()
+                },
+                ssh_secret: if profile.ssh.enabled && profile.ssh.remember_secret {
+                    saved.ssh_secret
+                } else {
+                    String::new()
+                },
+            }))
+    }
+
+    pub fn save_redis_credentials(
+        &self,
+        profile: &RedisProfile,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        let mut saved = self.read_credentials()?;
+        if profile.remember_password || (profile.ssh.enabled && profile.ssh.remember_secret) {
+            saved.insert(
+                profile.id,
+                SavedCredentials {
+                    database_password: if profile.remember_password {
+                        credentials.database_password.clone()
+                    } else {
+                        String::new()
+                    },
+                    ssh_secret: if profile.ssh.enabled && profile.ssh.remember_secret {
+                        credentials.ssh_secret.clone()
+                    } else {
+                        String::new()
+                    },
+                },
+            );
+        } else if saved.remove(&profile.id).is_none() {
+            return Ok(());
+        }
+        self.write_credentials(&saved)
     }
 
     pub fn credentials(&self, profile: &Profile) -> Result<Option<Credentials>> {

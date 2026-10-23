@@ -135,6 +135,7 @@ impl QueryTab {
                 .oracle
                 .as_ref()
                 .is_some_and(|doc| doc.is_dirty() || doc.may_have_transaction())
+            || self.redis.as_ref().is_some_and(|doc| doc.is_dirty())
             || self.jobs.as_ref().is_some_and(|doc| doc.dirty())
             || self
                 .advanced
@@ -656,7 +657,7 @@ impl App {
             }
             if ui
                 .button("查询历史")
-                .on_hover_text("历史保存在本机，恢复到编辑器时不会执行 SQL")
+                .on_hover_text("历史 SQL 以明文保存在本机，可能含敏感信息；恢复到编辑器不执行")
                 .clicked()
             {
                 self.history_open = true;
@@ -1309,14 +1310,8 @@ impl App {
                 .id_salt(("table-draft-details", tab.id))
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.label(
-                        "网格显示暂存值（●）和新增行（＋）；复制和导出使用上次读取的数据库快照。",
-                    );
                     if !tab.insert_drafts.is_empty() {
-                        ui.label(format!(
-                            "新增 {} 行待提交；默认值由数据库处理，右键可选择 NULL 或空字符串。",
-                            tab.insert_drafts.len()
-                        ));
+                        ui.label(format!("新增 {} 行待提交", tab.insert_drafts.len()));
                     }
                     egui::ScrollArea::vertical()
                         .max_height(110.0)
@@ -1343,7 +1338,7 @@ impl App {
                         });
                 })
                 .header_response
-                .on_hover_text("仅保存于本标签的本地草稿；在表格上方提交全部或撤销暂存");
+                .on_hover_text("● 暂存值 · ＋ 新增行；复制和导出使用上次读取的数据库快照，提交后才写入数据库");
         }
         if reload {
             self.load_table(self.active_tab);
@@ -1486,7 +1481,7 @@ impl App {
                             .map(|schema| format!("  ·  Schema：{schema}"))
                             .unwrap_or_default()
                     ));
-                    ui.label("此 SQL 可能修改数据或结构；原始 SQL 仍受数据库账号权限约束，批量语句中先前语句可能已提交。请核对目标与内容。");
+                    ui.label("此 SQL 可能修改数据或结构；批量语句中先前语句可能已提交。");
                     let max_height = (ctx.available_rect().height() * 0.5).clamp(80.0, 400.0);
                     egui::ScrollArea::both()
                         .max_height(max_height)
@@ -1508,9 +1503,14 @@ impl App {
         if let Some(action) = self.confirm_tab_action {
             let mut discard = false;
             let mut cancel = false;
-            dialog_window("关闭 SQL 标签？", ctx).show(ctx, |ui| {
-                    ui.label("关闭将移除这些标签的草稿，并结束对应独立会话；未保存的 SQL 编辑会丢弃，未提交事务可能回滚。");
-                    ui.label("需要保留时，请取消并保存文件或执行 COMMIT / ROLLBACK。");
+            dialog_window("关闭文档标签？", ctx).show(ctx, |ui| {
+                    let names = self.tabs.iter().enumerate().filter(|(index, _)| match action {
+                        TabAction::Close(i) => *index == i,
+                        TabAction::CloseOthers(i) => *index != i,
+                        TabAction::CloseRight(i) => *index > i,
+                        _ => false,
+                    }).map(|(_, tab)| tab.name.as_str()).collect::<Vec<_>>().join("、");
+                    ui.label(format!("关闭标签“{names}”将丢弃未保存的 SQL / Redis 值草稿，并结束对应会话；未提交事务可能回滚。"));
                     ui.horizontal(|ui| {
                         cancel = ui.button("取消，返回保存").clicked();
                         discard = ui.button("确认关闭").clicked();
@@ -1529,7 +1529,7 @@ impl App {
             let mut cancel = false;
             dialog_window("确认更改 SQL 标签目标", ctx).show(ctx, |ui| {
                     ui.label(format!(
-                        "后续执行将发送到 {} / {}{}。这不会执行 SQL。",
+                        "新目标：{} / {}{}",
                         target.connection,
                         target.database.as_deref().unwrap_or("服务器"),
                         target.schema.as_ref().map(|schema| format!(" / {schema}")).unwrap_or_default()
@@ -1555,8 +1555,7 @@ impl App {
             dialog_window("切换 / 断开数据库会话？", ctx).show(ctx, |ui| {
                 let connection = self.confirm_request.as_ref().map(|(id, _, _)| *id).unwrap();
                 let name = self.profiles.iter().find(|p| p.id == connection).map(|p| p.name.as_str()).unwrap_or("原连接");
-                ui.label(format!("连接 {name} 已执行用户 SQL。切库、重连或断开此连接可能回滚未提交事务；其他连接不受影响。应用不会自动提交或自动重连。"));
-                ui.label("如需保留事务，请取消并先自行 COMMIT / ROLLBACK。");
+                ui.label(format!("切库、重连或断开连接“{name}”可能回滚未提交事务；其他连接不受影响。"));
                 ui.horizontal(|ui| { cancel = ui.button("取消").clicked(); confirm = ui.button("确认继续").clicked(); });
             });
             if cancel {
@@ -1569,19 +1568,17 @@ impl App {
         if self.confirm_exit {
             let busy = self.any_busy();
             let object_dirty = self.object_design_dirty();
+            let redis_drafts = self.tabs.iter().any(|tab| tab.redis.as_ref().is_some_and(|doc| doc.is_dirty()));
             let mut exit = false;
             let mut discard_exit = false;
             let mut cancel = false;
             dialog_window("退出前确认", ctx).show(ctx, |ui| {
-                ui.label("存在未保存到 SQL 文件的修改、未提交的表数据暂存，或正在执行数据库操作。");
-                ui.label("表数据暂存不会自动保存；退出将丢弃暂存修改。未提交事务可能回滚。");
+                ui.label("退出将丢弃表数据暂存，未提交事务可能回滚；SQL 草稿可选择保存。");
+                if redis_drafts { ui.colored_label(ui.visuals().warn_fg_color, "Redis 值草稿未保存，直接退出将丢弃。"); }
                 ui.horizontal(|ui| {
                     cancel = ui.button("取消").clicked();
                     exit = ui
-                        .add_enabled(
-                            !busy && !object_dirty,
-                            egui::Button::new("保存 SQL 草稿并退出"),
-                        )
+                        .add_enabled(!busy && !object_dirty && !redis_drafts, egui::Button::new("保存草稿并退出"))
                         .clicked();
                     discard_exit = ui
                         .add_enabled(!busy, egui::Button::new("不保存草稿，直接退出"))
@@ -1611,7 +1608,6 @@ impl App {
                 .open(&mut open)
                 .default_width(720.0)
                 .show(ctx, |ui| {
-                    ui.label("历史含原始 SQL，可能包含敏感内容；以明文保存在本机。");
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.history_search)
@@ -1951,6 +1947,7 @@ fn browse_draft_controls(
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(error.is_none(), egui::Button::new("应用筛选与排序"))
+                        .on_hover_text("应用后重新读取数据；筛选条件以 AND 组合")
                         .clicked()
                     {
                         action = Some(BrowseDraftAction::Apply);
@@ -1962,13 +1959,9 @@ fn browse_draft_controls(
                     {
                         action = Some(BrowseDraftAction::Reset);
                     }
-                    ui.label(
-                        RichText::new(
-                            error.unwrap_or("编辑不会刷新；应用后生效 · 条件以 AND 组合"),
-                        )
-                        .small()
-                        .weak(),
-                    );
+                    if let Some(error) = error {
+                        ui.label(RichText::new(error).small().weak());
+                    }
                 });
             });
     });

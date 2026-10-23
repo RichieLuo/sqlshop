@@ -40,6 +40,10 @@ mod oracle_database_ui;
 mod query_result_ui;
 mod query_session_ui;
 mod recovery_ui;
+mod redis_ui;
+mod redis_connections_ui;
+use redis_connections_ui::{ConnectionKind, TreeConnection};
+use sqlshop::redis_database::{RedisProfile, RedisWorker};
 mod structure_ui;
 mod tab_bar_ui;
 mod table_insert_ui;
@@ -85,6 +89,7 @@ struct QueryTab {
     backup: Option<backup_ui::BackupDocument>,
     local_database: Option<local_database_ui::LocalDocument>,
     oracle: Option<oracle_database_ui::OracleDocument>,
+    redis: Option<redis_ui::RedisDocument>,
     jobs: Option<management_ui::JobsDocument>,
     compare: Option<compare_ui::CompareDocument>,
     table_data: Option<TableData>,
@@ -153,6 +158,7 @@ impl QueryTab {
             backup: None,
             local_database: None,
             oracle: None,
+            redis: None,
             jobs: None,
             compare: None,
             table_data: None,
@@ -404,7 +410,10 @@ struct PendingSqlExecution {
 }
 
 struct ConnectionForm {
+    kind: ConnectionKind,
+    saved_kind: Option<ConnectionKind>,
     profile: Profile,
+    redis_profile: RedisProfile,
     password: String,
     ssh_secret: String,
 }
@@ -703,6 +712,9 @@ pub struct App {
     logo: egui::TextureHandle,
     store: Option<Store>,
     profiles: Vec<Profile>,
+    redis_profiles: Vec<RedisProfile>,
+    redis_config_error: Option<String>,
+    redis_test_worker: Option<RedisWorker>,
     credentials: HashMap<Uuid, Credentials>,
     selected: Option<Uuid>,
     sessions: HashMap<Uuid, ConnectionSession>,
@@ -798,6 +810,9 @@ impl App {
             logo: crate::branding::load_texture(&cc.egui_ctx),
             store: None,
             profiles: Vec::new(),
+            redis_profiles: Vec::new(),
+            redis_config_error: None,
+            redis_test_worker: None,
             credentials: HashMap::new(),
             selected: None,
             sessions: HashMap::new(),
@@ -870,6 +885,7 @@ impl App {
                 },
                 Err(error) => app.fail(format!("{error:#}")),
             }
+            app.restore_redis_connections();
             app.restore_workspace();
             app.restore_catalog();
         }
@@ -879,11 +895,12 @@ impl App {
             let mut profile = Profile::default();
             profile.ssh.enabled = true;
             profile.ssh.auth = SshAuth::PrivateKey;
-            app.form = Some(ConnectionForm {
-                profile,
-                password: String::new(),
-                ssh_secret: String::new(),
-            });
+            app.form = Some(ConnectionForm::sql(profile, Credentials::default(), false));
+        }
+        if app.screenshot_path.is_some()
+            && std::env::var("SQLSHOP_SCREENSHOT_VIEW").as_deref() == Ok("redis-connection")
+        {
+            app.form = Some(ConnectionForm::redis(RedisProfile::default(), Credentials::default(), false));
         }
         if app.screenshot_path.is_some()
             && matches!(
@@ -1630,7 +1647,9 @@ FROM users;"
 
     fn tab_busy(&self, index: usize) -> bool {
         let tab = &self.tabs[index];
-        if tab.oracle.as_ref().is_some_and(|doc| doc.busy) {
+        if tab.oracle.as_ref().is_some_and(|doc| doc.busy)
+            || tab.redis.as_ref().is_some_and(|doc| doc.busy)
+        {
             return true;
         }
         if tab.advanced.as_ref().is_some_and(|doc| doc.busy)
@@ -1680,6 +1699,7 @@ FROM users;"
         self.test_busy
             || self.tabs.iter().any(|tab| {
                 tab.oracle.as_ref().is_some_and(|doc| doc.busy)
+                    || tab.redis.as_ref().is_some_and(|doc| doc.busy)
                     || tab.advanced.as_ref().is_some_and(|doc| doc.busy)
                     || tab
                         .compare
@@ -1933,6 +1953,7 @@ FROM users;"
 
     fn poll(&mut self) {
         self.poll_tree_details();
+        self.poll_redis_connection_test();
         self.poll_management();
         self.poll_query_sessions();
         self.poll_table_recovery();
@@ -2715,6 +2736,10 @@ FROM users;"
     }
 
     fn edit_connection(&mut self, id: Uuid) {
+        if self.is_redis_connection(id) {
+            self.edit_redis_connection(id);
+            return;
+        }
         let Some(profile) = self.profiles.iter().find(|p| p.id == id).cloned() else {
             return;
         };
@@ -2725,11 +2750,7 @@ FROM users;"
                 return;
             }
         };
-        self.form = Some(ConnectionForm {
-            profile,
-            password: credentials.database_password,
-            ssh_secret: credentials.ssh_secret,
-        });
+        self.form = Some(ConnectionForm::sql(profile, credentials, true));
     }
 
     fn credentials_for(&self, profile: &Profile) -> anyhow::Result<Option<Credentials>> {
@@ -2754,6 +2775,7 @@ FROM users;"
         credentials: Credentials,
     ) -> anyhow::Result<()> {
         profile.validate()?;
+        anyhow::ensure!(!self.redis_profiles.iter().any(|p| p.id == profile.id), "不能将已保存的 Redis 连接改成 SQL，请新建连接");
         let store = self
             .store
             .as_ref()
@@ -2776,6 +2798,10 @@ FROM users;"
     }
 
     fn connect_selected(&mut self) {
+        if let Some(id) = self.selected.filter(|id| self.is_redis_connection(*id)) {
+            self.open_redis_connection(id, true);
+            return;
+        }
         let Some(profile) = self
             .profiles
             .iter()
@@ -2806,11 +2832,7 @@ FROM users;"
                 && (!profile.remember_password
                     || (profile.ssh.enabled && !profile.ssh.remember_secret)))
         {
-            self.form = Some(ConnectionForm {
-                profile,
-                password: credentials.database_password,
-                ssh_secret: credentials.ssh_secret,
-            });
+            self.form = Some(ConnectionForm::sql(profile, credentials, true));
             self.status = "请填写数据库 / SSH 凭据，勾选记住后保存在本机".into();
             return;
         }
@@ -3182,35 +3204,13 @@ FROM users;"
                 let mut visible_connections = 0usize;
                 for (group_id, group_name) in &buckets {
                     let group_matches = searching && group_name.to_lowercase().contains(&filter);
-                    let members: Vec<_> = self
-                        .profiles
-                        .iter()
-                        .filter(|p| self.catalog.memberships.get(&p.id).copied() == *group_id)
-                        .filter(|profile| {
-                            let session = self.sessions.get(&profile.id);
-                            (!connected_only
-                                || session.is_some_and(|session| session.connected.is_some()))
-                                && (!searching
-                                    || group_matches
-                                    || profile.name.to_lowercase().contains(&filter)
-                                    || session.is_some_and(|session| {
-                                        session.databases.iter().any(|database| {
-                                            database.to_lowercase().contains(&filter)
-                                        }) || session.tables.iter().any(|table| {
-                                            format!("{}.{}", table.schema, table.name)
-                                                .to_lowercase()
-                                                .contains(&filter)
-                                        })
-                                    }))
-                        })
-                        .cloned()
-                        .collect();
+                    let members = self.connection_tree_members(*group_id, &filter, group_matches, connected_only);
                     visible_connections += members.len();
                     if members.is_empty() && (searching || connected_only) {
                         continue;
                     }
                     let expand_group =
-                        expand_connection.is_some_and(|id| members.iter().any(|p| p.id == id));
+                        expand_connection.is_some_and(|id| members.iter().any(|p| p.id() == id));
                     let group_state_id =
                         ui.make_persistent_id(("connection-group", group_id, tree_generation));
                     let group_header = tree_navigation_ui::branch(
@@ -3229,7 +3229,20 @@ FROM users;"
                     );
                     let group_response = group_header.response.clone();
                     group_header.body(|ui| {
-                        for profile in members {
+                        for member in members {
+                            let profile = match member {
+                                TreeConnection::Sql(profile) => profile,
+                                TreeConnection::Redis(profile) => {
+                                    let events = self.redis_connection_tree(ui, &profile, expand_connection == Some(profile.id) || expand_search, &buckets);
+                                    if events.connect.is_some() { to_connect = events.connect; }
+                                    if events.disconnect.is_some() { disconnect = events.disconnect; }
+                                    if events.edit.is_some() { to_edit = events.edit; }
+                                    if events.delete.is_some() { to_delete = events.delete; }
+                                    if events.select.is_some() { to_select = events.select; }
+                                    if events.move_group.is_some() { move_connection = events.move_group; }
+                                    continue;
+                                }
+                            };
                             let filter = if group_matches
                                 || (searching && profile.name.to_lowercase().contains(&filter))
                             {
@@ -3286,32 +3299,8 @@ FROM users;"
                             }
                             server_header.body(|ui| {
                                 if !connected {
-                                    ui.label(
-                                        RichText::new(if busy {
-                                            "正在连接…"
-                                        } else {
-                                            "尚未连接"
-                                        })
-                                        .small()
-                                        .weak(),
-                                    );
-                                    if ui.add_enabled(!busy, egui::Button::new("连接")).clicked()
-                                    {
-                                        to_connect = Some(profile.id);
-                                    }
                                     return;
                                 }
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} · {}:{}{}",
-                                        profile.engine.label(),
-                                        profile.host,
-                                        profile.port,
-                                        if profile.ssh.enabled { " · SSH" } else { "" }
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
                                 if databases.is_empty() {
                                     ui.label(
                                         RichText::new(if busy {
@@ -3556,9 +3545,12 @@ FROM users;"
                                 connected,
                             );
                             header_response.clone().on_hover_text(format!(
-                                "{} · {}",
+                                "{} · {}:{}{} · {}",
                                 profile.engine.label(),
-                                if connected { "已连接" } else { "未连接" },
+                                profile.host,
+                                profile.port,
+                                if profile.ssh.enabled { " · SSH" } else { "" },
+                                if busy { "正在操作…" } else if connected { "已连接" } else { "未连接" },
                             ));
                             header_response.context_menu(|ui| {
                                 connection_context_menu(
@@ -3579,12 +3571,10 @@ FROM users;"
                                 );
                             });
                         }
-                        if self
-                            .profiles
-                            .iter()
-                            .all(|p| self.catalog.memberships.get(&p.id).copied() != *group_id)
+                        if self.profiles.iter().map(|p| p.id).chain(self.redis_profiles.iter().map(|p| p.id))
+                            .all(|id| self.catalog.memberships.get(&id).copied() != *group_id)
                         {
-                            ui.label(RichText::new("空分组 · 右键连接可移入").small().weak());
+                            ui.label(RichText::new("空分组").small().weak());
                         }
                     });
                     if let Some(id) = group_id {
@@ -3606,7 +3596,7 @@ FROM users;"
                         });
                     }
                 }
-                if visible_connections == 0 && !self.profiles.is_empty() {
+                if visible_connections == 0 && (!self.profiles.is_empty() || !self.redis_profiles.is_empty()) {
                     ui.label(
                         RichText::new(if searching {
                             "没有匹配的连接或已读对象"
@@ -3630,12 +3620,11 @@ FROM users;"
                         self.selected = Some(connection);
                     }
                 }
-                if self.profiles.is_empty() {
+                if self.profiles.is_empty() && self.redis_profiles.is_empty() {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("⌁").size(38.0).color(accent(ui)));
                         ui.label(RichText::new("还没有数据库连接").size(16.0).strong());
-                        ui.label(RichText::new("新建连接，开始探索你的数据").small().weak());
                     });
                 }
             });
@@ -3644,7 +3633,13 @@ FROM users;"
                 .then(|| self.tree_selection.selected.clone())
                 .flatten()
         }) {
-            let scope = match node {
+            // Redis selection belongs only to the tree. It must never become a SQL BrowserScope.
+            let redis_node = match &node {
+                TreeNode::Connection(id) | TreeNode::Database(id, _) | TreeNode::Schema(id, _, _)
+                | TreeNode::Table(id, _, _) | TreeNode::TablePart(id, _, _, _, _) => self.is_redis_connection(*id),
+                TreeNode::Group(_) => false,
+            };
+            let scope = if redis_node { None } else { match node {
                 TreeNode::Group(_) => None,
                 TreeNode::Connection(connection) => Some((
                     object_browser_ui::BrowserScope {
@@ -3683,7 +3678,7 @@ FROM users;"
                         table,
                     }),
                 )),
-            };
+            }};
             if let Some((scope, item)) = scope {
                 if tree_activation.is_some() {
                     self.show_object_scope(scope, item);
@@ -3721,7 +3716,7 @@ FROM users;"
             self.confirm_delete = Some(id);
         }
         if let Some(id) = disconnect {
-            self.request_on(id, Request::Disconnect, "正在断开连接…");
+            self.disconnect_connection(id);
         }
         if let Some(id) = refresh_databases {
             self.request_on(id, Request::Databases, "正在刷新数据库列表…");
@@ -3735,7 +3730,14 @@ FROM users;"
         }
         if let Some((id, database)) = to_select {
             self.selected = Some(id);
-            self.request_on(id, Request::SelectDatabase(database), "正在选择数据库…");
+            if self.is_redis_connection(id) {
+                match database.parse::<u32>() {
+                    Ok(database) => { self.select_redis_database(id, database); }
+                    Err(_) => self.fail("Redis 数据库编号无效".into()),
+                }
+            } else {
+                self.request_on(id, Request::SelectDatabase(database), "正在选择数据库…");
+            }
         }
         if let Some((connection, database, engine, table)) = preview {
             if self.cell_editor.is_some() {
@@ -3930,7 +3932,7 @@ FROM users;"
                     {
                         "正在执行查询…"
                     } else {
-                        "暂无查询结果，执行状态见底部状态栏。"
+                        "暂无结果"
                     },
                 )
                 .weak(),
@@ -3945,7 +3947,7 @@ FROM users;"
             });
         }
         let Some(set) = output.sets.get(tab.result_index) else {
-            ui.label("执行完成，没有行结果；SQL Server 批处理不报告受影响行数。");
+            ui.label("执行完成，无结果集");
             return;
         };
         if !table_tab {
@@ -3972,11 +3974,11 @@ FROM users;"
         if set.truncated {
             ui.colored_label(
                 Color32::from_rgb(235, 180, 80),
-                "结果超过 1000 行，仅展示和导出前 1000 行；使用 LIMIT / TOP 缩小查询范围。",
+                "结果已截断，仅保留前 1000 行。",
             );
         }
         if set.columns.is_empty() {
-            ui.label("语句已完成，无行数据；详细执行信息见消息页。");
+            ui.label("执行完成，无行数据");
             return;
         }
         let context_matches = tab.table_target.as_ref().is_some_and(|target| {
@@ -4091,7 +4093,6 @@ FROM users;"
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.heading("字段定义");
-            ui.label(RichText::new("配置字段类型、约束和默认值").small().weak());
         });
         ui.add_space(6.0);
         let column_area_height = (ui.available_height() - 72.0).max(140.0);
@@ -4333,14 +4334,13 @@ FROM users;"
     }
 
     fn connection_window(&mut self, ctx: &egui::Context) {
-        let busy = self.test_busy
-            || self
-                .form
-                .as_ref()
-                .is_some_and(|f| self.session_busy(f.profile.id));
-        let Some(form) = &mut self.form else {
-            return;
-        };
+        let busy = self.test_busy || self.redis_test_worker.is_some()
+            || self.form.as_ref().is_some_and(|form| match form.kind {
+                ConnectionKind::Sql(_) => self.session_busy(form.id()),
+                ConnectionKind::Redis => self.redis_document(form.id()).is_some_and(|doc| doc.busy),
+            });
+        let Some(form) = &mut self.form else { return };
+        let redis_save_error = self.redis_config_error.clone();
         let mut open = true;
         let mut save = false;
         let mut connect = false;
@@ -4353,93 +4353,85 @@ FROM users;"
             .min_width(620.0)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
-                    ui.label(
-                        RichText::new("CONNECTION SETTINGS")
-                            .size(11.0)
-                            .color(accent(ui)),
-                    );
                     connection_heading(ui, form);
                     ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("connection-fields")
+                    egui::ScrollArea::vertical().id_salt("connection-fields")
                         .max_height((ctx.content_rect().height() - 340.0).max(180.0))
                         .show(ui, |ui| {
                             if ui.available_width() >= 820.0 {
                                 ui.columns(2, |columns| {
                                     columns[0].group(|ui| database_fields(ui, form));
-                                    columns[1].group(|ui| {
-                                        selection_error = ssh_fields(ui, form);
-                                    });
+                                    columns[1].group(|ui| { selection_error = connection_ssh_fields(ui, form); });
                                 });
                             } else {
                                 ui.group(|ui| database_fields(ui, form));
                                 ui.add_space(10.0);
-                                ui.group(|ui| {
-                                    selection_error = ssh_fields(ui, form);
-                                });
+                                ui.group(|ui| { selection_error = connection_ssh_fields(ui, form); });
                             }
                             ui.add_space(10.0);
                             ui.group(|ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.strong("数据库 TLS");
-                                database_tls_settings(ui, &mut form.profile);
+                                match form.kind {
+                                    ConnectionKind::Sql(_) => database_tls_settings(ui, &mut form.profile),
+                                    ConnectionKind::Redis => {
+                                        ui.checkbox(&mut form.redis_profile.tls, "启用 TLS 加密").on_hover_text("校验证书和主机名；暂不支持 TLS + SSH。");
+                                        if form.redis_profile.tls && form.redis_profile.ssh.enabled {
+                                            ui.colored_label(ui.visuals().error_fg_color, "TLS 与 SSH 不能同时启用，请关闭其中一项。");
+                                        }
+                                    }
+                                }
                             });
                         });
                     ui.add_space(10.0);
                     ui.separator();
+                    let can_save = form.kind != ConnectionKind::Redis || redis_save_error.is_none();
+                    if !can_save {
+                        ui.colored_label(ui.visuals().error_fg_color, redis_save_error.as_deref().unwrap_or_default());
+                    }
                     ui.horizontal(|ui| {
                         test = ui.button("测试连接").clicked();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            connect = ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("保存并连接").color(Color32::WHITE),
-                                    )
-                                    .fill(accent(ui)),
-                                )
-                                .clicked();
-                            save = ui.button("保存").clicked();
+                            connect = ui.add_enabled(can_save, egui::Button::new(RichText::new("保存并连接").color(Color32::WHITE)).fill(accent(ui))).clicked();
+                            save = ui.add_enabled(can_save, egui::Button::new("保存")).clicked();
                         });
                     });
                 });
-                if busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("正在处理…");
-                    });
-                }
-                if self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, &self.status);
-                } else {
-                    ui.label(RichText::new(&self.status).small().weak());
-                }
+                if busy { ui.horizontal(|ui| { ui.spinner(); ui.label("正在处理…"); }); }
+                if self.error { ui.colored_label(ui.visuals().error_fg_color, &self.status); }
+                else { ui.label(RichText::new(&self.status).small().weak()); }
             });
+        let kind = form.kind;
         let profile = form.profile.clone();
-        let credentials = Credentials {
-            database_password: form.password.clone(),
-            ssh_secret: form.ssh_secret.clone(),
-        };
-        if !open {
-            self.form = None;
-        }
-        if let Some(error) = selection_error {
-            self.fail(error);
-        }
+        let redis_profile = form.redis_profile.clone();
+        let credentials = form.credentials();
+        if !open { self.form = None; }
+        if let Some(error) = selection_error { self.fail(error); }
         if test {
-            match profile.validate() {
-                Ok(()) => self.request(
-                    Request::Test(profile.clone(), credentials.clone()),
-                    "正在测试连接…",
-                ),
-                Err(error) => self.fail(error.to_string()),
+            match kind {
+                ConnectionKind::Sql(_) => match profile.validate() {
+                    Ok(()) => self.request(Request::Test(profile.clone(), credentials.clone()), "正在测试连接…"),
+                    Err(error) => self.fail(error.to_string()),
+                },
+                ConnectionKind::Redis => {
+                    if let Err(error) = self.test_redis_connection(redis_profile.clone(), credentials.clone()) { self.fail(format!("{error:#}")); }
+                }
             }
         }
         if save || connect {
-            match self.save_connection(profile.clone(), credentials.clone()) {
+            let id = match kind { ConnectionKind::Sql(_) => profile.id, ConnectionKind::Redis => redis_profile.id };
+            let result = match kind {
+                ConnectionKind::Sql(_) => self.save_connection(profile.clone(), credentials.clone()),
+                ConnectionKind::Redis => self.save_redis_connection(redis_profile, credentials.clone()),
+            };
+            match result {
                 Ok(()) => {
                     self.form = None;
                     if connect {
-                        self.request(Request::Connect(profile, credentials), "正在连接数据库…");
+                        match kind {
+                            ConnectionKind::Sql(_) => self.request(Request::Connect(profile, credentials), "正在连接数据库…"),
+                            ConnectionKind::Redis => { self.open_redis_connection(id, true); }
+                        }
                     }
                 }
                 Err(error) => self.fail(format!("{error:#}")),
@@ -4451,13 +4443,17 @@ FROM users;"
         let Some(id) = self.confirm_delete else {
             return;
         };
-        let busy = self.session_busy(id) || self.query_connection_busy(id);
+        let redis = self.is_redis_connection(id);
+        let busy = if redis { self.redis_document(id).is_some_and(|doc| doc.busy || doc.is_dirty() || doc.has_pending_confirmation()) }
+            else { self.session_busy(id) || self.query_connection_busy(id) };
         let mut cancel = false;
         let mut delete = false;
         dialog_window("删除本机连接", ctx).show(ctx, |ui| {
-                ui.label("将删除此连接配置及保存的密码，数据库中的数据不受影响。");
-                if self.sessions.get(&id).is_some_and(|s| s.connected.is_some()) || self.query_connection_used(id) {
-                    ui.label("此连接仍有存活会话。删除会关闭其管理会话和所有 SQL 标签会话，未提交事务可能回滚；其他连接不受影响。");
+                ui.label("删除本机连接及凭据，不删除服务器数据。");
+                if redis {
+                    ui.label("将关闭此连接的 Redis 标签。");
+                } else if self.sessions.get(&id).is_some_and(|s| s.connected.is_some()) || self.query_connection_used(id) {
+                    ui.label("将关闭此连接的所有会话，未提交事务可能回滚。");
                 }
                 ui.horizontal(|ui| {
                     cancel = ui.button("取消").clicked();
@@ -4468,6 +4464,10 @@ FROM users;"
             });
         if cancel {
             self.confirm_delete = None;
+        }
+        if delete && redis {
+            if let Err(error) = self.delete_redis_connection(id) { self.fail(format!("{error:#}")); }
+            return;
         }
         if delete {
             let profiles: Vec<_> = self
@@ -4490,7 +4490,7 @@ FROM users;"
                     self.close_query_sessions(id);
                     self.profiles = profiles;
                     self.credentials.remove(&id);
-                    self.selected = self.profiles.first().map(|p| p.id);
+                    self.selected = self.profiles.first().map(|p| p.id).or_else(|| self.redis_profiles.first().map(|p| p.id));
                     self.tree_selection.selected = self.selected.map(TreeNode::Connection);
                     self.confirm_delete = None;
                     // Deletion explicitly closes only this connection's session.
@@ -4739,7 +4739,7 @@ FROM users;"
                 .default_width(700.0)
                 .show(ctx, |ui| {
                 ui.label(format!("{} / {}.{} · {} 行", form.target.database.as_deref().unwrap_or(""), form.table.schema, form.table.name, form.rows.len()));
-                ui.label("CSV 空字段（未引号）= NULL；双引号包裹的空文本=空字符串；文字 NULL 始终是字符串。未映射列使用默认值。");
+                ui.label("列映射").on_hover_text("未引号的空字段为 NULL，引号内空值为空字符串；未映射列使用默认值。");
                 for (index, header) in form.headers.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(format!("{header} →"));
@@ -4883,9 +4883,13 @@ impl eframe::App for App {
         apply_theme(ctx);
         egui::TopBottomPanel::top("title")
             .exact_height(window_chrome::TITLE_HEIGHT)
-            .frame(egui::Frame::new().fill(chrome(ctx)))
+            .frame(egui::Frame::new().fill(window_chrome::title_fill(ctx)))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                if cfg!(target_os = "windows") {
+                    ui.spacing_mut().button_padding.y = 4.0;
+                    ui.spacing_mut().interact_size.y = 24.0;
+                }
                 ui.horizontal(|ui| {
                     ui.set_height(window_chrome::TITLE_HEIGHT);
                     ui.add_space(window_chrome::leading_inset());
@@ -4943,18 +4947,14 @@ impl eframe::App for App {
                         ui.add_space(16.0);
                         ui.label(
                             RichText::new(
-                                if let Some(profile) =
-                                    self.selected_session().and_then(|s| s.connected.as_ref())
-                                {
-                                    format!("● {}", profile.name)
+                                if let Some(name) = self.selected_connected_name() {
+                                    format!("● {name}")
                                 } else {
                                     "○ 未连接".into()
                                 },
                             )
                             .color(
-                                if self
-                                    .selected_session()
-                                    .is_some_and(|s| s.connected.is_some())
+                                if self.selected_connected_name().is_some()
                                 {
                                     accent(ui)
                                 } else {
@@ -4980,12 +4980,8 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{} 个连接 · {} 个操作中",
-                            self.sessions
-                                .values()
-                                .filter(|s| s.connected.is_some())
-                                .count(),
-                            self.sessions.values().filter(|s| s.busy).count()
-                                + self.query_sessions.values().filter(|s| s.busy).count()
+                            self.connection_activity_counts().0,
+                            self.connection_activity_counts().1
                         ));
                         let width = (ui.available_width() * 0.35).min(420.0);
                         let color = if error {
@@ -5015,9 +5011,7 @@ impl eframe::App for App {
                                     .small()
                                     .weak(),
                                 );
-                            } else if self.tabs[self.active_tab].management_document() {
-                                ui.label(RichText::new("独立工具文档").small().weak());
-                            } else {
+                            } else if !self.tabs[self.active_tab].management_document() {
                                 self.executed_sql_footer(ui);
                             }
                         }
@@ -5025,6 +5019,7 @@ impl eframe::App for App {
                 });
         }
         let modal = self.modal_open();
+        let redis_active = !self.browser_visible && self.tabs[self.active_tab].redis.is_some();
         if self.view.navigation && !self.view.focus {
             egui::SidePanel::left("sidebar")
                 .default_width(240.0)
@@ -5039,6 +5034,7 @@ impl eframe::App for App {
                 });
         }
         if self.inspector_visible
+            && !redis_active
             && !self.view.focus
             && (self.view.information_force
                 || (ctx.content_rect().width() >= 1100.0 && ctx.available_rect().width() >= 720.0))
@@ -5566,6 +5562,9 @@ fn result_grid_inline(
     let mut draft_action = None;
     let mut remove_insert = None;
     let mut row_action = None;
+    let mut editor_controls = None;
+    let mut editor_input = None;
+    let mut editor_opening = inline_editor.as_ref().is_some_and(|editor| editor.focus);
     let target = tab.table_target.as_ref();
     let metadata = tab.table_data.as_ref();
     let editing_location = inline_editor
@@ -5604,9 +5603,14 @@ fn result_grid_inline(
         action
     };
     if let Some(editor) = inline_editor.as_mut().filter(|editor| editor.tab == tab.id) {
-        ui.horizontal(|ui| {
+        let controls = ui.horizontal(|ui| {
             ui.label(RichText::new(format!("编辑 {}", editor.change.column)).small());
-            ui.add_enabled(can_edit, egui::Checkbox::new(&mut editor.is_null, "NULL"));
+            if ui
+                .add_enabled(can_edit, egui::Checkbox::new(&mut editor.is_null, "NULL"))
+                .changed()
+            {
+                editor.focus = true;
+            }
             if ui.selectable_label(editor.expanded, "展开编辑").clicked() {
                 editor.expanded = !editor.expanded;
                 editor.focus = true;
@@ -5640,9 +5644,11 @@ fn result_grid_inline(
                 .weak(),
             );
         });
+        editor_controls = Some(controls.response);
+        editor_opening |= editor.focus;
         if editor.expanded {
             let was_focus = editor.focus;
-            egui::Frame::group(ui.style())
+            let expanded = egui::Frame::group(ui.style())
                 .inner_margin(6)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
@@ -5669,21 +5675,16 @@ fn result_grid_inline(
                                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter),
                                 )
                             });
-                            if row_action.is_none()
-                                && (cancel
-                                    || (can_edit
-                                        && (save
-                                            || (response.lost_focus()
-                                                && !was_focus
-                                                && !egui::Popup::is_any_open(ui.ctx())))))
-                            {
+                            if row_action.is_none() && (cancel || (can_edit && save)) {
                                 row_action = Some(GridAction::FinishCell {
                                     cancel,
                                     movement: CellMovement::Stay,
                                 });
                             }
+                            editor_input = Some(response);
                         });
                 });
+            editor_controls = editor_controls.map(|controls| controls | expanded.response);
         }
     }
     if has_drafts
@@ -5883,12 +5884,13 @@ fn result_grid_inline(
                                                 let next = input.consume_key(modifiers, egui::Key::Tab);
                                                 (escape, enter, next, shift)
                                             });
-                                            if row_action.is_none() && (escape || (can_edit && (enter || next || (response.lost_focus() && !was_focus && !egui::Popup::is_any_open(ui.ctx()))))) {
+                                            if row_action.is_none() && (escape || (can_edit && (enter || next))) {
                                                     row_action = Some(GridAction::FinishCell { cancel: escape, movement: if next {
                                                         CellMovement::Across(if shift { -1 } else { 1 })
                                                     } else if enter { CellMovement::Down(if shift { -1 } else { 1 }) }
                                                     else { CellMovement::Stay } });
                                             }
+                                            editor_input = Some(response);
                                             return;
                                         }
                                         let displayed = staged_value.unwrap_or(cell);
@@ -5934,9 +5936,9 @@ fn result_grid_inline(
                                             } else {
                                                 ui.label(value);
                                                 if editable {
-                                                    ui.label("单击选格 · 拖动选择区域 · Shift+单击扩展 · 双击 / F2 / Enter 编辑 · 粘贴仅暂存");
+                                                    ui.label("双击 / F2 编辑");
                                                 } else if target.is_none() {
-                                                    ui.label("SQL 查询结果只读；双击左侧表名打开可编辑的表数据");
+                                                    ui.label("查询结果只读");
                                                 }
                                             }
                                         });
@@ -6049,6 +6051,28 @@ fn result_grid_inline(
                 });
             pointer_selection.exclude_scrollbar(ui, &horizontal_scroll, 0);
         });
+    if row_action.is_none()
+        && can_edit
+        && !editor_opening
+        && !egui::Popup::is_any_open(ui.ctx())
+        && let (Some(controls), Some(input)) = (editor_controls, editor_input)
+    {
+        // NULL inputs are disabled and never gain focus, so also check outside clicks.
+        let outside_click = controls.clicked_elsewhere() && input.clicked_elsewhere();
+        let (pressed, position) =
+            ui.input(|state| (state.pointer.any_pressed(), state.pointer.interact_pos()));
+        let controls_interaction = pressed
+            && position.is_some_and(|position| {
+                controls.interact_rect.contains(position)
+                    && ui.ctx().layer_id_at(position) == Some(controls.layer_id)
+            });
+        if outside_click || (input.lost_focus() && !controls_interaction) {
+            row_action = Some(GridAction::FinishCell {
+                cancel: false,
+                movement: CellMovement::Stay,
+            });
+        }
+    }
     pointer_selection.finish(
         ui,
         grid_selection_ui::SelectionRefs {
@@ -7073,40 +7097,23 @@ fn table_buttons(
 fn connection_heading(ui: &mut egui::Ui, form: &mut ConnectionForm) {
     ui.horizontal(|ui| {
         ui.label("连接名称");
-        ui.add(
-            egui::TextEdit::singleline(&mut form.profile.name)
-                .hint_text("例如：开发数据库")
-                .desired_width((ui.available_width() - 20.0).min(440.0)),
-        );
+        let name = match form.kind { ConnectionKind::Sql(_) => &mut form.profile.name, ConnectionKind::Redis => &mut form.redis_profile.name };
+        ui.add(egui::TextEdit::singleline(name).hint_text("例如：开发数据库").desired_width((ui.available_width() - 20.0).min(440.0)));
     });
-    let previous = form.profile.engine;
-    ui.horizontal_wrapped(|ui| {
+    let mut kind = form.kind;
+    ui.horizontal(|ui| {
         ui.label("数据库类型");
-        for engine in Engine::ALL {
-            ui.selectable_value(&mut form.profile.engine, engine, engine.label());
-        }
+        egui::ComboBox::from_id_salt("connection-kind").selected_text(kind.label()).show_ui(ui, |ui| {
+            for choice in ConnectionKind::ALL {
+                ui.add_enabled_ui(form.permits_kind(choice), |ui| { ui.selectable_value(&mut kind, choice, choice.label()); });
+            }
+        });
     });
-    if previous != form.profile.engine {
-        let defaults = |engine: Engine| match engine {
-            Engine::MySql => "root",
-            Engine::Postgres => "postgres",
-            Engine::SqlServer => "sa",
-        };
-        let old_user = defaults(previous);
-        let new_user = defaults(form.profile.engine);
-        if form.profile.port == previous.port() {
-            form.profile.port = form.profile.engine.port();
-        }
-        if form.profile.username == old_user {
-            form.profile.username = new_user.into();
-        }
-        if form.profile.name == format!("本地 {}", previous.label()) {
-            form.profile.name = format!("本地 {}", form.profile.engine.label());
-        }
-    }
+    form.set_kind(kind);
 }
 
 fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
+    if form.kind == ConnectionKind::Redis { redis_connections_ui::redis_database_fields(ui, form); return; }
     ui.set_min_width(ui.available_width());
     ui.strong("数据库");
     ui.add_space(6.0);
@@ -7132,7 +7139,7 @@ fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
             ui.label("命名实例");
             ui.add(
                 egui::TextEdit::singleline(&mut form.profile.sqlserver_instance)
-                    .hint_text("可选；使用 SQL Browser UDP 1434 发现端口"),
+                    .hint_text("可选"),
             );
         });
         if form.profile.sqlserver_auth == sqlshop::model::SqlServerAuth::AadToken {
@@ -7140,7 +7147,7 @@ fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
                 ui.label("初始数据库");
                 ui.add(
                     egui::TextEdit::singleline(&mut form.profile.database)
-                        .hint_text("可选；令牌仅能访问特定数据库时填写"),
+                        .hint_text("可选"),
                 );
             });
         }
@@ -7183,76 +7190,75 @@ fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
         if form.profile.engine == Engine::SqlServer
             && form.profile.sqlserver_auth == sqlshop::model::SqlServerAuth::AadToken
         {
-            "记住访问令牌（加密保存；到期后需更新）"
+            "记住访问令牌"
         } else {
-            "记住数据库密码（本机保存）"
+            "记住密码"
         },
     );
-    let hint = if form.profile.ssh.enabled {
-        "主机和端口填写 SSH 服务器能访问的数据库地址。"
-    } else {
-        "连接后展开服务器，在数据库列表中选择要使用的库。"
-    };
-    ui.label(RichText::new(hint).small().weak());
 }
 
-fn ssh_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) -> Option<String> {
+fn connection_ssh_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) -> Option<String> {
+    let ssh = match form.kind { ConnectionKind::Sql(_) => &mut form.profile.ssh, ConnectionKind::Redis => &mut form.redis_profile.ssh };
+    ssh_fields(ui, ssh, &mut form.ssh_secret)
+}
+
+fn ssh_fields(ui: &mut egui::Ui, ssh: &mut sqlshop::model::SshConfig, ssh_secret: &mut String) -> Option<String> {
     ui.set_min_width(ui.available_width());
     ui.strong("SSH 隧道");
-    ui.checkbox(&mut form.profile.ssh.enabled, "通过 SSH 隧道连接");
+    ui.checkbox(&mut ssh.enabled, "通过 SSH 隧道连接");
     let mut selection_error = None;
     let input_width = (ui.available_width() - 90.0).clamp(140.0, 330.0);
-    ui.add_enabled_ui(form.profile.ssh.enabled, |ui| {
+    ui.add_enabled_ui(ssh.enabled, |ui| {
         egui::Grid::new("ssh-form")
             .num_columns(2)
             .spacing([14.0, 10.0])
             .show(ui, |ui| {
                 ui.label("主机");
                 ui.add(
-                    egui::TextEdit::singleline(&mut form.profile.ssh.host)
+                    egui::TextEdit::singleline(&mut ssh.host)
                         .desired_width(input_width),
                 );
                 ui.end_row();
                 ui.label("端口");
-                ui.add(egui::DragValue::new(&mut form.profile.ssh.port).range(1..=65535));
+                ui.add(egui::DragValue::new(&mut ssh.port).range(1..=65535));
                 ui.end_row();
                 ui.label("用户名");
                 ui.add(
-                    egui::TextEdit::singleline(&mut form.profile.ssh.username)
+                    egui::TextEdit::singleline(&mut ssh.username)
                         .desired_width(input_width),
                 );
                 ui.end_row();
                 ui.label("认证方式");
-                let previous = form.profile.ssh.auth;
+                let previous = ssh.auth;
                 egui::ComboBox::from_id_salt("ssh-auth")
                     .selected_text(match previous {
                         SshAuth::Password => "密码",
                         SshAuth::PrivateKey => "私钥",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut form.profile.ssh.auth, SshAuth::Password, "密码");
+                        ui.selectable_value(&mut ssh.auth, SshAuth::Password, "密码");
                         ui.selectable_value(
-                            &mut form.profile.ssh.auth,
+                            &mut ssh.auth,
                             SshAuth::PrivateKey,
                             "私钥",
                         );
                     });
-                if previous != form.profile.ssh.auth {
-                    form.ssh_secret.clear();
+                if previous != ssh.auth {
+                    (*ssh_secret).clear();
                 }
                 ui.end_row();
-                if form.profile.ssh.auth == SshAuth::PrivateKey {
+                if ssh.auth == SshAuth::PrivateKey {
                     ui.label("私钥文件");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut form.profile.ssh.private_key)
+                            egui::TextEdit::singleline(&mut ssh.private_key)
                                 .desired_width((input_width - 100.0).max(90.0)),
                         )
-                        .on_hover_text(&form.profile.ssh.private_key);
+                        .on_hover_text(&ssh.private_key);
                         if ui.button("选择文件…").clicked() {
-                            match choose_private_key(&form.profile.ssh.private_key) {
+                            match choose_private_key(&ssh.private_key) {
                                 Ok(Some(path)) => {
-                                    form.profile.ssh.private_key = path.display().to_string()
+                                    ssh.private_key = path.display().to_string()
                                 }
                                 Ok(None) => {}
                                 Err(error) => selection_error = Some(format!("{error:#}")),
@@ -7261,16 +7267,16 @@ fn ssh_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) -> Option<String> {
                     });
                     ui.end_row();
                 }
-                ui.label(if form.profile.ssh.auth == SshAuth::Password {
+                ui.label(if ssh.auth == SshAuth::Password {
                     "密码"
                 } else {
                     "私钥口令"
                 });
                 ui.add(
-                    egui::TextEdit::singleline(&mut form.ssh_secret)
+                    egui::TextEdit::singleline(&mut (*ssh_secret))
                         .password(true)
                         .desired_width(input_width)
-                        .hint_text(if form.profile.ssh.auth == SshAuth::PrivateKey {
+                        .hint_text(if ssh.auth == SshAuth::PrivateKey {
                             "未加密的私钥可留空"
                         } else {
                             ""
@@ -7280,27 +7286,22 @@ fn ssh_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) -> Option<String> {
             });
         ui.add_space(6.0);
         ui.checkbox(
-            &mut form.profile.ssh.remember_secret,
-            "记住 SSH 密码 / 私钥口令（本机保存）",
+            &mut ssh.remember_secret,
+            "记住 SSH 凭据",
         );
         egui::CollapsingHeader::new("SSH 主机校验")
             .default_open(false)
             .show(ui, |ui| {
                 ui.label("known_hosts 文件");
                 ui.add(
-                    egui::TextEdit::singleline(&mut form.profile.ssh.known_hosts)
+                    egui::TextEdit::singleline(&mut ssh.known_hosts)
                         .desired_width(input_width),
                 );
-                ui.label("服务器指纹（可选，填写后以此指纹校验）");
+                ui.label("服务器指纹（可选）");
                 ui.add(
-                    egui::TextEdit::singleline(&mut form.profile.ssh.fingerprint)
+                    egui::TextEdit::singleline(&mut ssh.fingerprint)
                         .hint_text("SHA256:…")
                         .desired_width(input_width),
-                );
-                ui.label(
-                    RichText::new("首次连接的测试结果会显示指纹；核实后填入此处。")
-                        .small()
-                        .weak(),
                 );
             });
     });
@@ -7958,6 +7959,170 @@ mod tests {
                     && rect.stroke.color == outline_color
                     && rect.stroke.width == 1.0
         )));
+    }
+
+    fn inline_grid_frame(app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let ctx = app.context.clone();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 820.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let actions = app.table_draft_action_state();
+                    let (editor, action) = result_grid_inline(
+                        ui,
+                        &mut app.tabs[0],
+                        true,
+                        app.cell_editor.as_mut(),
+                        actions,
+                    );
+                    if let Some(editor) = editor {
+                        app.cell_editor = Some(editor);
+                    }
+                    if let Some(GridAction::FinishCell { cancel, movement }) = action {
+                        app.finish_inline_cell(cancel, movement);
+                    }
+                });
+            },
+        )
+    }
+
+    fn click_inline_grid(app: &mut App, position: egui::Pos2) -> egui::FullOutput {
+        for pressed in [true, false] {
+            let output = inline_grid_frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            if !pressed {
+                return output;
+            }
+        }
+        unreachable!()
+    }
+
+    fn grid_text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing grid label {label}"))
+    }
+
+    #[test]
+    fn inline_cell_editing_ends_on_outside_click_for_null_and_text() {
+        for value in [None, Some("original".to_owned())] {
+            for expanded in [false, true] {
+                for destination in ["7", "note", "blank"] {
+                    let (mut app, _, _) = table_flow_fixture();
+                    install_font(&app.context);
+                    app.tabs[0].output.as_mut().unwrap().sets[0].rows[0][1] = value.clone();
+                    let output = inline_grid_frame(&mut app, vec![]);
+                    let position = grid_text_position(&output, value.as_deref().unwrap_or("NULL"));
+                    click_inline_grid(&mut app, position);
+                    click_inline_grid(&mut app, position);
+                    assert!(app.cell_editor.is_some(), "double click must start editing");
+                    inline_grid_frame(&mut app, vec![]);
+                    if expanded {
+                        let output = inline_grid_frame(&mut app, vec![]);
+                        let position = grid_text_position(&output, "展开编辑");
+                        click_inline_grid(&mut app, position);
+                        assert!(app.cell_editor.as_ref().unwrap().expanded);
+                    }
+                    let output = inline_grid_frame(&mut app, vec![]);
+                    let position = if destination == "blank" {
+                        egui::pos2(300.0, 600.0)
+                    } else {
+                        grid_text_position(&output, destination)
+                    };
+                    click_inline_grid(&mut app, position);
+                    assert!(
+                        app.cell_editor.is_none(),
+                        "outside click must finish editing: value={value:?}, expanded={expanded}, destination={destination}",
+                    );
+                    assert!(app.tabs[0].staged_cells.is_empty());
+                    assert_eq!(
+                        app.tabs[0].output.as_ref().unwrap().sets[0].rows[0][1],
+                        value,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_cell_outside_click_stages_input_without_changing_snapshot() {
+        for value in [None, Some("original".to_owned())] {
+            for expanded in [false, true] {
+                let (mut app, _, _) = table_flow_fixture();
+                install_font(&app.context);
+                app.tabs[0].output.as_mut().unwrap().sets[0].rows[0][1] = value.clone();
+                app.cell_editor = grid_cell_editor(&app.tabs[0], 0, 1, true);
+                app.cell_editor.as_mut().unwrap().expanded = expanded;
+                inline_grid_frame(&mut app, vec![]);
+                if value.is_none() {
+                    let output = inline_grid_frame(&mut app, vec![]);
+                    let position = grid_text_position(&output, "NULL");
+                    click_inline_grid(&mut app, position);
+                    assert!(!app.cell_editor.as_ref().unwrap().is_null);
+                }
+                inline_grid_frame(&mut app, vec![egui::Event::Text("changed".into())]);
+                let text = app.cell_editor.as_ref().unwrap().text.clone();
+                assert!(text.contains("changed"));
+                let output = inline_grid_frame(&mut app, vec![]);
+                let position = grid_text_position(&output, "7");
+                click_inline_grid(&mut app, position);
+                assert!(app.cell_editor.is_none());
+                assert_eq!(app.tabs[0].staged_cells.len(), 1);
+                assert_eq!(
+                    app.tabs[0].staged_cells[0].value.as_deref(),
+                    Some(text.as_str()),
+                );
+                assert_eq!(
+                    app.tabs[0].output.as_ref().unwrap().sets[0].rows[0][1],
+                    value,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_cell_toolbar_interactions_keep_editing_active() {
+        for value in [None, Some("original".to_owned())] {
+            let (mut app, _, _) = table_flow_fixture();
+            install_font(&app.context);
+            app.tabs[0].output.as_mut().unwrap().sets[0].rows[0][1] = value;
+            app.cell_editor = grid_cell_editor(&app.tabs[0], 0, 1, true);
+            inline_grid_frame(&mut app, vec![]);
+            for label in ["NULL", "展开编辑", "NULL", "展开编辑"] {
+                let output = inline_grid_frame(&mut app, vec![]);
+                let position = grid_text_position(&output, label);
+                click_inline_grid(&mut app, position);
+                assert!(
+                    app.cell_editor.is_some(),
+                    "clicking {label} must not finish editing",
+                );
+            }
+            assert!(app.tabs[0].staged_cells.is_empty());
+        }
     }
 
     #[test]
@@ -8893,7 +9058,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"{corrupt");
     }
 
-    fn session_test_app() -> App {
+    pub(super) fn session_test_app() -> App {
         let context = egui::Context::default();
         App {
             advanced_worker: sqlshop::advanced_worker::AdvancedWorker::new(context.clone()),
@@ -8909,6 +9074,9 @@ mod tests {
             ),
             store: None,
             profiles: Vec::new(),
+            redis_profiles: Vec::new(),
+            redis_config_error: None,
+            redis_test_worker: None,
             credentials: HashMap::new(),
             selected: None,
             sessions: HashMap::new(),

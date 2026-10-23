@@ -143,7 +143,7 @@ pub fn show(ui: &mut egui::Ui, document: &mut BackupDocument) -> Option<BackupAc
             });
             if document.profile.engine == Engine::SqlServer && document.config.operation == BackupOperation::Restore {
                 ui.add_space(10.0);
-                ui.label("恢复文件映射（可选 MOVE）");
+                ui.label("恢复文件映射（可选 MOVE）").on_hover_text("未映射的文件沿用原位置；请核对备份集序号和逻辑文件名。");
                 let mut remove = None;
                 for (index, mapping) in document.config.file_moves.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
@@ -154,7 +154,6 @@ pub fn show(ui: &mut egui::Ui, document: &mut BackupDocument) -> Option<BackupAc
                 }
                 if let Some(index) = remove { document.config.file_moves.remove(index); }
                 if ui.button("＋ 添加文件映射").clicked() { document.config.file_moves.push(BackupFileMove { logical_name: String::new(), server_path: String::new() }); }
-                ui.small("备份文件可能包含多份备份，请核对备份集序号和逻辑文件名；未映射的文件沿用原位置。");
             } else if document.config.operation == BackupOperation::Create {
                 document.config.file_moves.clear();
             }
@@ -179,7 +178,7 @@ pub fn show(ui: &mut egui::Ui, document: &mut BackupDocument) -> Option<BackupAc
                     Err(error) => { document.error = Some(format!("{error:#}")); document.preview = None; document.preview_fingerprint = None; },
                 }
             }
-            if busy { ui.spinner(); ui.label("执行中，请保留此页面查看服务器或工具返回结果"); }
+            if busy { ui.spinner(); ui.label("执行中…"); }
         });
         if let Some(status) = &document.tool_status { ui.label(status); }
         if let Some(preview) = &document.preview {
@@ -190,8 +189,8 @@ pub fn show(ui: &mut egui::Ui, document: &mut BackupDocument) -> Option<BackupAc
             });
             ui.add_enabled_ui(!busy, |ui| {
                 ui.checkbox(&mut document.confirmed, if document.config.operation == BackupOperation::Restore {
-                    "已核对恢复文件和目标空数据库，并已关闭应用内该数据库的写会话"
-                } else { "已核对备份数据库、文件位置和以上操作" });
+                    "已核对恢复文件、目标空数据库并关闭该库写会话"
+                } else { "已核对备份数据库、文件位置和操作" });
             });
             if ui.add_enabled(!busy && document.confirmed, egui::Button::new(if document.config.operation == BackupOperation::Restore { "执行恢复" } else { "开始备份" })).clicked() {
                 let generation = Uuid::new_v4();

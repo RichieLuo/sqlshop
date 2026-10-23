@@ -17,6 +17,7 @@ pub mod oracle_database;
 pub mod query_control;
 pub mod recovery;
 pub mod recovery_worker;
+pub mod redis_database;
 pub mod security;
 pub mod sql_editor;
 pub mod ssh;

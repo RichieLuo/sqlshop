@@ -186,7 +186,6 @@ pub fn show(
     let mut action = None;
     ui.push_id(document.id, |ui| {
         ui.heading("表数据与结构比较");
-        ui.small("完整扫描上限为每侧 1000 行。同步只更新可写差异与新增源独有行，保留目标独有行；结构只提供逐项新增普通字段/索引，DDL 文本只读。");
         let before = (document.source.fingerprint(),document.target.fingerprint());
         let busy = document.pending.is_some();
         ui.add_enabled_ui(!busy, |ui| {
@@ -199,7 +198,7 @@ pub fn show(
             document.report = None; document.confirmed = false; document.error = None; document.status.clear();
         }
         ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new("开始比较")).clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("开始比较")).on_hover_text("每侧最多扫描 1000 行。").clicked() {
                 let generation = Uuid::new_v4(); document.pending = Some(generation); document.error = None; document.report = None; document.confirmed = false;
                 action = Some(CompareAction::Compare { generation, source:document.source.clone(),target:document.target.clone() });
             }
@@ -217,7 +216,7 @@ pub fn show(
         match document.section {
             Section::Data => {
                 if report.data_differences.is_empty() {
-                    ui.label(if report.blockers.is_empty() { "完整范围内未发现数据差异。" } else { "未产生可完整核对的数据差异列表，请阅读以上限制。" });
+                    ui.label(if report.blockers.is_empty() { "未发现数据差异。" } else { "数据核对不完整。" });
                 }
                 egui::ScrollArea::vertical().id_salt("data_differences").max_height(ui.available_height().max(100.0)).show_rows(ui,64.0,report.data_differences.len(),|ui,range| {
                     for difference in &report.data_differences[range] {
@@ -233,7 +232,6 @@ pub fn show(
                 });
             },
             Section::Structure => {
-                ui.label("可逐项新增源侧普通可空字段与单列索引；不自动删除、改类型、复制主键或唯一/外键约束。");
                 ui.add_enabled_ui(!busy,|ui| {
                     for (index,candidate) in report.structure_candidates().iter().enumerate() {
                         if ui.selectable_label(document.selected_structure==Some(index),&candidate.label).clicked() {
@@ -245,8 +243,8 @@ pub fn show(
                     if let Some(reason)=&candidate.reason {ui.colored_label(ui.visuals().warn_fg_color,reason);}
                     if let Some(sql)=candidate.preview_sql() {
                         ui.monospace(sql);
-                        ui.add_enabled_ui(!busy,|ui|{ui.checkbox(&mut document.structure_confirmed,"已核对目标表和此条新增 SQL，同意执行此结构操作");});
-                        if ui.add_enabled(!busy&&candidate.supported()&&document.structure_confirmed,egui::Button::new("应用此结构操作")).clicked() {
+                        ui.add_enabled_ui(!busy,|ui|{ui.checkbox(&mut document.structure_confirmed,"确认向目标表应用此条新增 SQL");});
+                        if ui.add_enabled(!busy&&candidate.supported()&&document.structure_confirmed,egui::Button::new("应用此结构操作")).on_hover_text("仅新增普通可空字段或单列索引。").clicked() {
                             let generation=Uuid::new_v4(); document.pending=Some(generation); document.structure_confirmed=false;
                             action=Some(CompareAction::ApplyStructure {generation,report:report.clone(),candidate:index});
                         }
@@ -261,21 +259,20 @@ pub fn show(
                             ui.monospace(format!("目标：{}",difference.target.as_deref().unwrap_or("不存在")));
                         });
                     }
-                    if report.structure_differences.is_empty() { ui.label("字段、索引和外键目录未发现差异。DDL 可在旁边页查看。"); }
+                    if report.structure_differences.is_empty() { ui.label("未发现结构差异。"); }
                 });
             },
             Section::SourceDdl | Section::TargetDdl => {
                 let ddl = if document.section == Section::SourceDdl { &report.source.structure.ddl } else { &report.target.structure.ddl };
-                ui.label("只读定义；本流程不自动应用结构 DDL。");
-                if ui.button("复制 DDL").clicked() { ui.ctx().copy_text(ddl.clone()); }
+                if ui.button("复制 DDL").on_hover_text("只读定义，不自动应用 DDL。").clicked() { ui.ctx().copy_text(ddl.clone()); }
                 egui::ScrollArea::both().id_salt("compare_ddl").show(ui,|ui| { ui.monospace(ddl); });
             },
             Section::Sync => {
-                ui.label(format!("更新 {} 个可写单元格，新增 {} 行；应用前重新读取完整目标与元数据，发现变化即拒绝。",report.update_count(),report.insert_count()));
+                ui.label(format!("更新 {} 个单元格，新增 {} 行；保留目标独有行。",report.update_count(),report.insert_count()));
                 let preview = report.sync_preview();
                 if ui.button("复制操作预览").clicked() { ui.ctx().copy_text(preview.clone()); }
-                ui.add_enabled_ui(!busy && report.can_apply(),|ui| { ui.checkbox(&mut document.confirmed,"已核对来源、目标和具体修改；同意按此预览提交一个事务"); });
-                if ui.add_enabled(!busy && report.can_apply() && document.confirmed,egui::Button::new("应用数据同步")).clicked() {
+                ui.add_enabled_ui(!busy && report.can_apply(),|ui| { ui.checkbox(&mut document.confirmed,"已核对来源、目标与修改，确认提交同步事务"); });
+                if ui.add_enabled(!busy && report.can_apply() && document.confirmed,egui::Button::new("应用数据同步")).on_hover_text("应用前重读目标与元数据；发现变化时拒绝同步。").clicked() {
                     let generation = Uuid::new_v4(); document.pending = Some(generation); document.confirmed = false;
                     action = Some(CompareAction::Apply { generation,report:report.clone() });
                 }
@@ -304,7 +301,7 @@ pub fn show_er(ui: &mut egui::Ui, table: &Table, structure: &TableStructure) {
         relations.len()
     ));
     if relations.is_empty() {
-        ui.label("目录未返回此表的外键关系。");
+        ui.label("暂无外键关系。");
         return;
     }
     egui::ScrollArea::both()

@@ -25,6 +25,33 @@ fn preview_quotes_each_dialect_and_never_interpolates_identifiers_raw() {
 }
 
 #[test]
+fn new_profiles_start_without_tls() {
+    let profile = Profile::default();
+    assert!(!profile.tls);
+    assert!(!profile.trust_certificate);
+    assert!(profile.validate().is_ok());
+}
+
+#[test]
+fn persisted_profiles_preserve_tls_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store {
+        directory: directory.path().into(),
+    };
+    for (tls, trust_certificate) in [(false, false), (true, false), (true, true)] {
+        let profile = Profile {
+            tls,
+            trust_certificate,
+            ..Profile::default()
+        };
+        store.save(std::slice::from_ref(&profile)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].tls, tls);
+        assert_eq!(loaded[0].trust_certificate, trust_certificate);
+    }
+}
+
+#[test]
 fn persisted_profiles_round_trip_without_password_fields() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store {
@@ -385,7 +412,10 @@ fn private_key_paths_allow_extensionless_files_and_report_invalid_selections() {
 #[test]
 fn database_certificate_errors_explain_the_correct_connection_settings() {
     use sqlshop::db::connection_error;
-    let mut profile = Profile::default();
+    let mut profile = Profile {
+        tls: true,
+        ..Profile::default()
+    };
     let issuer = connection_error(
         &profile,
         anyhow::anyhow!(
