@@ -75,6 +75,7 @@ pub(super) fn show(ui: &mut egui::Ui, doc: &mut LocalDocument) {
     ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(doc.pending.is_none(), egui::Button::new("▶ 运行一条语句"))
+            .on_hover_text("一次执行一条语句，最多显示 1000 行。")
             .clicked()
         {
             doc.run();
@@ -125,7 +126,6 @@ pub(super) fn show(ui: &mut egui::Ui, doc: &mut LocalDocument) {
             doc.confirmed_sql = confirmed.then(|| doc.sql.clone());
         }
     });
-    ui.small("每个文档保留独立 SQLite 连接。一次执行一条语句，最多显示 1000 行；不加载扩展，不解密 SQLCipher。");
     if doc.pending.is_some() {
         ui.spinner();
     }

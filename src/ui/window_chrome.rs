@@ -2,9 +2,21 @@ use eframe::egui;
 #[cfg(target_os = "windows")]
 use eframe::egui::Color32;
 
-pub(super) const TITLE_HEIGHT: f32 = 44.0;
+pub(super) const TITLE_HEIGHT: f32 = if cfg!(target_os = "windows") {
+    34.0
+} else {
+    44.0
+};
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const CONTROL_WIDTH: f32 = 46.0;
+
+pub(super) fn title_fill(ctx: &egui::Context) -> egui::Color32 {
+    if cfg!(target_os = "windows") && !ctx.style().visuals.dark_mode {
+        egui::Color32::from_gray(238)
+    } else {
+        super::chrome(ctx)
+    }
+}
 
 pub(super) const fn leading_inset() -> f32 {
     if cfg!(target_os = "macos") { 78.0 } else { 0.0 }
@@ -141,12 +153,12 @@ pub(super) fn paint_border(ctx: &egui::Context) {
     {
         let dark = ctx.style().visuals.dark_mode;
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
-        let color = match (dark, focused) {
-            (false, true) => Color32::from_rgb(110, 145, 143),
-            (false, false) => Color32::from_rgb(155, 165, 170),
-            (true, true) => Color32::from_rgb(100, 155, 150),
-            (true, false) => Color32::from_rgb(95, 105, 115),
-        };
+        let color = Color32::from_gray(match (dark, focused) {
+            (false, true) => 187,
+            (false, false) => 211,
+            (true, true) => 68,
+            (true, false) => 57,
+        });
         let rounded = ctx.data(|data| {
             data.get_temp::<bool>(egui::Id::new("native-window-rounded"))
                 .unwrap_or(false)
@@ -164,7 +176,7 @@ pub(super) fn paint_border(ctx: &egui::Context) {
         .rect_stroke(
             ctx.viewport_rect(),
             radius,
-            egui::Stroke::new(1.5, color),
+            egui::Stroke::new(1.0 / ctx.pixels_per_point(), color),
             egui::StrokeKind::Inside,
         );
     }
@@ -227,67 +239,97 @@ fn control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Response {
             },
         )
     });
-    let highlighted = response.hovered() || response.is_pointer_button_down_on();
+    let pressed = response.is_pointer_button_down_on();
+    let highlighted = response.hovered() || pressed;
     let close = matches!(control, WindowControl::Close);
-    let visuals = ui.style().interact(&response);
+    let dark = ui.visuals().dark_mode;
     if highlighted {
-        let fill = if close {
-            Color32::from_rgb(196, 43, 56)
-        } else {
-            visuals.weak_bg_fill
+        let fill = match (close, pressed, dark) {
+            (true, false, _) => Color32::from_rgb(196, 43, 28),
+            (true, true, _) => Color32::from_rgb(172, 38, 25),
+            (false, false, false) => Color32::from_black_alpha(16),
+            (false, true, false) => Color32::from_black_alpha(28),
+            (false, false, true) => Color32::from_white_alpha(24),
+            (false, true, true) => Color32::from_white_alpha(36),
         };
         ui.painter().rect_filled(rect, 0, fill);
     }
     let focused = ui.input(|input| input.viewport().focused.unwrap_or(true));
     let color = if close && highlighted {
         Color32::WHITE
-    } else if focused {
-        ui.visuals().text_color()
     } else {
-        ui.visuals().weak_text_color()
+        Color32::from_gray(match (dark, focused) {
+            (false, true) => 32,
+            (false, false) => 128,
+            (true, true) => 232,
+            (true, false) => 144,
+        })
     };
-    let stroke = egui::Stroke::new(1.2, color);
-    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 10.0));
+    paint_control_icon(ui.painter(), rect, control, color);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(2.0),
+            0,
+            egui::Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn paint_control_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    control: WindowControl,
+    color: Color32,
+) {
+    let scale = painter.pixels_per_point();
+    let stroke_pixels = scale.round().max(1.0);
+    let stroke = egui::Stroke::new(stroke_pixels / scale, color);
+    // Snap the stroke edges, not just the icon's center, to physical pixels.
+    let snap =
+        |value: f32| ((value * scale - stroke_pixels / 2.0).round() + stroke_pixels / 2.0) / scale;
+    let icon = egui::Rect::from_min_max(
+        egui::pos2(snap(rect.center().x - 4.5), snap(rect.center().y - 4.5)),
+        egui::pos2(snap(rect.center().x + 4.5), snap(rect.center().y + 4.5)),
+    );
     match control {
         WindowControl::Minimize => {
-            ui.painter().line_segment(
+            painter.line_segment(
                 [
-                    egui::pos2(icon.left(), rect.center().y),
-                    egui::pos2(icon.right(), rect.center().y),
+                    egui::pos2(icon.left(), snap(rect.center().y)),
+                    egui::pos2(icon.right(), snap(rect.center().y)),
                 ],
                 stroke,
             );
         }
         WindowControl::Maximize { maximized: false } => {
-            ui.painter()
-                .rect_stroke(icon, 0, stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(icon, 0, stroke, egui::StrokeKind::Middle);
         }
         WindowControl::Maximize { maximized: true } => {
-            let front = icon.translate(egui::vec2(-1.0, 1.0)).shrink(1.0);
-            let back = front.translate(egui::vec2(3.0, -3.0));
-            ui.painter()
-                .line_segment([back.left_top(), back.right_top()], stroke);
-            ui.painter()
-                .line_segment([back.right_top(), back.right_bottom()], stroke);
-            ui.painter()
-                .line_segment([back.left_top(), front.left_top()], stroke);
-            ui.painter()
-                .line_segment([back.right_bottom(), front.right_bottom()], stroke);
-            ui.painter()
-                .rect_stroke(front, 0, stroke, egui::StrokeKind::Inside);
+            let offset = (2.0 * scale).round() / scale;
+            let front = egui::Rect::from_min_max(
+                icon.left_top() + egui::vec2(0.0, offset),
+                icon.right_bottom() - egui::vec2(offset, 0.0),
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    front.left_top() + egui::vec2(offset, 0.0),
+                    icon.left_top() + egui::vec2(offset, 0.0),
+                    icon.right_top(),
+                    icon.right_bottom() - egui::vec2(0.0, offset),
+                    front.right_bottom() - egui::vec2(0.0, offset),
+                ],
+                stroke,
+            ));
+            painter.rect_stroke(front, 0, stroke, egui::StrokeKind::Middle);
         }
         WindowControl::Close => {
-            ui.painter()
-                .line_segment([icon.left_top(), icon.right_bottom()], stroke);
-            ui.painter()
-                .line_segment([icon.right_top(), icon.left_bottom()], stroke);
+            painter.line_segment([icon.left_top(), icon.right_bottom()], stroke);
+            painter.line_segment([icon.right_top(), icon.left_bottom()], stroke);
         }
     }
-    if response.has_focus() {
-        ui.painter()
-            .rect_stroke(rect.shrink(2.0), 0, stroke, egui::StrokeKind::Inside);
-    }
-    response
 }
 
 pub(super) fn drag_area(ui: &mut egui::Ui) {
@@ -311,13 +353,22 @@ pub(super) fn drag_response(response: &egui::Response) {
 mod tests {
     use super::*;
 
-    fn render(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+    fn render(ctx: &egui::Context, events: Vec<egui::Event>, maximized: bool) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(900.0, 600.0),
                 )),
+                viewports: [(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo {
+                        maximized: Some(maximized),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
                 events,
                 ..Default::default()
             },
@@ -335,40 +386,73 @@ mod tests {
 
     #[test]
     fn caption_buttons_send_commands_from_the_top_right_edge() {
-        for (offset, expected) in [
-            (0.5, egui::ViewportCommand::Close),
-            (1.5, egui::ViewportCommand::Maximized(true)),
-            (2.5, egui::ViewportCommand::Minimized(true)),
+        for (maximized, offset, expected) in [
+            (false, 0.5, egui::ViewportCommand::Close),
+            (false, 1.5, egui::ViewportCommand::Maximized(true)),
+            (true, 1.5, egui::ViewportCommand::Maximized(false)),
+            (false, 2.5, egui::ViewportCommand::Minimized(true)),
         ] {
-            let ctx = egui::Context::default();
-            let _ = render(&ctx, vec![]);
-            let pos = egui::pos2(900.0 - CONTROL_WIDTH * offset, 2.0);
-            let _ = render(
-                &ctx,
-                vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
+            for y in [0.5, TITLE_HEIGHT - 0.5] {
+                let ctx = egui::Context::default();
+                let _ = render(&ctx, vec![], maximized);
+                let pos = egui::pos2(900.0 - CONTROL_WIDTH * offset, y);
+                let _ = render(
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    maximized,
+                );
+                let output = render(
+                    &ctx,
+                    vec![egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
-                        pressed: true,
+                        pressed: false,
                         modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-            );
-            let output = render(
-                &ctx,
-                vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-            );
-            assert!(
-                output.viewport_output[&egui::ViewportId::ROOT]
-                    .commands
-                    .contains(&expected)
-            );
+                    }],
+                    maximized,
+                );
+                assert!(
+                    output.viewport_output[&egui::ViewportId::ROOT]
+                        .commands
+                        .contains(&expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_icon_uses_pixel_aligned_right_angles_at_common_scales() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            let _ = render(&ctx, vec![], true);
+            ctx.set_pixels_per_point(scale);
+            let output = render(&ctx, vec![], true);
+            let back = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Path(path) if !path.closed && path.points.len() == 5 => Some(path),
+                    _ => None,
+                })
+                .expect("restore icon back window");
+            for segment in back.points.windows(2) {
+                assert!(segment[0].x == segment[1].x || segment[0].y == segment[1].y);
+            }
+            let half_stroke = back.stroke.width * scale / 2.0;
+            for point in &back.points {
+                for value in [point.x, point.y] {
+                    let edge = value * scale - half_stroke;
+                    assert!((edge - edge.round()).abs() < 0.001);
+                }
+            }
         }
     }
 }

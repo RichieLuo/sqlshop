@@ -40,6 +40,7 @@ impl QueryTab {
     pub(super) fn management_document(&self) -> bool {
         self.advanced.is_some()
             || self.oracle.is_some()
+            || self.redis.is_some()
             || self.backup.is_some()
             || self.local_database.is_some()
             || self.jobs.is_some()
@@ -120,7 +121,11 @@ impl App {
         Some(AdvancedSource::new(profile, target))
     }
 
-    fn management_tab(&mut self, name: String, target: Option<QueryTarget>) -> Option<Uuid> {
+    pub(super) fn management_tab(
+        &mut self,
+        name: String,
+        target: Option<QueryTarget>,
+    ) -> Option<Uuid> {
         if !self.apply_ui_tab_action(TabAction::New) {
             return None;
         }
@@ -529,6 +534,9 @@ impl App {
     }
 
     pub(super) fn poll_management(&mut self) {
+        for doc in self.tabs.iter_mut().filter_map(|tab| tab.redis.as_mut()) {
+            doc.poll();
+        }
         for doc in self.tabs.iter_mut().filter_map(|tab| tab.oracle.as_mut()) {
             doc.poll();
         }
@@ -630,6 +638,10 @@ impl App {
 
     pub(super) fn management_workspace(&mut self, ui: &mut egui::Ui) {
         let index = self.active_tab;
+        if let Some(doc) = self.tabs[index].redis.as_mut() {
+            doc.show(ui);
+            return;
+        }
         if let Some(doc) = self.tabs[index].oracle.as_mut() {
             doc.show(ui);
             return;
@@ -676,6 +688,7 @@ impl App {
                 | "transaction"
                 | "stopped"
                 | "oracle"
+                | "redis"
                 | "sqlite"
         ) {
             return;
@@ -707,6 +720,18 @@ impl App {
         self.status = "离线布局示例 · 没有建立连接或执行数据库操作".into();
         let source = AdvancedSource::new(profile.clone(), target.clone());
         match mode.as_str() {
+            "redis" => {
+                let document = redis_ui::RedisDocument::fixture(&self.context);
+                let profile = document.bound_profile().clone();
+                self.selected = Some(profile.id);
+                self.redis_profiles = vec![profile.clone()];
+                self.expand_connection = Some(profile.id);
+                self.tabs[0].redis = Some(document);
+                self.tabs[0].target = None;
+                self.tabs[0].name = profile.name;
+                self.tabs[0].sql.clear();
+                self.tabs[0].saved_sql.clear();
+            }
             "oracle" => {
                 self.tabs[0].oracle = Some(oracle_database_ui::OracleDocument::new(&self.context));
                 self.tabs[0].name = "Oracle 查询".into();
@@ -878,8 +903,8 @@ impl App {
         let doc = self.tabs[self.active_tab].jobs.as_mut().unwrap();
         let mut save = None;
         let mut delete = None;
-        ui.heading("SQL 任务调度");
-        ui.label("应用打开时按计划运行。失败或中断会暂停，错过的计划不补跑。SQL 以明文保存在本机，凭据只在运行时读取。");
+        ui.heading("SQL 任务调度")
+            .on_hover_text("仅在应用运行时调度；失败或中断后暂停，错过不补跑。SQL 明文保存在本机。");
         if self.job_scheduler.is_none() {
             ui.colored_label(ui.visuals().warn_fg_color, "任务存储不可用，计划未启动");
         }

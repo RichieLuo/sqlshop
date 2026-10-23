@@ -645,7 +645,6 @@ impl App {
                         if (ui.add_enabled(editable && preview.is_some(), egui::Button::new("预览修改 SQL")).on_hover_text("⌘ / Ctrl + S：生成 SQL 预览，确认后执行").clicked() || save_shortcut) && preview.is_some() { doc.pending = preview; }
                         if ui.add_enabled(!busy, egui::Button::new("取消编辑")).clicked() { doc.reset_draft(); }
                     });
-                    ui.label(RichText::new(if editing_existing { "支持普通字段的安全扩大及可空设置；依赖、生成列和复杂属性按能力限制，原默认值不会静默删除。" } else { "当前支持可空无默认值的新字段、单字段普通索引；完整改列及约束编辑待补。" }).small().weak());
                 });
             }
             ui.separator();
@@ -661,7 +660,7 @@ impl App {
                     DesignSection::Relations => { super::compare_ui::show_er(ui, &table, structure); }
                     DesignSection::Ddl => { egui::ScrollArea::both().id_salt("design-ddl").auto_shrink([false, false]).show(ui, |ui| { ui.add(egui::Label::new(RichText::new(&structure.ddl).monospace()).selectable(true)); }); }
                 }
-            } else { ui.label(if busy { "正在读取表结构…" } else { "暂无表结构，连接对应数据库后点击刷新结构。" }); }
+            } else { ui.label(if busy { "正在读取表结构…" } else { "尚未读取表结构" }); }
         });
         if refresh {
             self.load_structure(index);

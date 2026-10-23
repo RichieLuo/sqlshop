@@ -21,6 +21,7 @@ pub(super) struct NavigationState {
     pending_open: Option<(egui::Id, bool)>,
     pending_activation: Option<TreeNode>,
     last_filter: String,
+    initialized_connections: std::collections::HashSet<egui::Id>,
 }
 
 impl NavigationState {
@@ -202,6 +203,12 @@ pub(super) fn branch<'ui>(
 ) -> Branch<'ui> {
     let context = ui.ctx().clone();
     let mut state = CollapsingState::load_with_default_open(&context, id, default_open);
+    // Connection expansion is session-local, even when egui restores old panel state.
+    if matches!(&node, TreeNode::Connection(_))
+        && selection.navigator.initialized_connections.insert(id)
+    {
+        state.set_open(false);
+    }
     let was_open = state.is_open();
     if let Some(open) = force_open {
         state.set_open(open);
@@ -321,6 +328,83 @@ fn take_activation(selection: &mut TreeSelection, node: &TreeNode) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn draw(
+        context: &egui::Context,
+        selection: &mut TreeSelection,
+        node: TreeNode,
+        id: egui::Id,
+        force_open: Option<bool>,
+    ) -> bool {
+        let mut open = false;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let row = branch(
+                    ui,
+                    selection,
+                    node.clone(),
+                    id,
+                    "连接".into(),
+                    false,
+                    force_open,
+                    true,
+                );
+                open = row.is_open();
+                row.body(|ui| {
+                    ui.label("数据库");
+                });
+            });
+        });
+        open
+    }
+
+    #[test]
+    fn restored_connections_start_collapsed_and_preserve_explicit_expansion_in_session() {
+        for engine in ["mysql", "postgres", "sqlserver", "redis"] {
+            let context = egui::Context::default();
+            let node = TreeNode::Connection(Uuid::new_v4());
+            let id = egui::Id::new((engine, "restored-connection"));
+            CollapsingState::load_with_default_open(&context, id, true).store(&context);
+            let mut selection = TreeSelection::default();
+            assert!(!draw(&context, &mut selection, node.clone(), id, None));
+            assert!(draw(&context, &mut selection, node.clone(), id, Some(true)));
+            assert!(draw(&context, &mut selection, node.clone(), id, None));
+            assert!(!draw(
+                &context,
+                &mut selection,
+                node.clone(),
+                id,
+                Some(false)
+            ));
+            assert!(!draw(&context, &mut selection, node.clone(), id, None));
+            assert!(draw(&context, &mut selection, node.clone(), id, Some(true)));
+            let mut restarted = TreeSelection::default();
+            assert!(!draw(&context, &mut restarted, node, id, None));
+        }
+    }
+
+    #[test]
+    fn groups_and_explicit_reveal_are_not_collapsed_by_connection_defaults() {
+        let context = egui::Context::default();
+        let mut selection = TreeSelection::default();
+        let group = TreeNode::Group(None);
+        let id = egui::Id::new("restored-group");
+        CollapsingState::load_with_default_open(&context, id, true).store(&context);
+        assert!(draw(&context, &mut selection, group, id, None));
+        assert!(draw(
+            &context,
+            &mut selection,
+            TreeNode::Connection(Uuid::new_v4()),
+            egui::Id::new("revealed-connection"),
+            Some(true)
+        ));
     }
 }
 

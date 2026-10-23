@@ -72,6 +72,11 @@ pub(super) fn show(ui: &mut egui::Ui, doc: &mut AdvancedDocument) -> Option<Adva
                                 "刷新"
                             }),
                         )
+                        .on_hover_text(if doc.kind == AdvancedKind::Plan {
+                            "单个 SELECT / 只读 WITH；估算计划，不启用 ANALYZE。"
+                        } else {
+                            "读取最新快照。"
+                        })
                         .clicked()
                     {
                         action = Some(AdvancedAction::Run(doc.refresh_operation()));
@@ -121,7 +126,7 @@ pub(super) fn show(ui: &mut egui::Ui, doc: &mut AdvancedDocument) -> Option<Adva
                     let height = ui.available_height().max(140.);
                     show_output(ui, doc.id, &mut doc.result_index, output, height);
                 } else {
-                    ui.label(RichText::new("点击刷新，读取当前数据库的服务器诊断快照。").weak());
+                    ui.label(RichText::new("暂无诊断快照。").weak());
                 }
             }
             AdvancedKind::Security => show_security(ui, doc, &mut action),
@@ -131,11 +136,6 @@ pub(super) fn show(ui: &mut egui::Ui, doc: &mut AdvancedDocument) -> Option<Adva
 }
 
 fn show_plan(ui: &mut egui::Ui, doc: &mut AdvancedDocument) {
-    ui.label(
-        RichText::new("单个 SELECT / 只读 WITH · 估算计划 · 不启用 ANALYZE")
-            .small()
-            .weak(),
-    );
     ui.add_enabled(
         !doc.busy,
         egui::TextEdit::multiline(&mut doc.sql)
@@ -152,7 +152,7 @@ fn show_plan(ui: &mut egui::Ui, doc: &mut AdvancedDocument) {
         );
     }
     let Some(output) = &doc.output else {
-        ui.label(RichText::new("输入查询后点击“解释查询”。").weak());
+        ui.label(RichText::new("暂无执行计划。").weak());
         return;
     };
     let raw = output
@@ -264,7 +264,7 @@ fn show_security(
     action: &mut Option<AdvancedAction>,
 ) {
     let Some(catalog) = doc.catalog.as_ref() else {
-        ui.label(RichText::new("点击刷新，读取账号、数据库角色及当前账号可见的权限。").weak());
+        ui.label(RichText::new("暂无账号与权限快照。").weak());
         return;
     };
     let principals = catalog.principals.clone();
@@ -298,7 +298,7 @@ fn show_security(
                     ui.horizontal_wrapped(|ui| {ui.colored_label(accent(ui),RichText::new(principal.display_name()).strong());ui.label(principal.kind.label());if let Some(state)=principal_state(doc.source.profile.engine,&principal) {ui.label(RichText::new(state).weak());}
                         if let Some(schema)=&principal.default_schema {ui.label(format!("默认 Schema：{schema}"));}});
                     if ui.add_enabled(!doc.busy,egui::Button::new("读取最新授权")).clicked() {*action=Some(AdvancedAction::Run(AdvancedOperation::LoadGrants(principal)));}
-                } else {ui.label(RichText::new("选择左侧账号查看授权；可在下方创建角色。").weak());}
+                } else {ui.label(RichText::new("未选择账号。").weak());}
                 egui::CollapsingHeader::new("角色与权限操作").id_salt("security-edit").default_open(false).show(ui,|ui|show_security_form(ui,doc,&principals));
                 egui::CollapsingHeader::new("账号与登录管理").id_salt("account-edit").default_open(false).show(ui,|ui|show_account_form(ui,doc,&principals));
                 if let Some(preview)=doc.account_preview.take() {
@@ -306,9 +306,11 @@ fn show_security(
                     egui::Frame::group(ui.style()).inner_margin(8).show(ui,|ui| {
                         ui.strong("确认账号修改");
                         ui.label(format!("目标：{} / {}",preview.source.profile.name,preview.source.target.database.as_deref().unwrap_or("未选择数据库")));
-                        ui.label(RichText::new(if matches!(preview.change,AccountChange::CreateDatabaseUser{..}) {"数据库用户映射仅作用于当前数据库。"} else {"账号与登录状态作用于服务器或集群；密码已从 SQL 预览中遮盖。"}).small().weak());
+                        if matches!(preview.change,AccountChange::CreateDatabaseUser{..}) {ui.label("仅修改当前数据库用户映射。");}
                         egui::ScrollArea::both().id_salt("account-preview").max_height(110.).show(ui,|ui|{ui.add(egui::Label::new(RichText::new(&preview.sql).monospace()).selectable(true));});
-                        if matches!(preview.change,AccountChange::DropUser{..}) {ui.label(RichText::new("删除账号或数据库用户会影响其授权；数据库依赖与所有权由服务器核实。").small().weak());}
+                        if matches!(preview.change,AccountChange::DropUser{..}) {ui.label(RichText::new("删除此用户及其授权。").small().weak());}
+                        if matches!(preview.change,AccountChange::ChangePassword{..}) {ui.label("修改密码后需更新保存的连接凭据。");}
+                        if matches!(preview.change,AccountChange::SetLogin{..}) {ui.label("登录状态影响后续连接。");}
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!doc.busy&&!doc.outcome_unknown,egui::Button::new("确认执行账号修改")).clicked() {
                                 confirm=true;
@@ -325,7 +327,7 @@ fn show_security(
                     egui::Frame::group(ui.style()).inner_margin(8).show(ui,|ui| {
                         ui.strong("确认权限修改");ui.label(format!("目标：{} / {}",doc.source.profile.name,doc.source.target.database.as_deref().unwrap_or("未选择数据库")));
                         egui::ScrollArea::both().id_salt("security-preview").max_height(110.).show(ui,|ui| {ui.add(egui::Label::new(RichText::new(&preview.sql).monospace()).selectable(true));});
-                        if matches!(preview.change,SecurityChange::DropRole{..}) {ui.label(RichText::new(if doc.source.profile.engine==Engine::MySql {"删除角色会删除该 User@Host 账号及其授权和角色关系。"} else {"删除角色遵循数据库依赖与所有权规则；请核对角色名称。"}).small().weak());}
+                        if matches!(preview.change,SecurityChange::DropRole{..}) {ui.label(RichText::new(if doc.source.profile.engine==Engine::MySql {"删除此 User@Host 及其授权和角色关系。"} else {"删除此角色；服务器将检查依赖与所有权。"}).small().weak());}
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!doc.busy&&!doc.outcome_unknown,egui::Button::new("确认执行权限修改")).clicked() {*action=Some(AdvancedAction::Run(AdvancedOperation::ApplySecurity{change:preview.change.clone(),preview_sql:preview.sql.clone()}));}
                             if ui.add_enabled(!doc.busy,egui::Button::new("返回编辑")).clicked() {doc.preview=None;}
@@ -334,7 +336,7 @@ fn show_security(
                     });
                 }
                 ui.separator();
-                if let Some(output)=&doc.output {show_output(ui,doc.id,&mut doc.result_index,output,260.);} else if !doc.busy {ui.label(RichText::new("暂无授权快照。直接授权与成员关系不等于全部有效权限。").weak());}
+                if let Some(output)=&doc.output {show_output(ui,doc.id,&mut doc.result_index,output,260.);} else if !doc.busy {ui.label(RichText::new("暂无授权快照。").weak());}
             });
         });
     });
@@ -374,7 +376,8 @@ fn show_security_form(
                 0 => {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("角色名称");
-                        ui.add(egui::TextEdit::singleline(&mut doc.role_name).desired_width(180.));
+                        let name = ui.add(egui::TextEdit::singleline(&mut doc.role_name).desired_width(180.));
+                        if engine == Engine::MySql {name.on_hover_text("新角色使用 Host %，不创建登录凭据。");}
                         if ui.button("预览创建").clicked() {
                             let change = SecurityChange::CreateRole {
                                 name: doc.role_name.clone(),
@@ -382,13 +385,6 @@ fn show_security_form(
                             preview_change(doc, change);
                         }
                     });
-                    if engine == Engine::MySql {
-                        ui.label(
-                            RichText::new("新角色使用 Host %；不创建密码或登录凭据。")
-                                .small()
-                                .weak(),
-                        );
-                    }
                 }
                 1 => {
                     principal_choice(ui, "删除角色", "role-drop", &mut doc.role, &roles);
@@ -552,7 +548,6 @@ fn show_account_form(
                 if engine==Engine::SqlServer && !supported {ui.label("请选择 SQL Server 的 SQL 登录；Windows/Entra 密码由认证提供方管理。");}
                 password_fields(ui,doc,engine==Engine::SqlServer);
                 preview=ui.add_enabled(supported,egui::Button::new("预览修改密码")).clicked();
-                ui.label(RichText::new("密码修改后，保存的连接凭据需要手动更新。").small().weak());
             }
             2=>{
                 let supported=selected.as_ref().is_some_and(|principal|engine!=Engine::SqlServer || principal.kind==PrincipalKind::Login);
@@ -560,12 +555,10 @@ fn show_account_form(
                     if ui.add_enabled(supported,egui::Button::new(if engine==Engine::MySql{"预览解除登录锁定"}else{"预览允许登录"})).clicked() && let Some(principal)=selected.clone() {preview_account(doc,AccountChange::SetLogin{principal,enabled:true});}
                     if ui.add_enabled(supported,egui::Button::new(if engine==Engine::MySql{"预览锁定登录"}else{"预览禁止登录"})).clicked() && let Some(principal)=selected.clone() {preview_account(doc,AccountChange::SetLogin{principal,enabled:false});}
                 });
-                ui.label(RichText::new("登录状态影响后续连接；角色成员关系与登录锁定分别管理。").small().weak());
             }
             3=>{
                 let supported=selected.as_ref().is_some_and(|principal|engine!=Engine::SqlServer || principal.kind==PrincipalKind::User);
-                if engine==Engine::SqlServer {ui.label(RichText::new("此操作删除当前数据库 USER；服务器 LOGIN 删除暂不支持。").small().weak());}
-                if ui.add_enabled(supported,egui::Button::new("预览删除账号或用户")).clicked() && let Some(principal)=selected.clone() {preview_account(doc,AccountChange::DropUser{principal});}
+                if ui.add_enabled(supported,egui::Button::new("预览删除账号或用户")).on_hover_text(if engine==Engine::SqlServer {"仅删除当前数据库 USER，不删除服务器 LOGIN。"} else {"预览删除所选用户及其授权。"}).clicked() && let Some(principal)=selected.clone() {preview_account(doc,AccountChange::DropUser{principal});}
             }
             _=>{
                 ui.horizontal_wrapped(|ui|{ui.label("数据库用户名");ui.add(egui::TextEdit::singleline(&mut doc.account_name).desired_width(170.));});
@@ -588,7 +581,6 @@ fn show_account_form(
             }else{doc.error=Some("请选择目标账号。".into());clear_account_passwords(doc);return;};
             preview_account(doc,change);
         }
-        ui.label(RichText::new("基础账号流程支持密码和登录状态；高级认证插件、DENY 与 GRANT OPTION 仍需独立管理。").small().weak());
     });
 }
 

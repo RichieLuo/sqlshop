@@ -768,12 +768,7 @@ pub(super) fn object_browser(
         ui.vertical_centered(|ui| {
             ui.add_space(60.0);
             ui.heading("数据库对象");
-            ui.label(RichText::new("在导航栏选择连接、数据库或 Schema").weak());
-            ui.label(
-                RichText::new("查看表、视图、函数、过程及其他数据库对象")
-                    .small()
-                    .weak(),
-            );
+            ui.label(RichText::new("选择连接、数据库或 Schema").weak());
         });
         return None;
     };
@@ -895,7 +890,6 @@ pub(super) fn object_browser(
     if !data.connected {
         ui.add_space(22.0);
         ui.label(RichText::new("连接尚未打开").strong());
-        ui.label(RichText::new("连接后读取数据库目录").weak());
         if ui
             .add_enabled(!data.busy, egui::Button::new("连接服务器"))
             .clicked()
@@ -907,9 +901,9 @@ pub(super) fn object_browser(
     if !databases && scope.database.as_deref() != data.active_database {
         ui.add_space(22.0);
         ui.label(RichText::new("此数据库尚未选为当前数据库").strong());
-        ui.label(RichText::new("选择数据库后读取其对象目录；已有文档保持各自的执行目标。").weak());
         if ui
             .add_enabled(!data.busy, egui::Button::new("选择数据库"))
+            .on_hover_text("读取对象目录；已有文档保持各自的执行目标")
             .clicked()
         {
             action = Some(BrowserAction::SelectDatabase {
@@ -981,9 +975,6 @@ pub(super) fn object_browser(
             format!("{} 个匹配对象", rows.len())
         };
         ui.label(RichText::new(label).small().weak());
-        if !databases && state.view == BrowserView::Details {
-            ui.label(RichText::new("行数为统计估计；— 表示未提供").small().weak());
-        }
     });
     if rows.is_empty() {
         ui.add_space(28.0);
@@ -1235,7 +1226,9 @@ fn render_detail_view(
                                         )
                                         .sense(egui::Sense::click()),
                                     );
-                                    let header_response = if index == 4 {
+                                    let header_response = if !databases && index == 3 {
+                                        header_response.on_hover_text("服务器统计估计；— 表示未提供")
+                                    } else if !databases && index == 4 {
                                         header_response.on_hover_text(catalog_size_hint(data))
                                     } else {
                                         header_response
@@ -1468,22 +1461,19 @@ pub(super) fn inspector(ui: &mut egui::Ui, data: &InspectorData<'_>) -> Option<I
             InspectorPage::General => inspector_general(ui, data, &mut action),
             InspectorPage::Fields => inspector_fields(ui, data),
             InspectorPage::Ddl => {
-                ui.label(RichText::new("定义 / DDL").strong());
+                ui.label(RichText::new("定义 / DDL").strong()).on_hover_text(
+                    if data.definition.is_none() && data.structure.is_some()
+                        && data.browser.profile.is_some_and(|profile| profile.engine != Engine::MySql)
+                    {
+                        "由结构元数据生成的有限 DDL"
+                    } else {
+                        "对象定义"
+                    },
+                );
                 if let Some(definition) = data.definition {
                     inspector_sql(ui, definition, "复制定义");
                 } else if let Some((structure, stale)) = data.structure {
                     inspector_cache_notice(ui, stale);
-                    if data
-                        .browser
-                        .profile
-                        .is_some_and(|profile| profile.engine != sqlshop::model::Engine::MySql)
-                    {
-                        ui.label(
-                            RichText::new("当前为结构读取器生成的有限 DDL。")
-                                .small()
-                                .weak(),
-                        );
-                    }
                     if structure.ddl.is_empty() {
                         ui.label(RichText::new("当前缓存没有 DDL。").weak());
                     } else {
@@ -1498,36 +1488,23 @@ pub(super) fn inspector(ui: &mut egui::Ui, data: &InspectorData<'_>) -> Option<I
                         action = Some(inspector_browser_action(open_action(item)));
                     }
                 } else {
-                    ui.label(
-                        RichText::new(
-                            "尚未读取此对象的 DDL。在该对象的设计文档中读取结构后，可在此查看。",
-                        )
-                        .weak(),
-                    );
+                    ui.label(RichText::new("尚未读取 DDL").weak());
                 }
             }
             InspectorPage::Query => {
                 if let Some(preview) = &data.query_preview {
                     property(ui, "查询", preview.name);
-                    ui.label(RichText::new("当前文稿").strong());
-                    ui.label(
-                        RichText::new("预览编辑器中的 SQL，未执行的改动也会显示。")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(RichText::new("当前文稿").strong())
+                        .on_hover_text("编辑器中的 SQL，包含未执行的改动");
                     if preview.sql.is_empty() {
                         ui.label(RichText::new("文稿为空。").weak());
                     } else {
                         inspector_sql(ui, preview.sql, "复制当前文稿");
                     }
                     ui.separator();
-                    ui.label(RichText::new("最近执行").strong());
+                    ui.label(RichText::new("最近执行").strong())
+                        .on_hover_text("最近发送给服务器的 SQL，可能是选区或当前语句");
                     if let Some(sql) = preview.executed_sql {
-                        ui.label(
-                            RichText::new("这是最近发送给服务器的 SQL，可能是选区或当前语句。")
-                                .small()
-                                .weak(),
-                        );
                         inspector_sql(ui, sql, "复制最近执行 SQL");
                     } else {
                         ui.label(RichText::new("此文档尚无执行记录。").weak());
@@ -1662,7 +1639,7 @@ fn inspector_general(
                 },
             );
         } else if data.structure.is_none() {
-            ui.label(RichText::new("打开结构以查看字段和索引").small().weak());
+            ui.label(RichText::new("尚未读取结构").small().weak());
         }
     } else if let Some(item @ BrowserItem::CatalogObject { object, .. }) = data.selected {
         ui.separator();
@@ -1696,9 +1673,6 @@ fn inspector_general(
                     .to_string(),
             );
         }
-        if data.query_preview.is_none() {
-            ui.label(RichText::new("选择对象查看名称、属性与定义").small().weak());
-        }
     }
 }
 
@@ -1714,16 +1688,13 @@ fn inspector_catalog_properties(
         property(ui, "存储引擎", engine);
     }
     if let Some(rows) = object.estimated_rows {
-        property(ui, "估计行数", &rows.to_string());
-        ui.label(
-            RichText::new("来自服务器统计信息，可能与实际记录数不同。")
-                .small()
-                .weak(),
-        );
+        ui.scope(|ui| property(ui, "估计行数", &rows.to_string()))
+            .response
+            .on_hover_text("来自服务器统计信息，可能与实际记录数不同");
     }
     if let Some(size) = object.size_bytes {
-        property(ui, "目录大小", &format_bytes(size));
-        ui.label(RichText::new("目录大小统计").small().weak())
+        ui.scope(|ui| property(ui, "目录大小", &format_bytes(size)))
+            .response
             .on_hover_text(catalog_size_hint(browser));
     }
     if let Some(created) = &object.created_at {
@@ -1803,17 +1774,10 @@ fn inspector_fields(ui: &mut egui::Ui, data: &InspectorData<'_>) {
                     property(ui, "类型", &column.declared_type);
                     property(ui, "主键", if column.primary_key { "是" } else { "否" });
                     property(ui, "可编辑", if column.editable { "是" } else { "否" });
-                    ui.label(
-                        RichText::new("读取设计文档的结构后可查看默认值等更多属性。")
-                            .small()
-                            .weak(),
-                    );
                 });
         }
     } else {
-        ui.label(
-            RichText::new("尚未读取字段信息。在数据或设计文档中读取此对象后，可在此查看。").weak(),
-        );
+        ui.label(RichText::new("尚未读取字段信息").weak());
     }
 }
 

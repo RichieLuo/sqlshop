@@ -78,7 +78,7 @@ pub(super) fn render_draft_row(
             *selected = Some(draft.id);
         }
         response
-            .on_hover_text("新增草稿，尚未写入数据库；填写后提交全部，或撤销暂存")
+            .on_hover_text("新增草稿，提交后写入数据库")
             .context_menu(|ui| {
                 if ui
                     .add_enabled(enabled, egui::Button::new("移除此新增行"))
@@ -114,7 +114,7 @@ pub(super) fn render_draft_row(
             }
             if response.changed() { *value = InsertValue::Text(text); }
             if response.clicked() || response.has_focus() { *selected = Some(draft.id); }
-            response.on_hover_text(format!("{} · {}\n直接填写新值；右键选择默认值、NULL 或空字符串\n文字 NULL 是字符串，右键“设为 NULL”才是数据库 NULL", column.name, column.declared_type))
+            response.on_hover_text(format!("{} · {}\n右键设置默认值、NULL 或空字符串；直接输入 NULL 为字符串", column.name, column.declared_type))
                 .context_menu(|ui| {
                     ui.add_enabled_ui(enabled, |ui| {
                         for (label, mode) in [("使用默认值", InsertValue::Default), ("设为 NULL", InsertValue::Null)] {

@@ -41,12 +41,12 @@ pub(super) fn show_recovery(
         ui.strong("提交结果核实");
         if document.busy {
             ui.spinner();
-            ui.label("正在使用新连接读取当前值…");
+            ui.label("正在核实…");
         } else if document.pending {
             ui.label("草稿已保留，等待处理");
         }
     });
-    ui.label("提交未获确认时，请先核实记录。核实只读取数据；下面的处理按钮只修改本地草稿。");
+    ui.label("提交未确认时需先核实；草稿处理不撤销服务器提交。");
     if let Some(error) = &document.error {
         let color = ui.visuals().error_fg_color;
         ui.label(RichText::new(error).color(color));
@@ -54,6 +54,7 @@ pub(super) fn show_recovery(
     ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(!document.busy, egui::Button::new("重新核实"))
+            .on_hover_text("使用新连接只读核实；处理按钮仅修改本地草稿。")
             .clicked()
         {
             action = Some(RecoveryAction::CheckAgain);
@@ -76,9 +77,10 @@ pub(super) fn show_recovery(
             staged_changes.len(),
             inserts.len()
         ));
-        ui.label(
-            "尚无核实结果，请点击“重新核实”。新增记录没有可靠回执时，无法自动判断是否已提交。",
-        );
+        ui.label("尚无核实结果。");
+        if !inserts.is_empty() {
+            ui.label("新增记录无可靠回执，无法自动判定是否已提交。");
+        }
         return action;
     };
     let current_report = report_matches(report, staged_changes, inserts);
@@ -109,13 +111,12 @@ pub(super) fn show_recovery(
             .sets
             .first()
             .map_or(0, |set| set.rows.len());
-        ui.weak(format!(
-            "已读取当前页 {count} 条记录；原草稿和主键快照尚未替换。"
-        ));
+        ui.weak(format!("已读取当前页 {count} 条记录"))
+            .on_hover_text("原草稿和主键快照未替换。");
     }
     if !current_report {
         ui.label(
-            RichText::new("本地草稿已变化，此核实结果仅供查看。请重新核实后再处理。")
+            RichText::new("草稿已变化；需重新核实后处理。")
                 .color(ui.visuals().warn_fg_color),
         );
     }
