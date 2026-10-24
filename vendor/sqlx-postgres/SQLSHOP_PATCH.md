@@ -34,19 +34,28 @@ the handler around the operation they intend to observe.
 for in-memory cancellation; neither value is logged or persisted by SQLShop.
 `cancel_request_if_active(options, key, active)` opens a separate transport using
 the driver's existing TLS handshake, checks the execution generation after TLS,
-sends the native 16-byte CancelRequest, and waits for server EOF. It sends no
+sends the native 16-byte CancelRequest, and waits for server closure. It sends no
 StartupMessage or authentication SQL. The original query response, not the
 control connection, proves whether cancellation succeeded. The worker must keep
 the original session occupied until this control operation finishes.
+
+Windows PostgreSQL 18 can close a successfully received cancellation transport
+with TCP reset (`ConnectionReset`, WSAECONNRESET/10054), rather than EOF. Only
+the read after a successful complete request flush accepts either reset or EOF
+as transport completion. Connect, TLS and flush errors, other read errors and
+unexpected reply bytes still fail. This does not classify the user's query as
+cancelled: the original query must still return PostgreSQL SQLSTATE 57014.
+`tests/postgres_cancel_transport.rs` covers EOF, reset and unexpected replies;
+the opt-in table-designer cancellation tests verify server confirmation and
+continued reuse of the original management session.
 
 `observed_transaction_status()` drains pending ReadyForQuery after query errors
 and returns its actual I/T/E status. It sends no probing SQL, commits, rollback,
 or retries. See PostgreSQL's [message flow](https://www.postgresql.org/docs/17/protocol-flow.html),
 including cancellation and SSLRequest on the cancellation transport.
 
-These optional query-control APIs were compiled with SQLShop's configured
-features. No new tests or live database operations were run; protocol
-cancellation, proxies and server TLS combinations still require integration
+These optional query-control APIs are exercised with SQLShop's configured
+features. Proxies and server TLS combinations still require integration
 verification.
 
 ## Application-controlled server payload logging

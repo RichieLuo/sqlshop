@@ -917,8 +917,9 @@ impl App {
         let doc = self.tabs[self.active_tab].jobs.as_mut().unwrap();
         let mut save = None;
         let mut delete = None;
-        ui.heading("SQL 任务调度")
-            .on_hover_text("仅在应用运行时调度；失败或中断后暂停，错过不补跑。SQL 明文保存在本机。");
+        ui.heading("SQL 任务调度").on_hover_text(
+            "仅在应用运行时调度；失败或中断后暂停，错过不补跑。SQL 明文保存在本机。",
+        );
         if self.job_scheduler.is_none() {
             ui.colored_label(ui.visuals().warn_fg_color, "任务存储不可用，计划未启动");
         }

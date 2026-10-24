@@ -186,7 +186,7 @@ pub fn show(
     let mut action = None;
     ui.push_id(document.id, |ui| {
         ui.heading("表数据与结构比较");
-        let before = (document.source.fingerprint(),document.target.fingerprint());
+        let before = (document.source.fingerprint(), document.target.fingerprint());
         let busy = document.pending.is_some();
         ui.add_enabled_ui(!busy, |ui| {
             ui.columns(2, |columns| {
@@ -194,91 +194,278 @@ pub fn show(
                 endpoint_editor(&mut columns[1], "目标", &mut document.target, profiles);
             });
         });
-        if before != (document.source.fingerprint(),document.target.fingerprint()) {
-            document.report = None; document.confirmed = false; document.error = None; document.status.clear();
+        if before != (document.source.fingerprint(), document.target.fingerprint()) {
+            document.report = None;
+            document.confirmed = false;
+            document.error = None;
+            document.status.clear();
         }
         ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new("开始比较")).on_hover_text("每侧最多扫描 1000 行。").clicked() {
-                let generation = Uuid::new_v4(); document.pending = Some(generation); document.error = None; document.report = None; document.confirmed = false;
-                action = Some(CompareAction::Compare { generation, source:document.source.clone(),target:document.target.clone() });
+            if ui
+                .add_enabled(!busy, egui::Button::new("开始比较"))
+                .on_hover_text("每侧最多扫描 1000 行。")
+                .clicked()
+            {
+                let generation = Uuid::new_v4();
+                document.pending = Some(generation);
+                document.error = None;
+                document.report = None;
+                document.confirmed = false;
+                action = Some(CompareAction::Compare {
+                    generation,
+                    source: document.source.clone(),
+                    target: document.target.clone(),
+                });
             }
-            if busy { ui.spinner(); ui.label("读取或同步中"); }
+            if busy {
+                ui.spinner();
+                ui.label("读取或同步中");
+            }
             ui.label(&document.status);
         });
-        if let Some(error) = &document.error { ui.colored_label(ui.visuals().error_fg_color,error); }
-        let Some(report) = &document.report else { return; };
-        ui.label(format!("来源读取 {} 行{} · 目标读取 {} 行{} · {} 项字段/索引/外键差异 · {} 项行/单元格差异", report.source.data.output.sets.first().map(|s|s.rows.len()).unwrap_or(0),if report.source.complete {"（完整）"}else{"（未完整）"},report.target.data.output.sets.first().map(|s|s.rows.len()).unwrap_or(0),if report.target.complete {"（完整）"}else{"（未完整）"},report.structure_differences.len(),report.data_differences.len()));
-        for blocker in &report.blockers { ui.colored_label(ui.visuals().warn_fg_color,blocker); }
+        if let Some(error) = &document.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let Some(report) = &document.report else {
+            return;
+        };
+        ui.label(format!(
+            "来源读取 {} 行{} · 目标读取 {} 行{} · {} 项字段/索引/外键差异 · {} 项行/单元格差异",
+            report
+                .source
+                .data
+                .output
+                .sets
+                .first()
+                .map(|s| s.rows.len())
+                .unwrap_or(0),
+            if report.source.complete {
+                "（完整）"
+            } else {
+                "（未完整）"
+            },
+            report
+                .target
+                .data
+                .output
+                .sets
+                .first()
+                .map(|s| s.rows.len())
+                .unwrap_or(0),
+            if report.target.complete {
+                "（完整）"
+            } else {
+                "（未完整）"
+            },
+            report.structure_differences.len(),
+            report.data_differences.len()
+        ));
+        for blocker in &report.blockers {
+            ui.colored_label(ui.visuals().warn_fg_color, blocker);
+        }
         ui.horizontal_wrapped(|ui| {
-            for (section,label) in [(Section::Data,"数据差异"),(Section::Structure,"结构差异"),(Section::SourceDdl,"来源 DDL"),(Section::TargetDdl,"目标 DDL"),(Section::Sync,"同步预览"),(Section::Er,"目标外键图")] { ui.selectable_value(&mut document.section,section,label); }
+            for (section, label) in [
+                (Section::Data, "数据差异"),
+                (Section::Structure, "结构差异"),
+                (Section::SourceDdl, "来源 DDL"),
+                (Section::TargetDdl, "目标 DDL"),
+                (Section::Sync, "同步预览"),
+                (Section::Er, "目标外键图"),
+            ] {
+                ui.selectable_value(&mut document.section, section, label);
+            }
         });
         ui.separator();
         match document.section {
             Section::Data => {
                 if report.data_differences.is_empty() {
-                    ui.label(if report.blockers.is_empty() { "未发现数据差异。" } else { "数据核对不完整。" });
+                    ui.label(if report.blockers.is_empty() {
+                        "未发现数据差异。"
+                    } else {
+                        "数据核对不完整。"
+                    });
                 }
-                egui::ScrollArea::vertical().id_salt("data_differences").max_height(ui.available_height().max(100.0)).show_rows(ui,64.0,report.data_differences.len(),|ui,range| {
-                    for difference in &report.data_differences[range] {
-                        ui.group(|ui| {
-                            ui.label(RichText::new(format!("{} · {}{}", match difference.kind {RowDifferenceKind::Changed=>"值不同",RowDifferenceKind::SourceOnly=>"仅来源存在",RowDifferenceKind::TargetOnly=>"仅目标存在（保留）"}, display_key(&difference.key,&report.target.data.primary_keys), difference.column.as_ref().map(|c|format!(" · {c}")).unwrap_or_default())).strong());
-                            ui.horizontal(|ui| {
-                                let left = display_value(&difference.source); let right = display_value(&difference.target);
-                                ui.label(format!("来源：{}",left.chars().take(180).collect::<String>())).on_hover_text(left);
-                                ui.label(format!("目标：{}",right.chars().take(180).collect::<String>())).on_hover_text(right);
+                egui::ScrollArea::vertical()
+                    .id_salt("data_differences")
+                    .max_height(ui.available_height().max(100.0))
+                    .show_rows(ui, 64.0, report.data_differences.len(), |ui, range| {
+                        for difference in &report.data_differences[range] {
+                            ui.group(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} · {}{}",
+                                        match difference.kind {
+                                            RowDifferenceKind::Changed => "值不同",
+                                            RowDifferenceKind::SourceOnly => "仅来源存在",
+                                            RowDifferenceKind::TargetOnly => "仅目标存在（保留）",
+                                        },
+                                        display_key(
+                                            &difference.key,
+                                            &report.target.data.primary_keys
+                                        ),
+                                        difference
+                                            .column
+                                            .as_ref()
+                                            .map(|c| format!(" · {c}"))
+                                            .unwrap_or_default()
+                                    ))
+                                    .strong(),
+                                );
+                                ui.horizontal(|ui| {
+                                    let left = display_value(&difference.source);
+                                    let right = display_value(&difference.target);
+                                    ui.label(format!(
+                                        "来源：{}",
+                                        left.chars().take(180).collect::<String>()
+                                    ))
+                                    .on_hover_text(left);
+                                    ui.label(format!(
+                                        "目标：{}",
+                                        right.chars().take(180).collect::<String>()
+                                    ))
+                                    .on_hover_text(right);
+                                });
                             });
-                        });
-                    }
-                });
-            },
+                        }
+                    });
+            }
             Section::Structure => {
-                ui.add_enabled_ui(!busy,|ui| {
-                    for (index,candidate) in report.structure_candidates().iter().enumerate() {
-                        if ui.selectable_label(document.selected_structure==Some(index),&candidate.label).clicked() {
-                            document.selected_structure=Some(index); document.structure_confirmed=false;
+                ui.add_enabled_ui(!busy, |ui| {
+                    for (index, candidate) in report.structure_candidates().iter().enumerate() {
+                        if ui
+                            .selectable_label(
+                                document.selected_structure == Some(index),
+                                &candidate.label,
+                            )
+                            .clicked()
+                        {
+                            document.selected_structure = Some(index);
+                            document.structure_confirmed = false;
                         }
                     }
                 });
-                if let Some((index,candidate))=document.selected_structure.and_then(|index|report.structure_candidates().get(index).map(|c|(index,c))) {
-                    if let Some(reason)=&candidate.reason {ui.colored_label(ui.visuals().warn_fg_color,reason);}
-                    if let Some(sql)=candidate.preview_sql() {
+                if let Some((index, candidate)) = document
+                    .selected_structure
+                    .and_then(|index| report.structure_candidates().get(index).map(|c| (index, c)))
+                {
+                    if let Some(reason) = &candidate.reason {
+                        ui.colored_label(ui.visuals().warn_fg_color, reason);
+                    }
+                    if let Some(sql) = candidate.preview_sql() {
                         ui.monospace(sql);
-                        ui.add_enabled_ui(!busy,|ui|{ui.checkbox(&mut document.structure_confirmed,"确认向目标表应用此条新增 SQL");});
-                        if ui.add_enabled(!busy&&candidate.supported()&&document.structure_confirmed,egui::Button::new("应用此结构操作")).on_hover_text("仅新增普通可空字段或单列索引。").clicked() {
-                            let generation=Uuid::new_v4(); document.pending=Some(generation); document.structure_confirmed=false;
-                            action=Some(CompareAction::ApplyStructure {generation,report:report.clone(),candidate:index});
+                        ui.add_enabled_ui(!busy, |ui| {
+                            ui.checkbox(
+                                &mut document.structure_confirmed,
+                                "确认向目标表应用此条新增 SQL",
+                            );
+                        });
+                        if ui
+                            .add_enabled(
+                                !busy && candidate.supported() && document.structure_confirmed,
+                                egui::Button::new("应用此结构操作"),
+                            )
+                            .on_hover_text("仅新增普通可空字段或单列索引。")
+                            .clicked()
+                        {
+                            let generation = Uuid::new_v4();
+                            document.pending = Some(generation);
+                            document.structure_confirmed = false;
+                            action = Some(CompareAction::ApplyStructure {
+                                generation,
+                                report: report.clone(),
+                                candidate: index,
+                            });
                         }
                     }
                 }
                 ui.separator();
-                egui::ScrollArea::both().id_salt("structure_differences").show(ui, |ui| {
-                    for difference in &report.structure_differences {
-                        ui.group(|ui| {
-                            ui.label(RichText::new(format!("{} · {}",difference.section,difference.name)).strong());
-                            ui.monospace(format!("来源：{}",difference.source.as_deref().unwrap_or("不存在")));
-                            ui.monospace(format!("目标：{}",difference.target.as_deref().unwrap_or("不存在")));
-                        });
-                    }
-                    if report.structure_differences.is_empty() { ui.label("未发现结构差异。"); }
-                });
-            },
+                egui::ScrollArea::both()
+                    .id_salt("structure_differences")
+                    .show(ui, |ui| {
+                        for difference in &report.structure_differences {
+                            ui.group(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} · {}",
+                                        difference.section, difference.name
+                                    ))
+                                    .strong(),
+                                );
+                                ui.monospace(format!(
+                                    "来源：{}",
+                                    difference.source.as_deref().unwrap_or("不存在")
+                                ));
+                                ui.monospace(format!(
+                                    "目标：{}",
+                                    difference.target.as_deref().unwrap_or("不存在")
+                                ));
+                            });
+                        }
+                        if report.structure_differences.is_empty() {
+                            ui.label("未发现结构差异。");
+                        }
+                    });
+            }
             Section::SourceDdl | Section::TargetDdl => {
-                let ddl = if document.section == Section::SourceDdl { &report.source.structure.ddl } else { &report.target.structure.ddl };
-                if ui.button("复制 DDL").on_hover_text("只读定义，不自动应用 DDL。").clicked() { ui.ctx().copy_text(ddl.clone()); }
-                egui::ScrollArea::both().id_salt("compare_ddl").show(ui,|ui| { ui.monospace(ddl); });
-            },
-            Section::Sync => {
-                ui.label(format!("更新 {} 个单元格，新增 {} 行；保留目标独有行。",report.update_count(),report.insert_count()));
-                let preview = report.sync_preview();
-                if ui.button("复制操作预览").clicked() { ui.ctx().copy_text(preview.clone()); }
-                ui.add_enabled_ui(!busy && report.can_apply(),|ui| { ui.checkbox(&mut document.confirmed,"已核对来源、目标与修改，确认提交同步事务"); });
-                if ui.add_enabled(!busy && report.can_apply() && document.confirmed,egui::Button::new("应用数据同步")).on_hover_text("应用前重读目标与元数据；发现变化时拒绝同步。").clicked() {
-                    let generation = Uuid::new_v4(); document.pending = Some(generation); document.confirmed = false;
-                    action = Some(CompareAction::Apply { generation,report:report.clone() });
+                let ddl = if document.section == Section::SourceDdl {
+                    &report.source.structure.ddl
+                } else {
+                    &report.target.structure.ddl
+                };
+                if ui
+                    .button("复制 DDL")
+                    .on_hover_text("只读定义，不自动应用 DDL。")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(ddl.clone());
                 }
-                egui::ScrollArea::both().id_salt("sync_preview").show(ui,|ui| { ui.monospace(preview); });
-            },
-            Section::Er => { show_er(ui,&report.target.endpoint.table,&report.target.structure); },
+                egui::ScrollArea::both()
+                    .id_salt("compare_ddl")
+                    .show(ui, |ui| {
+                        ui.monospace(ddl);
+                    });
+            }
+            Section::Sync => {
+                ui.label(format!(
+                    "更新 {} 个单元格，新增 {} 行；保留目标独有行。",
+                    report.update_count(),
+                    report.insert_count()
+                ));
+                let preview = report.sync_preview();
+                if ui.button("复制操作预览").clicked() {
+                    ui.ctx().copy_text(preview.clone());
+                }
+                ui.add_enabled_ui(!busy && report.can_apply(), |ui| {
+                    ui.checkbox(
+                        &mut document.confirmed,
+                        "已核对来源、目标与修改，确认提交同步事务",
+                    );
+                });
+                if ui
+                    .add_enabled(
+                        !busy && report.can_apply() && document.confirmed,
+                        egui::Button::new("应用数据同步"),
+                    )
+                    .on_hover_text("应用前重读目标与元数据；发现变化时拒绝同步。")
+                    .clicked()
+                {
+                    let generation = Uuid::new_v4();
+                    document.pending = Some(generation);
+                    document.confirmed = false;
+                    action = Some(CompareAction::Apply {
+                        generation,
+                        report: report.clone(),
+                    });
+                }
+                egui::ScrollArea::both()
+                    .id_salt("sync_preview")
+                    .show(ui, |ui| {
+                        ui.monospace(preview);
+                    });
+            }
+            Section::Er => {
+                show_er(ui, &report.target.endpoint.table, &report.target.structure);
+            }
         }
     });
     action

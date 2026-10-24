@@ -48,7 +48,9 @@ def test_service(service, suite="databases"):
     # These images generate self-signed server certificates on first startup.
     env["SQLSHOP_TEST_SELF_SIGNED_TLS"] = "1" if service != "postgres" else "0"
     print(f"Testing {service} on 127.0.0.1:{port}", flush=True)
-    run(["cargo", "test", "--locked", "--test", suite, service, "--", "--ignored", "--exact"], env=env)
+    # Designer/cancellation suites use engine-prefixed names (for example,
+    # postgres_page_cancellation), so an exact engine-name filter skips them.
+    run(["cargo", "test", "--locked", "--test", suite, service, "--", "--ignored"], env=env)
 
 
 def main():
@@ -67,11 +69,14 @@ def main():
             "test-browser": ("table_browser",),
             "test-edit": ("table_edit",),
             "test-query": ("query_sessions",),
-            "test-all": ("databases", "table_browser", "table_edit", "query_sessions"),
+            "test-all": ("databases", "table_browser", "table_edit", "query_sessions",
+                         "table_designer", "object_designer", "input_integrity"),
         }[args.command]
         failed = []
         for service in services:
             for suite in suites:
+                if suite == "input_integrity" and service == "mysql":
+                    continue
                 try:
                     test_service(service, suite)
                 except subprocess.CalledProcessError:

@@ -331,6 +331,19 @@ fn take_activation(selection: &mut TreeSelection, node: &TreeNode) -> bool {
     }
 }
 
+fn register_focus(selection: &mut TreeSelection, node: &TreeNode, response: &egui::Response) {
+    if response.clicked() || response.secondary_clicked() {
+        selection.navigator.focused = true;
+        selection.navigator.focus_node = Some(node.clone());
+        response.request_focus();
+    }
+    if selection.navigator.pending_focus.as_ref() == Some(node) {
+        response.request_focus();
+        response.scroll_to_me(Some(egui::Align::Center));
+        selection.navigator.pending_focus = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,18 +418,5 @@ mod tests {
             egui::Id::new("revealed-connection"),
             Some(true)
         ));
-    }
-}
-
-fn register_focus(selection: &mut TreeSelection, node: &TreeNode, response: &egui::Response) {
-    if response.clicked() || response.secondary_clicked() {
-        selection.navigator.focused = true;
-        selection.navigator.focus_node = Some(node.clone());
-        response.request_focus();
-    }
-    if selection.navigator.pending_focus.as_ref() == Some(node) {
-        response.request_focus();
-        response.scroll_to_me(Some(egui::Align::Center));
-        selection.navigator.pending_focus = None;
     }
 }

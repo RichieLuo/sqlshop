@@ -322,7 +322,13 @@ pub async fn execute(
     // Restore checks use a dedicated management connection, never a document's
     // persistent SQL session. They do not automatically delete/create objects.
     if config.operation == BackupOperation::Restore {
-        let mut preflight = Session::connect(profile, credentials).await?;
+        let mut preflight = if profile.engine == Engine::SqlServer {
+            // SQL Server can restore a database that does not exist yet; its
+            // preflight uses master rather than connecting to that target.
+            Session::connect(profile, credentials).await?
+        } else {
+            Session::connect_to_database(profile, credentials, &config.database).await?
+        };
         preflight
             .ensure_restore_target_empty(&config.database)
             .await?;

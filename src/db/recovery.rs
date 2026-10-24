@@ -1,6 +1,9 @@
 use super::{
     Session,
-    table_edit::{display_expression, parameter_expression},
+    table_edit::{
+        SqlServerVarcharColumn, display_expression, original_value_predicate, parameter_expression,
+        sqlserver_text_type, sqlserver_varchar_expression,
+    },
 };
 use crate::{
     model::{CellKind, CellUpdate, Engine, InsertValue, Table, TableColumn},
@@ -10,6 +13,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, ensure};
+use std::collections::BTreeMap;
 
 impl Session {
     /// Use a newly connected management session. Do not run this on the failed
@@ -61,6 +65,7 @@ impl Session {
             "新增草稿的列映射不完整"
         );
         let columns = self.table_columns(table).await?;
+        let varchar_columns = self.sqlserver_varchar_columns(table).await?;
         let schema_matches = !expected_columns.is_empty()
             && columns.len() == expected_columns.len()
             && columns
@@ -74,7 +79,6 @@ impl Session {
                         && actual.primary_key == expected.primary_key
                         && actual.editable == expected.editable
                 });
-        let engine = self.profile.engine;
         let mut groups: Vec<Vec<&CellUpdate>> = Vec::new();
         for change in changes {
             if let Some(group) = groups.iter_mut().find(|group| {
@@ -137,19 +141,26 @@ impl Session {
                 continue;
             }
             row.evidence.push(
-                self.lookup_draft_row(engine, table, &columns, &keys, &row.original_key, &group)
-                    .await?,
+                self.lookup_draft_row(
+                    table,
+                    &columns,
+                    &keys,
+                    &row.original_key,
+                    &group,
+                    &varchar_columns,
+                )
+                .await?,
             );
             if row.intended_key != row.original_key && row.intended_key.iter().all(Option::is_some)
             {
                 row.evidence.push(
                     self.lookup_draft_row(
-                        engine,
                         table,
                         &columns,
                         &keys,
                         &row.intended_key,
                         &group,
+                        &varchar_columns,
                     )
                     .await?,
                 );
@@ -175,13 +186,14 @@ impl Session {
 
     async fn lookup_draft_row(
         &mut self,
-        engine: Engine,
         table: &Table,
         columns: &[TableColumn],
         keys: &[&TableColumn],
         key_values: &[Option<String>],
         changes: &[&CellUpdate],
+        varchar_columns: &BTreeMap<String, SqlServerVarcharColumn>,
     ) -> Result<ServerRowEvidence> {
+        let engine = self.profile.engine;
         let mut parameters = Vec::new();
         let predicates = keys
             .iter()
@@ -216,9 +228,16 @@ impl Session {
                     } else {
                         &change.original
                     };
-                    comparison(engine, column, value.as_deref(), intended, &mut parameters)
+                    comparison(
+                        engine,
+                        column,
+                        value.as_deref(),
+                        intended,
+                        &mut parameters,
+                        varchar_columns.get(&column.name),
+                    )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>>>()?
                 .join(" AND ");
             fields.push(format!("CASE WHEN {checks} THEN '1' ELSE '0' END"));
         }
@@ -288,20 +307,83 @@ fn comparison(
     value: Option<&str>,
     intended: bool,
     parameters: &mut Vec<String>,
-) -> String {
+    varchar_column: Option<&SqlServerVarcharColumn>,
+) -> Result<String> {
     let name = engine.quote(&column.name);
     let Some(value) = value else {
-        return format!("{name} IS NULL");
+        return Ok(format!("{name} IS NULL"));
     };
     parameters.push(value.to_owned());
     let position = parameters.len();
+    if !intended {
+        return Ok(original_value_predicate(engine, column, position));
+    }
     let converted = parameter_expression(engine, column, position);
-    match engine {
-        Engine::Postgres => format!("{name} IS NOT DISTINCT FROM {converted}"),
+    Ok(match engine {
+        Engine::Postgres => format!(
+            "({} COLLATE \"C\") IS NOT DISTINCT FROM (CAST({converted} AS text) COLLATE \"C\")",
+            display_expression(engine, column)
+        ),
+        Engine::SqlServer if column.kind == CellKind::Binary => {
+            let bound = column.sql_type.split_once('(').and_then(|(_, width)| {
+                width
+                    .strip_suffix(')')
+                    .and_then(|width| width.parse::<usize>().ok())
+            });
+            let guard = bound
+                .map(|width| format!("DATALENGTH({converted}) <= {width} AND "))
+                .unwrap_or_default();
+            format!(
+                "({guard}CONVERT(varbinary(max), {name}) = CONVERT(varbinary(max), CONVERT({}, {converted})))",
+                column.sql_type
+            )
+        }
+        Engine::SqlServer if sqlserver_text_type(column) => {
+            // Canonicalize fixed-width padding only after proving a narrowing
+            // cast would retain every byte. An overlength draft must not be
+            // reported as matching a truncated value already on the server.
+            let (base, width) = column
+                .sql_type
+                .split_once('(')
+                .unwrap_or((&column.sql_type, "max)"));
+            let bound = width
+                .strip_suffix(')')
+                .and_then(|width| width.parse::<usize>().ok());
+            let complete = if base.starts_with('n') {
+                format!("CAST({converted} AS nvarchar(max))")
+            } else {
+                let actual =
+                    varchar_column.context("无法读取目标列字符集，不能核实可能有损的文本转换")?;
+                sqlserver_varchar_expression(&converted, &actual.collation)
+            };
+            let length_guard = bound
+                .map(|width| {
+                    format!(
+                        "DATALENGTH({complete}) <= {} AND ",
+                        if base.starts_with('n') {
+                            width * 2
+                        } else {
+                            width
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            let roundtrip_guard = if base.starts_with('n') {
+                String::new()
+            } else {
+                format!(
+                    "CONVERT(varbinary(max),CONVERT(nvarchar(max),{complete})) = CONVERT(varbinary(max),{converted}) AND "
+                )
+            };
+            format!(
+                "({length_guard}{roundtrip_guard}CONVERT(varbinary(max), {name}) = CONVERT(varbinary(max), CAST({complete} AS {})))",
+                column.sql_type
+            )
+        }
         Engine::SqlServer => {
             format!("CONVERT(varbinary(max), {name}) = CONVERT(varbinary(max), {converted})")
         }
-        Engine::MySql if !intended || column.kind == CellKind::Text => {
+        Engine::MySql if column.kind == CellKind::Text => {
             format!("BINARY {} = BINARY ?", display_expression(engine, column))
         }
         Engine::MySql if column.kind == CellKind::Binary => {
@@ -311,7 +393,7 @@ fn comparison(
             "BINARY {} = BINARY CAST({converted} AS CHAR CHARACTER SET utf8mb4)",
             display_expression(engine, column)
         ),
-    }
+    })
 }
 
 fn classify(row: &mut RowVerification) {

@@ -5,7 +5,16 @@ use crate::model::{
 };
 use anyhow::{Context, Result};
 use sqlx::Connection;
-use std::{fmt, time::Instant};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    time::Instant,
+};
+
+pub(super) struct SqlServerVarcharColumn {
+    pub collation: String,
+    pub max_bytes: i16,
+}
 
 #[derive(Debug)]
 pub(crate) struct EditRejected(pub String);
@@ -28,6 +37,112 @@ impl fmt::Display for CommitOutcomeUnknown {
 impl std::error::Error for CommitOutcomeUnknown {}
 
 impl Session {
+    pub(super) async fn sqlserver_varchar_columns(
+        &mut self,
+        table: &Table,
+    ) -> Result<BTreeMap<String, SqlServerVarcharColumn>> {
+        let Driver::SqlServer(client) = &mut self.driver else {
+            return Ok(BTreeMap::new());
+        };
+        let mut query = tiberius::Query::new(
+            "SELECT c.name,c.collation_name,c.max_length FROM sys.columns c JOIN sys.objects o ON o.object_id=c.object_id JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE s.name=@P1 AND o.name=@P2 AND c.system_type_id IN (167,175)",
+        );
+        query.bind(table.schema.as_str());
+        query.bind(table.name.as_str());
+        let rows = query.query(client).await?.into_first_result().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<&str, _>(0)
+                        .context("列字符集元数据缺少名称")?
+                        .to_owned(),
+                    SqlServerVarcharColumn {
+                        collation: row
+                            .get::<&str, _>(1)
+                            .context("无法读取列字符集，拒绝可能有损的文本转换")?
+                            .to_owned(),
+                        max_bytes: row.get::<i16, _>(2).context("列字符集元数据缺少字节长度")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn ensure_sqlserver_text_inputs(
+        &mut self,
+        table: &Table,
+        columns: &[TableColumn],
+        changes: &[CellUpdate],
+        names: &[String],
+        rows: &[Vec<InsertValue>],
+    ) -> Result<()> {
+        if self.profile.engine != Engine::SqlServer {
+            return Ok(());
+        }
+        let mut inputs = Vec::new();
+        for change in changes {
+            if let Some(value) = change.value.as_deref()
+                && let Some(column) = columns
+                    .iter()
+                    .find(|c| c.name == change.column && sqlserver_varchar_type(c))
+            {
+                inputs.push((column, value));
+            }
+        }
+        for row in rows {
+            for (name, value) in names.iter().zip(row) {
+                if let InsertValue::Text(value) = value
+                    && let Some(column) = columns
+                        .iter()
+                        .find(|c| c.name == *name && sqlserver_varchar_type(c))
+                {
+                    inputs.push((column, value.as_str()));
+                }
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let metadata = self.sqlserver_varchar_columns(table).await?;
+        let Driver::SqlServer(client) = &mut self.driver else {
+            unreachable!()
+        };
+        let mut checked = HashSet::new();
+        for (column, value) in inputs {
+            if !checked.insert((column.name.as_str(), value)) {
+                continue;
+            }
+            let actual = metadata.get(&column.name).ok_or_else(|| {
+                EditRejected("目标列或字符集元数据已改变，未执行写入；请刷新表数据".into())
+            })?;
+            let complete = sqlserver_varchar_expression("@P1", &actual.collation);
+            let length_guard = if actual.max_bytes == -1 {
+                String::new()
+            } else {
+                format!(" AND DATALENGTH({complete}) <= {}", actual.max_bytes)
+            };
+            let sql = format!(
+                "SELECT CASE WHEN CONVERT(varbinary(max),CONVERT(nvarchar(max),{complete})) = CONVERT(varbinary(max),CAST(@P1 AS nvarchar(max))){length_guard} THEN 1 ELSE 0 END"
+            );
+            let mut query = tiberius::Query::new(sql);
+            query.bind(value);
+            let row = query
+                .query(client)
+                .await?
+                .into_row()
+                .await?
+                .context("文本无损转换检查未返回结果")?;
+            if row.get::<i32, _>(0) != Some(1) {
+                return Err(EditRejected(format!(
+                    "列 {} 的输入无法按列字符集无损保存，或超过列字节长度；未执行写入",
+                    column.name
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn table_writable(&mut self, table: &Table) -> Result<bool> {
         let sql = match self.profile.engine {
             Engine::MySql => {
@@ -146,7 +261,13 @@ impl Session {
                 r#"SELECT a.attname::text, pg_catalog.format_type(a.atttypid,a.atttypmod)::text, t.typname::text,
                 (a.attgenerated <> '' OR a.attidentity <> '' OR c.relkind NOT IN ('r','p'))::text,
                 EXISTS(SELECT 1 FROM pg_index i, unnest(i.indkey) WITH ORDINALITY k(attnum, position)
-                       WHERE i.indrelid=c.oid AND i.indisprimary AND k.position <= i.indnkeyatts AND k.attnum=a.attnum)::text
+                       WHERE i.indrelid=c.oid AND i.indisprimary AND k.position <= i.indnkeyatts AND k.attnum=a.attnum)::text,
+                COALESCE((WITH RECURSIVE base AS (
+                    SELECT t.oid,t.typtype,t.typbasetype UNION ALL
+                    SELECT bt.oid,bt.typtype,bt.typbasetype FROM pg_type bt JOIN base b ON bt.oid=b.typbasetype WHERE b.typtype='d'
+                ) SELECT CASE oid WHEN 'pg_catalog.varchar'::regtype THEN 'pg_catalog.varchar'
+                    WHEN 'pg_catalog.bpchar'::regtype THEN 'pg_catalog.bpchar' END FROM base WHERE typtype<>'d'),
+                    pg_catalog.format_type(a.atttypid,a.atttypmod))::text
                 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
                 JOIN pg_type t ON t.oid=a.atttypid
                 WHERE n.nspname=$1 AND c.relname=$2 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"#
@@ -230,7 +351,11 @@ impl Session {
                     CellKind::Time => "TIME(6)".into(),
                     _ => "CHAR CHARACTER SET utf8mb4".into(),
                 },
-                _ => declared.clone(),
+                // A bounded character cast truncates before assignment checks.
+                // Domains over character types also need an unbounded input;
+                // assigning to the real column still enforces its domain checks.
+                Engine::Postgres => field(5)?.to_owned(),
+                Engine::SqlServer => declared.clone(),
             };
             columns.push(TableColumn {
                 name,
@@ -309,25 +434,23 @@ impl Session {
                 )
             })
             .collect::<Vec<_>>();
-        let old_value = parameter_expression(engine, column, parameters.len());
         let name = engine.quote(&column.name);
-        let optimistic = match engine {
-            Engine::Postgres => format!("{name} IS NOT DISTINCT FROM {old_value}"),
-            Engine::MySql => format!(
-                "BINARY {} <=> BINARY {}",
-                display_expression(engine, column),
-                placeholder(engine, parameters.len())
-            ),
-            Engine::SqlServer => format!(
-                "(CONVERT(varbinary(max),{name}) = CONVERT(varbinary(max),{old_value}) OR ({name} IS NULL AND {old_value} IS NULL))"
-            ),
-        };
+        validate_assignment_value(engine, column, change.value.as_deref())?;
+        self.ensure_sqlserver_text_inputs(
+            &change.table,
+            &columns,
+            std::slice::from_ref(change),
+            &[],
+            &[],
+        )
+        .await?;
+        let optimistic = original_value_predicate(engine, column, parameters.len());
         // SQL Server references the same positional parameter twice; MySQL's ? is used once.
         let sql = format!(
             "UPDATE {}.{} SET {name} = {} WHERE {} AND ({optimistic})",
             engine.quote(&change.table.schema),
             engine.quote(&change.table.name),
-            parameter_expression(engine, column, 1),
+            assignment_expression(engine, column, 1),
             predicates.join(" AND ")
         );
         match &mut self.driver {
@@ -550,6 +673,8 @@ impl Session {
             .iter()
             .map(|row| insert_statement(engine, table, &columns, names, row))
             .collect::<Result<Vec<_>>>()?;
+        self.ensure_sqlserver_text_inputs(table, &columns, &[], names, rows)
+            .await?;
         match &mut self.driver {
             Driver::MySql(connection) => {
                 let mut tx = connection.begin().await?;
@@ -673,6 +798,8 @@ impl Session {
                 .map_err(|error| EditRejected(format!("新增草稿无效，未执行写入：{error:#}")))?;
             prepared.push((sql, parameters, false));
         }
+        self.ensure_sqlserver_text_inputs(table, &columns, changes, names, rows)
+            .await?;
         match &mut self.driver {
             Driver::MySql(connection) => {
                 let mut tx = connection.begin().await?;
@@ -846,7 +973,8 @@ fn insert_statement(
             InsertValue::Default => unreachable!(),
         };
         params.push(parameter);
-        expressions.push(parameter_expression(engine, column, params.len()));
+        validate_assignment_value(engine, column, params.last().unwrap().as_deref())?;
+        expressions.push(assignment_expression(engine, column, params.len()));
     }
     let table_name = format!(
         "{}.{}",
@@ -916,6 +1044,7 @@ fn update_row_statement(
             }
         }
         changed_columns.push(column);
+        validate_assignment_value(engine, column, change.value.as_deref())?;
     }
     // One statement per original row: all SET expressions and optimistic checks
     // refer to that same row, even when a primary-key column is being changed.
@@ -932,7 +1061,7 @@ fn update_row_statement(
             format!(
                 "{} = {}",
                 engine.quote(&column.name),
-                parameter_expression(engine, column, index + 1)
+                assignment_expression(engine, column, index + 1)
             )
         })
         .collect::<Vec<_>>()
@@ -949,16 +1078,15 @@ fn update_row_statement(
         })
         .collect::<Vec<_>>()
         .join(" AND ");
-    let optimistic = changed_columns.iter().enumerate().map(|(index, column)| {
-        let name = engine.quote(&column.name);
-        let position = changes.len() + keys.len() + index + 1;
-        let old = parameter_expression(engine, column, position);
-        match engine {
-            Engine::Postgres => format!("{name} IS NOT DISTINCT FROM {old}"),
-            Engine::MySql => format!("BINARY {} <=> BINARY {}", display_expression(engine, column), placeholder(engine, position)),
-            Engine::SqlServer => format!("(CONVERT(varbinary(max),{name}) = CONVERT(varbinary(max),{old}) OR ({name} IS NULL AND {old} IS NULL))"),
-        }
-    }).collect::<Vec<_>>().join(" AND ");
+    let optimistic = changed_columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let position = changes.len() + keys.len() + index + 1;
+            original_value_predicate(engine, column, position)
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
     let sql = format!(
         "UPDATE {}.{} SET {assignments} WHERE {predicates} AND ({optimistic})",
         engine.quote(&first.table.schema),
@@ -1003,15 +1131,121 @@ pub(super) fn parameter_expression(engine: Engine, column: &TableColumn, index: 
         return match engine {
             Engine::Postgres => format!("decode(substr(CAST({parameter} AS text),3),'hex')"),
             Engine::MySql => format!("UNHEX(SUBSTRING({parameter},3))"),
-            Engine::SqlServer => format!("CONVERT({}, {parameter}, 1)", column.sql_type),
+            Engine::SqlServer => format!("CONVERT(varbinary(max), {parameter}, 1)"),
         };
     }
     match engine {
         // A bound string has lower collation precedence than the column. Casting it
         // to CHAR can give both operands implicit precedence with different collations.
         Engine::MySql if column.kind == CellKind::Text => parameter,
-        Engine::Postgres => format!("CAST(CAST({parameter} AS text) AS {})", column.sql_type),
+        Engine::Postgres => format!(
+            "CAST(CAST({parameter} AS text) AS {})",
+            postgres_parameter_type(&column.sql_type)
+        ),
+        Engine::SqlServer if sqlserver_text_type(column) => {
+            format!("CAST({parameter} AS nvarchar(max))")
+        }
         _ => format!("CAST({parameter} AS {})", column.sql_type),
+    }
+}
+
+// Comparisons and assignments must both retain the complete input. In particular,
+// a filter for a long string must not become a filter for its truncated prefix.
+fn postgres_parameter_type(sql_type: &str) -> &str {
+    for prefix in ["character varying(", "varchar("] {
+        if sql_type.starts_with(prefix) && sql_type.ends_with(')') {
+            return "pg_catalog.varchar";
+        }
+    }
+    for prefix in ["character(", "char("] {
+        if sql_type.starts_with(prefix) && sql_type.ends_with(')') {
+            return "pg_catalog.bpchar";
+        }
+    }
+    sql_type
+}
+
+pub(super) fn sqlserver_text_type(column: &TableColumn) -> bool {
+    matches!(
+        column.sql_type.split('(').next(),
+        Some("varchar" | "char" | "nvarchar" | "nchar" | "text" | "ntext")
+    )
+}
+
+pub(super) fn sqlserver_varchar_type(column: &TableColumn) -> bool {
+    matches!(column.sql_type.split('(').next(), Some("varchar" | "char"))
+}
+
+pub(super) fn sqlserver_varchar_expression(parameter: &str, collation: &str) -> String {
+    format!(
+        "CAST({parameter} COLLATE {} AS varchar(max))",
+        Engine::SqlServer.quote(collation)
+    )
+}
+
+fn assignment_expression(engine: Engine, column: &TableColumn, index: usize) -> String {
+    // Keep numeric, temporal, enum and other custom-type conversions. Text and
+    // binary conversions above deliberately omit a length; the destination
+    // column, rather than an explicit narrowing CAST, must validate the value.
+    parameter_expression(engine, column, index)
+}
+
+fn validate_assignment_value(
+    engine: Engine,
+    column: &TableColumn,
+    value: Option<&str>,
+) -> Result<()> {
+    let Some(value) = value else { return Ok(()) };
+    if engine != Engine::SqlServer {
+        return Ok(());
+    }
+    let Some((base, length)) = column.sql_type.split_once('(') else {
+        return Ok(());
+    };
+    let Some(length) = length
+        .strip_suffix(')')
+        .and_then(|n| n.parse::<usize>().ok())
+    else {
+        return Ok(());
+    };
+    // SQL Server can truncate binary assignments without a warning even with
+    // ANSI_WARNINGS enabled. Validate the original hex bytes before sending SQL.
+    let too_long = match base {
+        "binary" | "varbinary" => value
+            .strip_prefix("0x")
+            .is_some_and(|hex| hex.len() / 2 > length),
+        "nvarchar" | "nchar" => value.encode_utf16().count() > length,
+        "varchar" | "char" => value.chars().count() > length,
+        _ => false,
+    };
+    if too_long {
+        return Err(EditRejected(format!(
+            "列 {} 的输入超过 {} 长度，未执行写入",
+            column.name, column.declared_type
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn original_value_predicate(
+    engine: Engine,
+    column: &TableColumn,
+    index: usize,
+) -> String {
+    let parameter = placeholder(engine, index);
+    let displayed = display_expression(engine, column);
+    match engine {
+        // json/xml have no equality operator, and citext/nondeterministic
+        // collations can equate changed strings. Compare the exact representation
+        // originally read, without reinterpreting it through the column type.
+        Engine::Postgres => format!(
+            "({displayed} COLLATE \"C\") IS NOT DISTINCT FROM (CAST({parameter} AS text) COLLATE \"C\")"
+        ),
+        Engine::MySql => format!("BINARY {displayed} <=> BINARY {parameter}"),
+        Engine::SqlServer => format!(
+            "(CONVERT(varbinary(max),CAST({displayed} AS nvarchar(max))) = CONVERT(varbinary(max),CAST({parameter} AS nvarchar(max))) OR ({displayed} IS NULL AND {parameter} IS NULL))"
+        ),
     }
 }
 
@@ -1152,6 +1386,43 @@ mod workflow_tests {
             invalid.primary_keys = vec!["injected".into()];
             assert!(update_row_statement(engine, &columns(), &change, &[&invalid]).is_err());
             assert!(rejected_update(Ok::<u64, &str>(0)).0.contains("修改未保存"));
+        }
+    }
+
+    #[test]
+    fn sqlserver_rejects_full_binary_and_utf16_values_before_preparing_writes() {
+        let mut column = columns()[1].clone();
+        for (kind, sql_type, oversized, fitting) in [
+            (CellKind::Text, "nvarchar(5)", "😀😀😀", "😀😀x"),
+            (CellKind::Text, "varchar(5)", "abcdef", "abcde"),
+            (CellKind::Binary, "varbinary(2)", "0x010203", "0x0102"),
+            (CellKind::Binary, "binary(2)", "0x010203", "0x01"),
+        ] {
+            column.kind = kind;
+            column.sql_type = sql_type.into();
+            column.declared_type = sql_type.into();
+            let columns = [column.clone()];
+            let names = [column.name.clone()];
+            assert!(
+                insert_statement(
+                    Engine::SqlServer,
+                    &table(),
+                    &columns,
+                    &names,
+                    &[InsertValue::Text(oversized.into())]
+                )
+                .is_err()
+            );
+            assert!(
+                insert_statement(
+                    Engine::SqlServer,
+                    &table(),
+                    &columns,
+                    &names,
+                    &[InsertValue::Text(fitting.into())]
+                )
+                .is_ok()
+            );
         }
     }
 }

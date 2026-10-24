@@ -1227,7 +1227,8 @@ fn render_detail_view(
                                         .sense(egui::Sense::click()),
                                     );
                                     let header_response = if !databases && index == 3 {
-                                        header_response.on_hover_text("服务器统计估计；— 表示未提供")
+                                        header_response
+                                            .on_hover_text("服务器统计估计；— 表示未提供")
                                     } else if !databases && index == 4 {
                                         header_response.on_hover_text(catalog_size_hint(data))
                                     } else {
@@ -1461,15 +1462,20 @@ pub(super) fn inspector(ui: &mut egui::Ui, data: &InspectorData<'_>) -> Option<I
             InspectorPage::General => inspector_general(ui, data, &mut action),
             InspectorPage::Fields => inspector_fields(ui, data),
             InspectorPage::Ddl => {
-                ui.label(RichText::new("定义 / DDL").strong()).on_hover_text(
-                    if data.definition.is_none() && data.structure.is_some()
-                        && data.browser.profile.is_some_and(|profile| profile.engine != Engine::MySql)
-                    {
-                        "由结构元数据生成的有限 DDL"
-                    } else {
-                        "对象定义"
-                    },
-                );
+                ui.label(RichText::new("定义 / DDL").strong())
+                    .on_hover_text(
+                        if data.definition.is_none()
+                            && data.structure.is_some()
+                            && data
+                                .browser
+                                .profile
+                                .is_some_and(|profile| profile.engine != Engine::MySql)
+                        {
+                            "由结构元数据生成的有限 DDL"
+                        } else {
+                            "对象定义"
+                        },
+                    );
                 if let Some(definition) = data.definition {
                     inspector_sql(ui, definition, "复制定义");
                 } else if let Some((structure, stale)) = data.structure {

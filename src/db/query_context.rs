@@ -1,6 +1,23 @@
 use super::*;
 
 impl Session {
+    /// A disposable operation with an explicit target must connect to that
+    /// database directly, including when PostgreSQL denies access to bootstrap
+    /// databases. Verify the server context before submitting operation SQL.
+    pub async fn connect_to_database(
+        profile: &Profile,
+        credentials: &Credentials,
+        database: &str,
+    ) -> Result<Self> {
+        validate_identifier(database, "目标数据库")?;
+        let mut session = Self::open(profile, credentials, Some(database)).await?;
+        anyhow::ensure!(
+            session.current_database().await?.as_deref() == Some(database),
+            "连接未进入指定数据库，操作未执行"
+        );
+        Ok(session)
+    }
+
     /// Discovery runs on a separate short-lived connection owned by the query
     /// worker; it must never alter an existing user transaction or search path.
     pub async fn query_schemas(&mut self) -> Result<Vec<String>> {

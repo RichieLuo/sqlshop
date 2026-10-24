@@ -11,6 +11,8 @@ pub(super) enum CatalogDialog {
         name: String,
         sql: String,
         target: Option<QueryTarget>,
+        source_tab: Option<Uuid>,
+        expected: Option<Box<SavedQuery>>,
     },
     DeleteGroup(Uuid, String),
     DeleteQuery(Uuid, String),
@@ -23,6 +25,7 @@ impl App {
         match store.load() {
             Ok(catalog) => {
                 self.catalog = catalog;
+                self.refresh_saved_query_states();
                 self.catalog_store = Some(store);
             }
             Err(error) => self.fail(format!(
@@ -40,6 +43,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.catalog = catalog;
+                self.refresh_saved_query_states();
                 self.status = "查询库 / 连接分组已保存".into();
                 self.error = false;
                 true
@@ -48,6 +52,18 @@ impl App {
                 self.fail(format!("保存失败，未更改内存中的查询库：{error:#}"));
                 false
             }
+        }
+    }
+
+    fn refresh_saved_query_states(&mut self) {
+        for tab in &mut self.tabs {
+            tab.saved_query_stale = tab.saved_query.as_ref().is_some_and(|saved| {
+                self.catalog
+                    .queries
+                    .iter()
+                    .find(|query| query.id == saved.id)
+                    != Some(saved)
+            });
         }
     }
 
@@ -69,11 +85,58 @@ impl App {
     }
 
     pub(super) fn new_connection(&mut self) {
-        self.form = Some(ConnectionForm::sql(Profile::default(), Credentials::default(), false));
+        self.form = Some(ConnectionForm::sql(
+            Profile::default(),
+            Credentials::default(),
+            false,
+        ));
+    }
+
+    pub(super) fn can_save_query(&self) -> bool {
+        let tab = &self.tabs[self.active_tab];
+        !self.browser_visible
+            && !tab.management_document()
+            && self.table_create.is_none()
+            && tab.table_target.is_none()
+            && tab.definition.is_none()
+    }
+
+    pub(super) fn save_query_command(&mut self, save_as: bool) {
+        if !self.can_save_query() {
+            return;
+        }
+        let tab = &self.tabs[self.active_tab];
+        if !save_as && tab.file_path.is_some() {
+            self.save_sql(false);
+            return;
+        }
+        if !save_as && let Some(saved) = tab.saved_query.clone() {
+            let dialog = CatalogDialog::Query {
+                id: Some(saved.id),
+                name: saved.name.clone(),
+                sql: tab.sql.clone(),
+                target: tab.target.clone(),
+                source_tab: Some(tab.id),
+                expected: Some(Box::new(saved)),
+            };
+            self.apply_catalog_dialog(&dialog);
+        } else {
+            self.save_to_library(None);
+        }
     }
 
     fn save_to_library(&mut self, id: Option<Uuid>) {
+        if !self.can_save_query() {
+            return;
+        }
         let tab = &self.tabs[self.active_tab];
+        let expected = id.and_then(|id| {
+            tab.saved_query
+                .as_ref()
+                .filter(|q| q.id == id)
+                .or_else(|| self.catalog.queries.iter().find(|q| q.id == id))
+                .cloned()
+        });
         let name = id
             .and_then(|id| {
                 self.catalog
@@ -88,22 +151,104 @@ impl App {
             name,
             sql: tab.sql.clone(),
             target: tab.target.clone(),
+            source_tab: Some(tab.id),
+            expected: expected.map(Box::new),
         });
+    }
+
+    fn apply_catalog_dialog(&mut self, dialog: &CatalogDialog) -> bool {
+        let mut catalog = self.catalog.clone();
+        let result = match dialog {
+            CatalogDialog::Group { id, name } => catalog.save_group(*id, name).map(|_| None),
+            CatalogDialog::Query {
+                id,
+                name,
+                sql,
+                target,
+                expected,
+                ..
+            } => {
+                if id.is_some()
+                    && catalog.queries.iter().find(|q| Some(q.id) == *id) != expected.as_deref()
+                {
+                    self.fail(
+                        "此查询已被修改或删除，未覆盖保存。请重新打开核对，或另存为查询。".into(),
+                    );
+                    return false;
+                }
+                catalog
+                    .save_query(*id, name, sql.clone(), target.clone())
+                    .map(Some)
+            }
+            CatalogDialog::DeleteGroup(id, _) => {
+                catalog.delete_group(*id);
+                Ok(None)
+            }
+            CatalogDialog::DeleteQuery(id, _) => {
+                catalog.queries.retain(|q| q.id != *id);
+                Ok(None)
+            }
+        };
+        let saved_id = match result {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail(error.to_string());
+                return false;
+            }
+        };
+        if !self.commit_catalog(catalog) {
+            return false;
+        }
+        if let Some(id) = saved_id {
+            let query = self
+                .catalog
+                .queries
+                .iter()
+                .find(|q| q.id == id)
+                .unwrap()
+                .clone();
+            let source_tab = match dialog {
+                CatalogDialog::Query { source_tab, .. } => *source_tab,
+                _ => None,
+            };
+            for tab in &mut self.tabs {
+                let source = Some(tab.id) == source_tab;
+                let renamed = tab.saved_query.as_ref().is_some_and(|old| {
+                    old.id == query.id && old.sql == query.sql && old.target == query.target
+                });
+                if source || renamed {
+                    if tab.file_path.is_none() {
+                        tab.name = query.name.clone();
+                    }
+                    tab.saved_query = Some(query.clone());
+                    tab.saved_query_stale = false;
+                }
+            }
+            self.status = format!("查询“{}”已保存", query.name);
+        }
+        true
     }
 
     pub(super) fn command_bar(&mut self, ctx: &egui::Context) {
         let available = !self.modal_open();
-        let selected_sql_ready = self.selected_session().is_some_and(|s| s.connected.is_some() && !s.busy);
-        let selected_ready = self.selected.map(|id| if self.is_redis_connection(id) { self.redis_ready(id) } else { selected_sql_ready }).unwrap_or(false);
+        let selected_sql_ready = self
+            .selected_session()
+            .is_some_and(|s| s.connected.is_some() && !s.busy);
+        let selected_ready = self
+            .selected
+            .map(|id| {
+                if self.is_redis_connection(id) {
+                    self.redis_ready(id)
+                } else {
+                    selected_sql_ready
+                }
+            })
+            .unwrap_or(false);
         let selected_database = self
             .selected_session()
             .is_some_and(|s| s.active_database.is_some());
         let writable = self.catalog_store.is_some();
-        let sql_tab = !self.browser_visible
-            && !self.tabs[self.active_tab].management_document()
-            && self.table_create.is_none()
-            && (self.tabs[self.active_tab].table_target.is_none()
-                && self.tabs[self.active_tab].definition.is_none());
+        let sql_tab = self.can_save_query();
         let dark = ctx.style().visuals.dark_mode;
         let divider = egui::Stroke::new(
             1.0,
@@ -137,12 +282,22 @@ impl App {
                                 ui.close();
                             }
                             ui.separator();
+                            if ui
+                                .add_enabled(
+                                    writable && sql_tab,
+                                    egui::Button::new("保存查询  Ctrl+S"),
+                                )
+                                .clicked()
+                            {
+                                self.save_query_command(false);
+                                ui.close();
+                            }
                             if ui.button("打开 SQL 文件…  Ctrl+O").clicked() {
                                 self.open_sql();
                                 ui.close();
                             }
                             if ui
-                                .add_enabled(sql_tab, egui::Button::new("保存 SQL 文件…  Ctrl+S"))
+                                .add_enabled(sql_tab, egui::Button::new("保存 SQL 文件…"))
                                 .clicked()
                             {
                                 self.save_sql(false);
@@ -202,11 +357,16 @@ impl App {
                                 .add_enabled(selected_ready, egui::Button::new("断开活动连接…"))
                                 .clicked()
                             {
-                                if let Some(id) = self.selected { self.disconnect_connection(id); }
+                                if let Some(id) = self.selected {
+                                    self.disconnect_connection(id);
+                                }
                                 ui.close();
                             }
                             if ui
-                                .add_enabled(selected_sql_ready, egui::Button::new("刷新数据库列表"))
+                                .add_enabled(
+                                    selected_sql_ready,
+                                    egui::Button::new("刷新数据库列表"),
+                                )
                                 .clicked()
                             {
                                 self.request(Request::Databases, "正在刷新数据库列表…");
@@ -280,14 +440,24 @@ impl App {
                             if ui
                                 .add_enabled(
                                     writable && sql_tab,
-                                    egui::Button::new("保存到查询库…"),
+                                    egui::Button::new("保存查询  Ctrl+S"),
                                 )
                                 .clicked()
                             {
-                                self.save_to_library(None);
+                                self.save_query_command(false);
                                 ui.close();
                             }
-                            if ui.button("已保存查询 / 连接分组…").clicked() {
+                            if ui
+                                .add_enabled(
+                                    writable && sql_tab,
+                                    egui::Button::new("查询另存为…  Ctrl+Shift+S"),
+                                )
+                                .clicked()
+                            {
+                                self.save_query_command(true);
+                                ui.close();
+                            }
+                            if ui.button("已保存查询…").clicked() {
                                 self.library_open = true;
                                 ui.close();
                             }
@@ -365,8 +535,9 @@ impl App {
                         if ui
                             .add_enabled(selected_ready, egui::Button::new("断开"))
                             .clicked()
+                            && let Some(id) = self.selected
                         {
-                            if let Some(id) = self.selected { self.disconnect_connection(id); }
+                            self.disconnect_connection(id);
                         }
                         ui.separator();
                         if ui.button("＋ 新建查询").clicked() {
@@ -377,12 +548,14 @@ impl App {
                         }
                         if ui
                             .add_enabled(writable && sql_tab, egui::Button::new("保存查询…"))
-                            .on_hover_text("命名保存到本机查询库，与 SQL 文件 / 自动草稿独立")
+                            .on_hover_text(
+                                "命名保存查询；已打开的命名查询直接更新，SQL 文件继续保存到原文件",
+                            )
                             .clicked()
                         {
-                            self.save_to_library(None);
+                            self.save_query_command(false);
                         }
-                        if ui.button("查询库").clicked() {
+                        if ui.button("已保存查询").clicked() {
                             self.library_open = true;
                         }
                         ui.separator();
@@ -414,8 +587,58 @@ impl App {
         }
     }
 
+    pub(super) fn saved_queries_sidebar(&mut self, ui: &mut egui::Ui) {
+        let mut selected = None;
+        egui::CollapsingHeader::new(format!("已保存查询 ({})", self.catalog.queries.len()))
+            .id_salt("saved-queries-sidebar")
+            .default_open(true)
+            .show(ui, |ui| {
+                if ui.button("打开查询库…").clicked() {
+                    self.library_open = true;
+                }
+                if self.catalog.queries.is_empty() {
+                    ui.label(
+                        RichText::new("在查询页点击“保存查询”即可添加")
+                            .small()
+                            .weak(),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("saved-queries-sidebar-list")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for query in &self.catalog.queries {
+                                let active = !self.browser_visible
+                                    && self.tabs[self.active_tab].saved_query.as_ref()
+                                        == Some(query);
+                                if ui
+                                    .selectable_label(active, &query.name)
+                                    .on_hover_text("打开命名查询，保留执行目标")
+                                    .clicked()
+                                {
+                                    selected = Some(query.clone());
+                                }
+                            }
+                        });
+                }
+            });
+        if let Some(query) = selected {
+            self.open_saved_query(query);
+        }
+    }
+
     pub(super) fn open_saved_query(&mut self, query: SavedQuery) {
-        // Always create a new editor, never overwrite a dirty draft, connect or run.
+        // Reuse the named document without replacing unsaved edits.
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.saved_query.as_ref() == Some(&query))
+        {
+            self.active_tab = index;
+            self.browser_visible = false;
+            self.tabs[index].focus_editor = true;
+            return;
+        }
         if !self.apply_ui_tab_action(TabAction::New) {
             return;
         }
@@ -428,14 +651,14 @@ impl App {
         if self.library_open {
             let mut open = true;
             let mut selected_query = None;
-            dialog_window("已保存查询与连接分组", ctx)
+            dialog_window("已保存查询", ctx)
                 .open(&mut open).default_width(740.0).default_height(480.0)
                 .show(ctx, |ui| {
                     ui.add_enabled_ui(self.catalog_dialog.is_none(), |ui| {
                         if self.catalog_store.is_none() { ui.colored_label(Color32::from_rgb(230, 130, 90), "查询库不可用，修改已禁用；请检查状态栏错误并重启。"); }
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.library_search).hint_text("搜索查询名称 / SQL"));
-                            if ui.add_enabled(self.catalog_store.is_some() && (self.tabs[self.active_tab].table_target.is_none() && self.tabs[self.active_tab].definition.is_none()), egui::Button::new("保存当前查询…")).on_hover_text("命名查询独立于草稿和历史；SQL 以明文保存在本机，可能含敏感信息").clicked() { self.save_to_library(None); }
+                            if ui.add_enabled(self.catalog_store.is_some() && self.can_save_query(), egui::Button::new("保存当前查询…")).on_hover_text("命名查询独立于草稿和历史；SQL 以明文保存在本机，可能含敏感信息").clicked() { self.save_to_library(None); }
                         });
                         let needle = self.library_search.to_lowercase();
                         egui::ScrollArea::vertical().id_salt("saved-query-list").max_height(280.0).show(ui, |ui| {
@@ -447,8 +670,8 @@ impl App {
                                         ui.strong(&query.name);
                                         if ui.button("打开").clicked() { selected_query = Some(query.clone()); }
                                         ui.add_enabled_ui(self.catalog_store.is_some(), |ui| {
-                                            if ui.button("重命名…").clicked() { self.catalog_dialog = Some(CatalogDialog::Query { id: Some(query.id), name: query.name.clone(), sql: query.sql.clone(), target: query.target.clone() }); }
-                                            if ui.add_enabled(self.tabs[self.active_tab].table_target.is_none() && self.tabs[self.active_tab].definition.is_none(), egui::Button::new("用当前查询更新…")).on_hover_text("确认后覆盖此命名查询的 SQL 和执行目标，不修改 SQL 文件").clicked() { self.save_to_library(Some(query.id)); }
+                                            if ui.button("重命名…").clicked() { self.catalog_dialog = Some(CatalogDialog::Query { id: Some(query.id), name: query.name.clone(), sql: query.sql.clone(), target: query.target.clone(), source_tab: None, expected: Some(Box::new(query.clone())) }); }
+                                            if ui.add_enabled(self.can_save_query(), egui::Button::new("用当前查询更新…")).on_hover_text("确认后覆盖此命名查询的 SQL 和执行目标，不修改 SQL 文件").clicked() { self.save_to_library(Some(query.id)); }
                                             if ui.button("删除…").clicked() { self.catalog_dialog = Some(CatalogDialog::DeleteQuery(query.id, query.name.clone())); }
                                         });
                                     });
@@ -522,10 +745,14 @@ impl App {
                             ));
                         }
                         CatalogDialog::DeleteGroup(_, name) => {
-                            ui.label(format!("删除分组“{name}”？组内连接移入“未分组”，保留连接配置及凭据。"));
+                            ui.label(format!(
+                                "删除分组“{name}”？组内连接移入“未分组”，保留连接配置及凭据。"
+                            ));
                         }
                         CatalogDialog::DeleteQuery(_, name) => {
-                            ui.label(format!("永久删除命名查询“{name}”？已打开的标签、SQL 文件和历史不受影响。"));
+                            ui.label(format!(
+                                "永久删除命名查询“{name}”？已打开的标签、SQL 文件和历史不受影响。"
+                            ));
                         }
                     }
                     ui.horizontal(|ui| {
@@ -539,33 +766,7 @@ impl App {
                             .clicked();
                     });
                 });
-            let mut completed = false;
-            if confirm {
-                let mut catalog = self.catalog.clone();
-                let result = match &dialog {
-                    CatalogDialog::Group { id, name } => catalog.save_group(*id, name).map(|_| ()),
-                    CatalogDialog::Query {
-                        id,
-                        name,
-                        sql,
-                        target,
-                    } => catalog
-                        .save_query(*id, name, sql.clone(), target.clone())
-                        .map(|_| ()),
-                    CatalogDialog::DeleteGroup(id, _) => {
-                        catalog.delete_group(*id);
-                        Ok(())
-                    }
-                    CatalogDialog::DeleteQuery(id, _) => {
-                        catalog.queries.retain(|q| q.id != *id);
-                        Ok(())
-                    }
-                };
-                match result {
-                    Ok(()) => completed = self.commit_catalog(catalog),
-                    Err(error) => self.fail(error.to_string()),
-                }
-            }
+            let completed = confirm && self.apply_catalog_dialog(&dialog);
             if !cancel && !completed {
                 self.catalog_dialog = Some(dialog);
             }
@@ -576,17 +777,255 @@ impl App {
 fn query_tab_from_saved(query: SavedQuery, id: Uuid) -> QueryTab {
     let mut tab = QueryTab::new(1);
     tab.id = id;
-    tab.name = query.name;
-    tab.sql = query.sql;
+    tab.name = query.name.clone();
+    tab.sql = query.sql.clone();
     // Library snapshots are not file saves. Keep a separate file-dirty baseline.
     tab.saved_sql.clear();
-    tab.target = query.target;
+    tab.target = query.target.clone();
+    tab.saved_query = Some(query);
     tab
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn library_app(directory: &std::path::Path) -> App {
+        let mut app = super::super::tests::session_test_app();
+        app.browser_visible = false;
+        app.catalog_store = Some(CatalogStore::new(directory.into()));
+        app
+    }
+
+    fn save_new_query(app: &mut App, name: &str) -> SavedQuery {
+        app.save_query_command(false);
+        let mut dialog = app
+            .catalog_dialog
+            .take()
+            .expect("name dialog for new query");
+        let CatalogDialog::Query { name: title, .. } = &mut dialog else {
+            panic!("query dialog")
+        };
+        *title = name.into();
+        assert!(app.apply_catalog_dialog(&dialog));
+        app.catalog.queries.last().unwrap().clone()
+    }
+
+    #[test]
+    fn named_query_save_update_and_restart_preserve_identity_sql_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        let target = Some(QueryTarget {
+            connection: Uuid::new_v4(),
+            database: Some("业务库".into()),
+            schema: Some("sales".into()),
+        });
+        app.tabs[0].sql = "SELECT '查询内容';".into();
+        app.tabs[0].target = target.clone();
+        let original = save_new_query(&mut app, "每日报表");
+        assert!(!app.tabs[0].dirty());
+        assert!(app.tabs[0].saved_sql.is_empty() && app.tabs[0].file_path.is_none());
+        app.tabs[0].sql = "SELECT '更新内容';".into();
+        assert!(app.tabs[0].dirty());
+        app.save_query_command(false);
+        assert!(app.catalog_dialog.is_none());
+        assert_eq!(app.catalog.queries.len(), 1);
+        assert_eq!(app.catalog.queries[0].id, original.id);
+        assert!(!app.tabs[0].dirty());
+        let stored = CatalogStore::new(dir.path().into()).load().unwrap();
+        assert_eq!(stored.queries[0].sql, "SELECT '更新内容';");
+        assert_eq!(stored.queries[0].target, target);
+
+        WorkspaceStore::new(dir.path().into())
+            .save(&app.workspace_snapshot())
+            .unwrap();
+        let mut restored = library_app(dir.path());
+        restored.store = Some(Store {
+            directory: dir.path().into(),
+        });
+        restored.restore_workspace();
+        restored.restore_catalog();
+        assert_eq!(
+            restored.tabs[0].saved_query.as_ref().unwrap().id,
+            original.id
+        );
+        assert_eq!(restored.tabs[0].target, target);
+        assert!(!restored.tabs[0].dirty());
+        assert!(restored.query_sessions.is_empty());
+        assert!(!restored.tabs[0].query_started);
+        restored.tabs[0].sql = "SELECT '重启后修改';".into();
+        restored.save_query_command(false);
+        assert_eq!(restored.catalog.queries.len(), 1);
+        assert_eq!(restored.catalog.queries[0].sql, "SELECT '重启后修改';");
+    }
+
+    #[test]
+    fn opening_named_query_reuses_its_editor_and_keeps_unsaved_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 1".into();
+        let saved = save_new_query(&mut app, "常用查询");
+        app.tabs[0].sql = "SELECT 2".into();
+        app.open_saved_query(saved);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].sql, "SELECT 2");
+        assert!(app.tabs[0].dirty());
+        assert!(app.query_sessions.is_empty());
+    }
+
+    #[test]
+    fn opening_updated_query_uses_current_contents_and_keeps_old_target_as_a_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 'old'".into();
+        app.tabs[0].target = Some(QueryTarget {
+            connection: Uuid::new_v4(),
+            database: Some("old_db".into()),
+            schema: None,
+        });
+        let old_target = app.tabs[0].target.clone();
+        let saved = save_new_query(&mut app, "目标保护");
+        let mut newer = QueryTab::new(2);
+        newer.sql = "SELECT 'new'".into();
+        newer.target = Some(QueryTarget {
+            connection: Uuid::new_v4(),
+            database: Some("new_db".into()),
+            schema: None,
+        });
+        app.tabs.push(newer);
+        app.active_tab = 1;
+        app.save_to_library(Some(saved.id));
+        let dialog = app.catalog_dialog.take().unwrap();
+        assert!(app.apply_catalog_dialog(&dialog));
+        assert!(app.tabs[0].saved_query_stale && app.tabs[0].dirty());
+        assert_eq!(app.tabs[0].target, old_target);
+        app.active_tab = 0;
+        app.open_saved_query(app.catalog.queries[0].clone());
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.tabs[1].sql, "SELECT 'new'");
+        assert_eq!(
+            app.tabs[1].target.as_ref().unwrap().database.as_deref(),
+            Some("new_db")
+        );
+        assert_eq!(app.tabs[0].sql, "SELECT 'old'");
+    }
+
+    #[test]
+    fn file_save_shortcut_writes_the_file_even_when_also_saved_in_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 1".into();
+        let named = save_new_query(&mut app, "文件和查询");
+        let file = dir.path().join("query.sql");
+        app.tabs[0].file_path = Some(file.clone());
+        app.tabs[0].sql = "SELECT 2".into();
+        app.save_query_command(false);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "SELECT 2");
+        assert_eq!(app.catalog.queries[0], named);
+        assert!(!app.tabs[0].dirty());
+    }
+
+    #[test]
+    fn editor_save_shortcut_opens_naming_for_an_untitled_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 1".into();
+        let ctx = app.context.clone();
+        let modifiers = egui::Modifiers::COMMAND;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            modifiers,
+            events: vec![egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.workspace_tools(ui));
+        });
+        assert!(matches!(
+            app.catalog_dialog,
+            Some(CatalogDialog::Query { id: None, .. })
+        ));
+        assert!(app.catalog.queries.is_empty());
+        assert!(!app.tabs[0].query_started);
+    }
+
+    #[test]
+    fn stale_named_query_never_overwrites_another_editors_newer_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 1".into();
+        let saved = save_new_query(&mut app, "并发编辑");
+        app.tabs.push(query_tab_from_saved(saved, Uuid::new_v4()));
+        app.tabs[0].sql = "SELECT 2".into();
+        app.save_query_command(false);
+        app.active_tab = 1;
+        app.tabs[1].sql = "SELECT 3".into();
+        app.save_query_command(false);
+        assert!(app.error);
+        assert_eq!(app.catalog.queries[0].sql, "SELECT 2");
+        assert_eq!(
+            CatalogStore::new(dir.path().into()).load().unwrap().queries[0].sql,
+            "SELECT 2"
+        );
+        assert_eq!(app.tabs[1].sql, "SELECT 3");
+        assert!(app.tabs[1].dirty());
+        app.save_query_command(true);
+        let mut dialog = app.catalog_dialog.take().unwrap();
+        let CatalogDialog::Query { name, .. } = &mut dialog else {
+            panic!()
+        };
+        *name = "并发编辑副本".into();
+        assert!(app.apply_catalog_dialog(&dialog));
+        assert_eq!(app.catalog.queries.len(), 2);
+        assert!(!app.tabs[1].dirty());
+    }
+
+    #[test]
+    fn save_dialog_binds_its_source_and_failed_write_keeps_the_draft_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 1".into();
+        app.save_query_command(false);
+        let dialog = app.catalog_dialog.take().unwrap();
+        app.tabs.push(QueryTab::new(2));
+        app.active_tab = 1;
+        assert!(app.apply_catalog_dialog(&dialog));
+        assert!(app.tabs[0].saved_query.is_some());
+        assert!(app.tabs[1].saved_query.is_none());
+        app.tabs[1].sql = "SELECT 2".into();
+        app.save_query_command(false);
+        let dialog = app.catalog_dialog.take().unwrap();
+        std::fs::write(dir.path().join("catalog.json"), b"{corrupt").unwrap();
+        assert!(!app.apply_catalog_dialog(&dialog));
+        assert_eq!(app.catalog.queries.len(), 1);
+        assert!(app.tabs[1].saved_query.is_none());
+        assert!(app.tabs[1].dirty());
+    }
+
+    #[test]
+    fn library_save_never_marks_an_existing_sql_file_as_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = library_app(dir.path());
+        app.tabs[0].sql = "SELECT 2".into();
+        app.tabs[0].saved_sql = "SELECT 1".into();
+        app.tabs[0].file_path = Some(dir.path().join("query.sql"));
+        app.save_to_library(None);
+        let dialog = app.catalog_dialog.take().unwrap();
+        assert!(app.apply_catalog_dialog(&dialog));
+        assert!(app.tabs[0].dirty());
+        assert_eq!(app.tabs[0].saved_sql, "SELECT 1");
+        assert!(!dir.path().join("query.sql").exists());
+    }
+
     #[test]
     fn library_open_preserves_missing_target_without_executing_or_claiming_a_file_save() {
         let target = Some(QueryTarget {
@@ -606,7 +1045,8 @@ mod tests {
         assert_eq!(tab.target, target);
         assert!(!tab.query_started);
         assert!(tab.output.is_none() && tab.file_path.is_none() && tab.table_target.is_none());
-        assert!(tab.dirty());
+        assert!(!tab.dirty());
+        assert!(tab.saved_sql.is_empty());
         assert!(tab.selection.is_empty());
     }
 }

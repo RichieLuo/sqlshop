@@ -1,5 +1,7 @@
 use super::*;
 
+type HashEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 pub(super) async fn handle_request(
     connection: &mut Option<RedisConnection>,
     database: &mut u32,
@@ -518,7 +520,7 @@ async fn read_key(connection: &mut RedisConnection, key: Vec<u8>) -> Result<Redi
             RedisValue::String(bytes)
         }
         RedisKind::Hash => {
-            let (cursor, pairs): (u64, Vec<(Vec<u8>, Vec<u8>)>) = connection
+            let (cursor, pairs): (u64, HashEntries) = connection
                 .query(
                     redis::cmd("HSCAN")
                         .arg(&key)

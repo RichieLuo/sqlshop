@@ -1,4 +1,58 @@
 use super::*;
+use sqlshop::workspace::SavedEngineDocument;
+
+pub(super) enum SqlReplacement {
+    Generated(String),
+    File { path: PathBuf, sql: String },
+}
+
+impl SqlReplacement {
+    fn sql(&self) -> &str {
+        match self {
+            Self::Generated(sql) | Self::File { sql, .. } => sql,
+        }
+    }
+
+    pub(super) fn apply(
+        self,
+        sql: &mut String,
+        saved_sql: &mut String,
+        file_path: &mut Option<PathBuf>,
+    ) {
+        match self {
+            Self::Generated(replacement) => *sql = replacement,
+            Self::File {
+                path,
+                sql: replacement,
+            } => {
+                *saved_sql = replacement.clone();
+                *sql = replacement;
+                *file_path = Some(path);
+            }
+        }
+    }
+
+    pub(super) fn confirm(&self, ui: &mut egui::Ui) -> Option<bool> {
+        let mut action = None;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label("当前 SQL 有未保存修改。确认替换会丢弃这些修改。");
+            ui.collapsing("待替换的 SQL", |ui| {
+                egui::ScrollArea::both().max_height(120.0).show(ui, |ui| {
+                    ui.monospace(self.sql());
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui.button("保留当前 SQL").clicked() {
+                    action = Some(false);
+                }
+                if ui.button("确认替换 SQL").clicked() {
+                    action = Some(true);
+                }
+            });
+        });
+        action
+    }
+}
 
 #[derive(Clone)]
 struct FilterDraft {
@@ -129,7 +183,7 @@ impl QueryTab {
     }
 
     pub(super) fn dirty(&self) -> bool {
-        self.sql != self.saved_sql
+        self.sql_dirty()
             || self.local_database.as_ref().is_some_and(|doc| doc.dirty())
             || self
                 .oracle
@@ -141,6 +195,43 @@ impl QueryTab {
                 .advanced
                 .as_ref()
                 .is_some_and(|doc| doc.preview.is_some() || doc.account_preview.is_some())
+    }
+
+    fn workspace_saved_tab(&self) -> SavedTab {
+        if let Some(doc) = &self.local_database {
+            return doc.saved_tab(self.id, &self.name);
+        }
+        if let Some(doc) = &self.oracle {
+            return doc.saved_tab(self.id, &self.name);
+        }
+        SavedTab {
+            id: self.id,
+            name: self.name.clone(),
+            sql: self.sql.clone(),
+            file_path: self.file_path.clone(),
+            saved_sql: self.saved_sql.clone(),
+            target: self.target.clone(),
+            saved_query: self.saved_query.clone(),
+            document: None,
+        }
+    }
+
+    fn matches_saved_tab(&self, saved: &SavedTab) -> bool {
+        if saved.id != self.id || saved.name != self.name {
+            return false;
+        }
+        if let Some(doc) = &self.local_database {
+            return doc.matches_saved(saved);
+        }
+        if let Some(doc) = &self.oracle {
+            return doc.matches_saved(saved);
+        }
+        saved.document.is_none()
+            && saved.sql == self.sql
+            && saved.file_path == self.file_path
+            && saved.saved_sql == self.saved_sql
+            && saved.target == self.target
+            && saved.saved_query == self.saved_query
     }
 }
 
@@ -221,11 +312,29 @@ impl App {
                     .map(|saved| {
                         let mut tab = QueryTab::new(1);
                         tab.id = saved.id;
-                        tab.name = saved.name;
-                        tab.sql = saved.sql;
-                        tab.saved_sql = saved.saved_sql;
-                        tab.file_path = saved.file_path;
-                        tab.target = saved.target;
+                        tab.name = saved.name.clone();
+                        match &saved.document {
+                            Some(SavedEngineDocument::Sqlite { database_path }) => {
+                                tab.local_database =
+                                    Some(local_database_ui::LocalDocument::restore(
+                                        database_path.clone(),
+                                        &saved,
+                                    ));
+                            }
+                            Some(SavedEngineDocument::Oracle { .. }) => {
+                                tab.oracle = Some(oracle_database_ui::OracleDocument::restore(
+                                    &self.context,
+                                    &saved,
+                                ));
+                            }
+                            None => {
+                                tab.sql = saved.sql;
+                                tab.saved_sql = saved.saved_sql;
+                                tab.file_path = saved.file_path;
+                                tab.target = saved.target;
+                                tab.saved_query = saved.saved_query;
+                            }
+                        }
                         tab
                     })
                     .collect();
@@ -268,7 +377,7 @@ impl App {
 
     fn workspace_tabs(&self) -> impl Iterator<Item = &QueryTab> {
         self.tabs.iter().filter(|t| {
-            !t.management_document()
+            (t.local_database.is_some() || t.oracle.is_some() || !t.management_document())
                 && t.definition.is_none()
                 && (t.table_target.is_none() || t.dirty())
         })
@@ -317,13 +426,7 @@ impl App {
             let Some(saved) = saved_tabs.next() else {
                 return false;
             };
-            if saved.id != tab.id
-                || saved.name != tab.name
-                || saved.sql != tab.sql
-                || saved.file_path != tab.file_path
-                || saved.saved_sql != tab.saved_sql
-                || saved.target != tab.target
-            {
+            if !tab.matches_saved_tab(saved) {
                 return false;
             }
         }
@@ -333,14 +436,7 @@ impl App {
     pub(super) fn workspace_snapshot(&self) -> Workspace {
         let tabs: Vec<_> = self
             .workspace_tabs()
-            .map(|t| SavedTab {
-                id: t.id,
-                name: t.name.clone(),
-                sql: t.sql.clone(),
-                file_path: t.file_path.clone(),
-                saved_sql: t.saved_sql.clone(),
-                target: t.target.clone(),
-            })
+            .map(QueryTab::workspace_saved_tab)
             .collect();
         let active_id = self.tabs[self.active_tab].id;
         let active_tab = tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
@@ -645,10 +741,16 @@ impl App {
                 if ui.button("打开 SQL…").clicked() {
                     self.open_sql();
                 }
-                if ui.button("保存 SQL").clicked() {
+                if ui.button("保存查询").clicked() {
+                    self.save_query_command(false);
+                }
+                if ui.button("已保存查询").clicked() {
+                    self.library_open = true;
+                }
+                if ui.button("保存 SQL 文件").clicked() {
                     self.save_sql(false);
                 }
-                if ui.button("另存为…").clicked() {
+                if ui.button("SQL 文件另存为…").clicked() {
                     self.save_sql(true);
                 }
             });
@@ -683,6 +785,12 @@ impl App {
                 });
             }
         });
+        if self.tabs[self.active_tab].saved_query_stale {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "查询库已有新版；此标签保留旧内容和目标。可从侧栏打开新版，或另存为查询。",
+            );
+        }
         let shortcuts = ui.is_enabled()
             && self.cell_editor.is_none()
             && self.form.is_none()
@@ -693,8 +801,15 @@ impl App {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
                 self.tabs[self.active_tab].find_open = true;
             }
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
-                self.save_sql(false);
+            if ui.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::S,
+                )
+            }) {
+                self.save_query_command(true);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+                self.save_query_command(false);
             }
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
                 self.open_sql();
@@ -1338,7 +1453,9 @@ impl App {
                         });
                 })
                 .header_response
-                .on_hover_text("● 暂存值 · ＋ 新增行；复制和导出使用上次读取的数据库快照，提交后才写入数据库");
+                .on_hover_text(
+                    "● 暂存值 · ＋ 新增行；复制和导出使用上次读取的数据库快照，提交后才写入数据库",
+                );
         }
         if reload {
             self.load_table(self.active_tab);
@@ -1477,7 +1594,10 @@ impl App {
                             .database
                             .as_deref()
                             .unwrap_or("服务器（未选库）"),
-                        pending.target.schema.as_ref()
+                        pending
+                            .target
+                            .schema
+                            .as_ref()
                             .map(|schema| format!("  ·  Schema：{schema}"))
                             .unwrap_or_default()
                     ));
@@ -1554,9 +1674,19 @@ impl App {
             let mut cancel = false;
             dialog_window("切换 / 断开数据库会话？", ctx).show(ctx, |ui| {
                 let connection = self.confirm_request.as_ref().map(|(id, _, _)| *id).unwrap();
-                let name = self.profiles.iter().find(|p| p.id == connection).map(|p| p.name.as_str()).unwrap_or("原连接");
-                ui.label(format!("切库、重连或断开连接“{name}”可能回滚未提交事务；其他连接不受影响。"));
-                ui.horizontal(|ui| { cancel = ui.button("取消").clicked(); confirm = ui.button("确认继续").clicked(); });
+                let name = self
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == connection)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("原连接");
+                ui.label(format!(
+                    "切库、重连或断开连接“{name}”可能回滚未提交事务；其他连接不受影响。"
+                ));
+                ui.horizontal(|ui| {
+                    cancel = ui.button("取消").clicked();
+                    confirm = ui.button("确认继续").clicked();
+                });
             });
             if cancel {
                 self.confirm_request = None;
@@ -1568,17 +1698,28 @@ impl App {
         if self.confirm_exit {
             let busy = self.any_busy();
             let object_dirty = self.object_design_dirty();
-            let redis_drafts = self.tabs.iter().any(|tab| tab.redis.as_ref().is_some_and(|doc| doc.is_dirty()));
+            let redis_drafts = self
+                .tabs
+                .iter()
+                .any(|tab| tab.redis.as_ref().is_some_and(|doc| doc.is_dirty()));
             let mut exit = false;
             let mut discard_exit = false;
             let mut cancel = false;
             dialog_window("退出前确认", ctx).show(ctx, |ui| {
                 ui.label("退出将丢弃表数据暂存，未提交事务可能回滚；SQL 草稿可选择保存。");
-                if redis_drafts { ui.colored_label(ui.visuals().warn_fg_color, "Redis 值草稿未保存，直接退出将丢弃。"); }
+                if redis_drafts {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Redis 值草稿未保存，直接退出将丢弃。",
+                    );
+                }
                 ui.horizontal(|ui| {
                     cancel = ui.button("取消").clicked();
                     exit = ui
-                        .add_enabled(!busy && !object_dirty && !redis_drafts, egui::Button::new("保存草稿并退出"))
+                        .add_enabled(
+                            !busy && !object_dirty && !redis_drafts,
+                            egui::Button::new("保存草稿并退出"),
+                        )
                         .clicked();
                     discard_exit = ui
                         .add_enabled(!busy, egui::Button::new("不保存草稿，直接退出"))
@@ -2139,5 +2280,174 @@ mod browse_draft_tests {
         assert_eq!(tab.browse.page_size, 50);
         assert_eq!(other.browse, TableBrowseOptions::default());
         assert!(other.browse_draft.filters.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod engine_draft_tests {
+    use super::*;
+
+    fn engine_tabs(directory: &std::path::Path) -> Vec<SavedTab> {
+        [
+            (
+                "SQLite · 资料",
+                "DROP TABLE keep_me;",
+                SavedEngineDocument::Sqlite {
+                    database_path: directory.join("not-opened.sqlite"),
+                },
+            ),
+            (
+                "Oracle · 业务库",
+                "UPDATE items SET value = '草稿';",
+                SavedEngineDocument::Oracle {
+                    username: "app_user".into(),
+                    connect_string: "offline.invalid:1521/service".into(),
+                    schema: "APP".into(),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, sql, document)| SavedTab {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            sql: sql.into(),
+            saved_sql: "SELECT 1".into(),
+            file_path: Some(directory.join(format!("{name}.sql"))),
+            target: None,
+            saved_query: None,
+            document: Some(document),
+        })
+        .collect()
+    }
+
+    fn restored_app(directory: &std::path::Path) -> App {
+        let mut app = super::super::tests::session_test_app();
+        let mut workspace = app.workspace_snapshot();
+        workspace.tabs = engine_tabs(directory);
+        workspace.active_tab = 1;
+        workspace.next_tab = 3;
+        WorkspaceStore::new(directory.to_owned())
+            .save(&workspace)
+            .unwrap();
+        app.store = Some(Store {
+            directory: directory.to_owned(),
+        });
+        app.restore_workspace();
+        app
+    }
+
+    fn click_save_and_exit(app: &mut App) {
+        let context = app.context.clone();
+        let mut time = 0.0;
+        let mut frame = |events| {
+            time += 0.1;
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |context| app.workspace_windows(context),
+            )
+        };
+        frame(vec![]);
+        let output = frame(vec![]);
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "保存草稿并退出" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+                }
+                _ => None,
+            })
+            .expect("save-and-exit button must be available for native SQL drafts");
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+    }
+
+    #[test]
+    fn engine_drafts_save_on_exit_and_restore_with_correct_engine_and_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = restored_app(directory.path());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert!(app.tabs[0].local_database.is_some());
+        assert!(app.tabs[1].oracle.is_some());
+        assert!(
+            app.tabs
+                .iter()
+                .all(|tab| tab.target.is_none() && tab.saved_query.is_none() && tab.sql.is_empty())
+        );
+        let before = app.workspace_snapshot();
+        assert!(app.workspace_matches(&before));
+        app.tabs[0]
+            .local_database
+            .as_mut()
+            .unwrap()
+            .sql
+            .push_str(" -- continued editing");
+        assert!(!app.workspace_matches(&before));
+        app.confirm_exit = true;
+        click_save_and_exit(&mut app);
+        assert!(app.allow_exit);
+        let saved = app.workspace_store.as_ref().unwrap().load().unwrap();
+        assert_eq!(saved.tabs, app.workspace_snapshot().tabs);
+        assert_eq!(saved.active_tab, 1);
+        assert!(!directory.path().join("not-opened.sqlite").exists());
+        let mut reopened = super::super::tests::session_test_app();
+        reopened.store = Some(Store {
+            directory: directory.path().to_owned(),
+        });
+        reopened.restore_workspace();
+        assert_eq!(reopened.workspace_snapshot().tabs, saved.tabs);
+        assert!(reopened.tabs.iter().all(QueryTab::document_dirty));
+        assert!(
+            reopened.tabs[0]
+                .local_database
+                .as_ref()
+                .unwrap()
+                .pending
+                .is_none()
+        );
+        let oracle = reopened.tabs[1].oracle.as_ref().unwrap();
+        assert!(!oracle.connected && !oracle.busy && !oracle.may_have_transaction());
+        assert!(!reopened.any_busy());
+        assert!(reopened.query_sessions.is_empty());
+    }
+
+    #[test]
+    fn engine_drafts_keep_close_confirmation_and_failed_exit_save_preserves_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = restored_app(directory.path());
+        for index in [0, 1] {
+            app.change_tab(TabAction::Close(index));
+            assert!(matches!(app.confirm_tab_action, Some(TabAction::Close(i)) if i == index));
+            assert_eq!(app.tabs.len(), 2);
+            app.confirm_tab_action = None;
+        }
+        let original = app.workspace_snapshot();
+        let path = directory.path().join("workspace.json");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.confirm_exit = true;
+        click_save_and_exit(&mut app);
+        assert!(!app.allow_exit);
+        assert!(app.confirm_exit);
+        assert_eq!(app.workspace_snapshot(), original);
+        assert!(path.is_dir());
     }
 }

@@ -384,8 +384,10 @@ fn console_rejects_state_blocking_admin_scripts_and_unbounded_reads() {
             )
             .is_err()
     );
-    let mut profile = RedisProfile::default();
-    profile.tls = true;
+    let mut profile = RedisProfile {
+        tls: true,
+        ..Default::default()
+    };
     profile.ssh.enabled = true;
     assert!(
         profile

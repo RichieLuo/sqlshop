@@ -182,7 +182,21 @@ fn cancellation(engine: Engine, prefix: &str, last: bool) {
                 disconnected: false,
                 ..
             } => assert!(message.contains("停止"), "{message}"),
-            _ => panic!("expected confirmed or between-request read cancellation"),
+            Response::OperationError {
+                message,
+                disconnected,
+                ..
+            }
+            | Response::Error {
+                message,
+                disconnected,
+            } => {
+                panic!("read cancellation failed: disconnected={disconnected}, {message}")
+            }
+            other => panic!(
+                "expected confirmed or between-request read cancellation, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         };
         assert!(w.table_read_execution(tab).is_none());
         assert!(w.cancel_table_read(tab, execution).is_err());

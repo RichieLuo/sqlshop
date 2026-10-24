@@ -354,9 +354,18 @@ pub async fn execute_sql_job(
         spec.connection_fingerprint.as_ref() == Some(&serde_json::to_string(profile)?),
         "任务连接配置已变化或缺少配置快照，未执行；请重新确认计划"
     );
-    let mut session = Session::connect(profile, credentials).await?;
-    session.select_database(&spec.database).await?;
-    if let Some(schema) = &spec.schema {
+    if profile.engine == crate::model::Engine::MySql {
+        anyhow::ensure!(
+            spec.schema
+                .as_ref()
+                .is_none_or(|schema| schema == &spec.database),
+            "MySQL 任务的 Schema 必须与目标数据库一致，SQL 未执行"
+        );
+    }
+    let mut session = Session::connect_to_database(profile, credentials, &spec.database).await?;
+    if let Some(schema) = &spec.schema
+        && profile.engine != crate::model::Engine::MySql
+    {
         session.select_query_schema(schema).await?;
     }
     let output = session.query(&spec.sql).await?;

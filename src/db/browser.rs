@@ -483,9 +483,16 @@ impl Session {
                 }
             }
             Driver::SqlServer(client) => {
-                let row = client.simple_query("SELECT @@TRANCOUNT AS transaction_count, (@@OPTIONS & 2) AS implicit_transactions").await?.into_row().await?.context("无法读取事务状态")?;
+                let row = client.simple_query("SELECT @@TRANCOUNT AS transaction_count, (@@OPTIONS & 2) AS implicit_transactions, (@@OPTIONS & 8) AS ansi_warnings").await?.into_row().await?.context("无法读取事务状态")?;
                 if row.get::<i32, _>(0) != Some(0) || row.get::<i32, _>(1) != Some(0) {
                     return Err(rejected().into());
+                }
+                if row.get::<i32, _>(2) != Some(8) {
+                    return Err(EditRejected(
+                        "当前连接关闭了 ANSI_WARNINGS，可能静默截断文本；请重新连接后再编辑表格"
+                            .into(),
+                    )
+                    .into());
                 }
             }
         }

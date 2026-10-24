@@ -120,43 +120,87 @@ pub(super) fn render_draft_row(
     for (display_index, &index) in visible_columns.iter().enumerate() {
         let column = &columns[index];
         let value = &mut draft.values[index];
-        row.col(|ui| grid_columns_ui::cell(ui, display_index < frozen_count, horizontal_offset, frozen_boundary, viewport_rect, |ui| {
-            if !column.editable || column.kind == sqlshop::model::CellKind::Unsupported {
-                grid_cell(ui, RichText::new("默认值").italics().weak(), false, false)
-                    .on_hover_text("自增、生成或不支持编辑的列，由数据库处理默认值");
-                return;
-            }
-            let rect = ui.available_rect_before_wrap();
-            ui.painter().rect_filled(rect, 0, accent(ui).gamma_multiply(0.08));
-            ui.allocate_rect(rect, egui::Sense::hover());
-            let mut text = match value { InsertValue::Text(text) => text.clone(), _ => String::new() };
-            let hint = match value { InsertValue::Default => "默认值", InsertValue::Null => "NULL", InsertValue::Text(text) if text.is_empty() => "空字符串", InsertValue::Text(_) => "" };
-            let response = ui.add_enabled_ui(enabled, |ui| {
-                ui.put(rect.shrink2(egui::vec2(8.0, 4.0)), egui::TextEdit::singleline(&mut text)
-                    .id_salt(("insert-cell", draft.id, index)).frame(false).hint_text(hint))
-            }).inner;
-            if *focus == Some(draft.id) && first_editable == Some(index) && enabled {
-                response.request_focus();
-                *focus = None;
-            }
-            if response.changed() { *value = InsertValue::Text(text); }
-            if response.clicked() || response.has_focus() { *selected = Some(draft.id); }
-            response.on_hover_text(format!("{} · {}\n右键设置默认值、NULL 或空字符串；直接输入 NULL 为字符串", column.name, column.declared_type))
-                .context_menu(|ui| {
-                    ui.add_enabled_ui(enabled, |ui| {
-                        for (label, mode) in [("使用默认值", InsertValue::Default), ("设为 NULL", InsertValue::Null)] {
-                            if ui.button(label).clicked() { *value = mode; ui.close(); }
-                        }
-                        if column.kind == sqlshop::model::CellKind::Text && ui.button("设为空字符串").clicked() {
-                            *value = InsertValue::Text(String::new());
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("移除此新增行").clicked() { remove = true; ui.close(); }
-                    });
-                });
-            grid_cell_border(ui, rect);
-        }));
+        row.col(|ui| {
+            grid_columns_ui::cell(
+                ui,
+                display_index < frozen_count,
+                horizontal_offset,
+                frozen_boundary,
+                viewport_rect,
+                |ui| {
+                    if !column.editable || column.kind == sqlshop::model::CellKind::Unsupported {
+                        grid_cell(ui, RichText::new("默认值").italics().weak(), false, false)
+                            .on_hover_text("自增、生成或不支持编辑的列，由数据库处理默认值");
+                        return;
+                    }
+                    let rect = ui.available_rect_before_wrap();
+                    ui.painter()
+                        .rect_filled(rect, 0, accent(ui).gamma_multiply(0.08));
+                    ui.allocate_rect(rect, egui::Sense::hover());
+                    let mut text = match value {
+                        InsertValue::Text(text) => text.clone(),
+                        _ => String::new(),
+                    };
+                    let hint = match value {
+                        InsertValue::Default => "默认值",
+                        InsertValue::Null => "NULL",
+                        InsertValue::Text(text) if text.is_empty() => "空字符串",
+                        InsertValue::Text(_) => "",
+                    };
+                    let response = ui
+                        .add_enabled_ui(enabled, |ui| {
+                            ui.put(
+                                rect.shrink2(egui::vec2(8.0, 4.0)),
+                                egui::TextEdit::singleline(&mut text)
+                                    .id_salt(("insert-cell", draft.id, index))
+                                    .frame(false)
+                                    .hint_text(hint),
+                            )
+                        })
+                        .inner;
+                    if *focus == Some(draft.id) && first_editable == Some(index) && enabled {
+                        response.request_focus();
+                        *focus = None;
+                    }
+                    if response.changed() {
+                        *value = InsertValue::Text(text);
+                    }
+                    if response.clicked() || response.has_focus() {
+                        *selected = Some(draft.id);
+                    }
+                    response
+                        .on_hover_text(format!(
+                            "{} · {}\n右键设置默认值、NULL 或空字符串；直接输入 NULL 为字符串",
+                            column.name, column.declared_type
+                        ))
+                        .context_menu(|ui| {
+                            ui.add_enabled_ui(enabled, |ui| {
+                                for (label, mode) in [
+                                    ("使用默认值", InsertValue::Default),
+                                    ("设为 NULL", InsertValue::Null),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        *value = mode;
+                                        ui.close();
+                                    }
+                                }
+                                if column.kind == sqlshop::model::CellKind::Text
+                                    && ui.button("设为空字符串").clicked()
+                                {
+                                    *value = InsertValue::Text(String::new());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("移除此新增行").clicked() {
+                                    remove = true;
+                                    ui.close();
+                                }
+                            });
+                        });
+                    grid_cell_border(ui, rect);
+                },
+            )
+        });
     }
     // A table containing only generated columns still accepts DEFAULT VALUES.
     if *focus == Some(draft.id) && first_editable.is_none() {

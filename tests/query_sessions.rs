@@ -5,7 +5,7 @@ use sqlshop::{
     worker::{QueryRequest, QueryResponse, QueryWorker},
     workspace::QueryTarget,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[path = "support/ssh_gateway.rs"]
@@ -53,10 +53,15 @@ fn send(
 }
 
 fn receive(worker: &QueryWorker) -> QueryResponse {
+    receive_within(worker, Duration::from_secs(20))
+}
+
+fn receive_within(worker: &QueryWorker, timeout: Duration) -> QueryResponse {
+    let deadline = Instant::now() + timeout;
     loop {
         let response = worker
             .receiver
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .unwrap();
         if !matches!(
             response,
@@ -69,16 +74,20 @@ fn receive(worker: &QueryWorker) -> QueryResponse {
     }
 }
 
-fn finished(response: QueryResponse, tab: Uuid, target: &QueryTarget) -> QueryOutput {
+fn finished(response: QueryResponse, tab: Uuid, target: &mut QueryTarget) -> QueryOutput {
     match response {
         QueryResponse::Finished {
             tab: origin,
             output,
             database,
-            ..
+            schema,
         } => {
             assert_eq!(origin, tab);
             assert_eq!(database, target.database);
+            // The actor reports the server's actual schema after connecting or
+            // executing SQL. The UI adopts this context before its next Run;
+            // exercise that same protocol instead of resending schema=None.
+            target.schema = schema;
             output
         }
         QueryResponse::Error { message, .. } => panic!("Unexpected query error: {message}"),
@@ -101,6 +110,7 @@ fn retained_error(response: QueryResponse, tab: Uuid, target: &QueryTarget) {
             tab: origin,
             connected,
             database,
+            schema,
             ..
         } => {
             assert_eq!(origin, tab);
@@ -109,6 +119,7 @@ fn retained_error(response: QueryResponse, tab: Uuid, target: &QueryTarget) {
                 "An ordinary statement error must preserve the session"
             );
             assert_eq!(database, target.database);
+            assert_eq!(schema, target.schema);
         }
         _ => panic!("Expected a retained query session error"),
     }
@@ -128,12 +139,12 @@ fn exercise(engine: Engine, prefix: &str) {
             } else {
                 None
             };
-            let a_target = QueryTarget {
+            let mut a_target = QueryTarget {
                 schema: None,
                 connection: profile.id,
                 database: Some(profile.database.clone()),
             };
-            let b_target = QueryTarget {
+            let mut b_target = QueryTarget {
                 schema: None,
                 connection: profile.id,
                 database: Some(std::env::var("SQLSHOP_TEST_SECOND_DATABASE").unwrap()),
@@ -168,9 +179,10 @@ fn exercise(engine: Engine, prefix: &str) {
                     "WAITFOR DELAY '00:00:03'; SELECT 1 AS completed",
                 ),
             };
-            for (worker, tab, target, marker) in
-                [(&a, a_tab, &a_target, "a"), (&b, b_tab, &b_target, "b")]
-            {
+            for (worker, tab, target, marker) in [
+                (&a, a_tab, &mut a_target, "a"),
+                (&b, b_tab, &mut b_target, "b"),
+            ] {
                 send(
                     worker,
                     &profile,
@@ -192,7 +204,7 @@ fn exercise(engine: Engine, prefix: &str) {
                 &a_target,
                 &format!("{begin}; UPDATE {table} SET marker = 'transaction'"),
             );
-            finished(receive(&a), a_tab, &a_target);
+            finished(receive(&a), a_tab, &mut a_target);
             send(
                 &a,
                 &profile,
@@ -201,7 +213,7 @@ fn exercise(engine: Engine, prefix: &str) {
                 &format!("SELECT marker FROM {table}"),
             );
             assert_eq!(
-                finished(receive(&a), a_tab, &a_target).sets[0].rows[0][0].as_deref(),
+                finished(receive(&a), a_tab, &mut a_target).sets[0].rows[0][0].as_deref(),
                 Some("transaction")
             );
             send(
@@ -212,7 +224,7 @@ fn exercise(engine: Engine, prefix: &str) {
                 &format!("SELECT marker FROM {table}"),
             );
             assert_eq!(
-                finished(receive(&b), b_tab, &b_target).sets[0].rows[0][0].as_deref(),
+                finished(receive(&b), b_tab, &mut b_target).sets[0].rows[0][0].as_deref(),
                 Some("b")
             );
             assert!(!management.raw_session_requires_confirmation());
@@ -223,6 +235,10 @@ fn exercise(engine: Engine, prefix: &str) {
 
             // Misrouting or edited profiles must not discard an open transaction.
             send(&a, &profile, &credentials, &b_target, "SELECT 1");
+            retained_error(receive(&a), a_tab, &a_target);
+            let mut stale_schema = a_target.clone();
+            stale_schema.schema = Some("sqlshop_stale_schema".into());
+            send(&a, &profile, &credentials, &stale_schema, "SELECT 1");
             retained_error(receive(&a), a_tab, &a_target);
             let mut edited = profile.clone();
             edited.port = edited.port.saturating_add(1);
@@ -241,7 +257,7 @@ fn exercise(engine: Engine, prefix: &str) {
             // PostgreSQL has an aborted transaction here: context probes must not
             // prevent the rollback from reaching the same physical connection.
             send(&a, &profile, &credentials, &a_target, rollback);
-            finished(receive(&a), a_tab, &a_target);
+            finished(receive(&a), a_tab, &mut a_target);
             send(
                 &a,
                 &profile,
@@ -250,19 +266,19 @@ fn exercise(engine: Engine, prefix: &str) {
                 &format!("SELECT marker FROM {table}"),
             );
             assert_eq!(
-                finished(receive(&a), a_tab, &a_target).sets[0].rows[0][0].as_deref(),
+                finished(receive(&a), a_tab, &mut a_target).sets[0].rows[0][0].as_deref(),
                 Some("a")
             );
 
             // A pending query on A cannot serialize B behind the same server.
             send(&a, &profile, &credentials, &a_target, slow);
             send(&b, &profile, &credentials, &b_target, "SELECT 42 AS answer");
-            let b_response = b.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            let b_response = receive_within(&b, Duration::from_secs(2));
             assert_eq!(
-                finished(b_response, b_tab, &b_target).sets[0].rows[0][0].as_deref(),
+                finished(b_response, b_tab, &mut b_target).sets[0].rows[0][0].as_deref(),
                 Some("42")
             );
-            finished(receive(&a), a_tab, &a_target);
+            finished(receive(&a), a_tab, &mut a_target);
 
             // USE changes only its source tab, including when a later statement
             // in the batch fails. PostgreSQL has no USE statement.
@@ -280,7 +296,7 @@ fn exercise(engine: Engine, prefix: &str) {
                 send(&a, &profile, &credentials, &a_target, "SELECT 1");
                 retained_error(receive(&a), a_tab, &b_target);
                 send(&a, &profile, &credentials, &b_target, "SELECT 42 AS answer");
-                finished(receive(&a), a_tab, &b_target);
+                finished(receive(&a), a_tab, &mut b_target);
                 assert_eq!(
                     management.current_database().await.unwrap(),
                     b_target.database
@@ -289,7 +305,7 @@ fn exercise(engine: Engine, prefix: &str) {
             a.send(QueryRequest::Disconnect).unwrap();
             assert!(matches!(receive(&a), QueryResponse::Disconnected { tab } if tab == a_tab));
             send(&a, &profile, &credentials, &b_target, "SELECT 42 AS answer");
-            finished(receive(&a), a_tab, &b_target);
+            finished(receive(&a), a_tab, &mut b_target);
             drop(a);
             drop(b);
             drop(management);

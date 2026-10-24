@@ -115,10 +115,7 @@ pub(super) fn show_recovery(
             .on_hover_text("原草稿和主键快照未替换。");
     }
     if !current_report {
-        ui.label(
-            RichText::new("草稿已变化；需重新核实后处理。")
-                .color(ui.visuals().warn_fg_color),
-        );
+        ui.label(RichText::new("草稿已变化；需重新核实后处理。").color(ui.visuals().warn_fg_color));
     }
     let selection_id = ui
         .id()

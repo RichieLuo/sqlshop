@@ -909,6 +909,13 @@ pub fn format_sql(sql: &str, engine: Engine, compact: bool) -> Result<String, St
                 let line_comment = previous.comment && !previous.text.starts_with("/*");
                 let batch_line = batch_lines.contains(&line_start(previous.range.end))
                     || batch_lines.contains(&line_start(token.range.start));
+                // PostgreSQL concatenates adjacent string constants only when
+                // their separating whitespace contains a newline. Preserve it
+                // at literal boundaries even in compact mode (including when
+                // a comment or literal prefix sits between the constants).
+                let literal_newline = engine == Engine::Postgres
+                    && gap.contains(['\n', '\r'])
+                    && (previous.text.starts_with('\'') || token.text.starts_with('\''));
                 let clause = !token.opaque
                     && !token.comment
                     && matches!(
@@ -934,6 +941,7 @@ pub fn format_sql(sql: &str, engine: Engine, compact: bool) -> Result<String, St
                             | "ORDER"
                     );
                 if line_comment
+                    || literal_newline
                     || (batch_line && gap.contains(['\n', '\r']))
                     || (!compact && (clause || previous.text == ";" || previous.text == ","))
                 {
@@ -1228,6 +1236,29 @@ pub fn folding_ranges(sql: &str, engine: Engine) -> Result<Vec<Range<usize>>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_formatting_preserves_literal_concatenation_newlines() {
+        for (sql, expected) in [
+            ("SELECT 'foo'\n'bar';", "SELECT 'foo'\n'bar';"),
+            ("SELECT '中'\r\n'文';", "SELECT '中'\n'文';"),
+            ("SELECT E'foo'\n'bar';", "SELECT E'foo'\n'bar';"),
+            ("SELECT 'foo'\n'bar'\n'baz';", "SELECT 'foo'\n'bar'\n'baz';"),
+        ] {
+            for compact in [false, true] {
+                let formatted = format_sql(sql, Engine::Postgres, compact).unwrap();
+                assert_eq!(formatted, expected);
+                assert_eq!(
+                    format_sql(&formatted, Engine::Postgres, compact).unwrap(),
+                    formatted
+                );
+            }
+        }
+        assert_eq!(
+            format_sql("SELECT 'foo' 'bar';", Engine::Postgres, true).unwrap(),
+            "SELECT 'foo' 'bar';"
+        );
+    }
 
     #[test]
     fn formatting_preserves_dialect_tokens_and_comment_boundaries() {

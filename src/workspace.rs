@@ -9,7 +9,9 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const WORKSPACE_VERSION: u32 = 1;
+// Older clients must reject engine-specific documents rather than interpreting
+// their SQL as an unbound query for a different database engine.
+pub const WORKSPACE_VERSION: u32 = 2;
 pub const MAX_HISTORY_ENTRIES: usize = 200;
 pub const MAX_SQL_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
@@ -33,6 +35,25 @@ pub struct SavedTab {
     pub file_path: Option<PathBuf>,
     pub saved_sql: String,
     pub target: Option<QueryTarget>,
+    #[serde(default)]
+    pub saved_query: Option<crate::catalog::SavedQuery>,
+    /// Independent engine documents retain their identity without credentials,
+    /// live connections, transaction state or result sets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<SavedEngineDocument>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "engine", rename_all = "snake_case")]
+pub enum SavedEngineDocument {
+    Sqlite {
+        database_path: PathBuf,
+    },
+    Oracle {
+        username: String,
+        connect_string: String,
+        schema: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +196,9 @@ impl WorkspaceStore {
         let bytes = read_limited(file, MAX_WORKSPACE_BYTES).context("Cannot read workspace")?;
         let mut workspace: Workspace = serde_json::from_slice(&bytes)
             .context("Workspace is not valid JSON or has invalid fields")?;
+        if workspace.version == 1 {
+            workspace.version = WORKSPACE_VERSION;
+        }
         validate_version(&workspace)?;
         workspace.normalize();
         Ok(workspace)
@@ -347,6 +371,8 @@ mod tests {
             saved_sql: "SELECT 1".into(),
             file_path: Some(directory.path().join("中文.sql")),
             target: Some(entry(1).target),
+            saved_query: None,
+            document: None,
         });
         workspace.next_tab = 2;
         workspace.editor_height = Some(260.0);
@@ -357,6 +383,33 @@ mod tests {
         store.save(&workspace).unwrap();
         assert_eq!(store.load().unwrap(), workspace);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn legacy_saved_tabs_without_engine_or_catalog_binding_still_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(directory.path().to_owned());
+        let mut json = serde_json::to_value(Workspace::default()).unwrap();
+        json["version"] = serde_json::json!(1);
+        json["tabs"] = serde_json::json!([{
+            "id": Uuid::new_v4(), "name": "Legacy", "sql": "SELECT '草稿'",
+            "file_path": null, "saved_sql": "SELECT 1", "target": null
+        }]);
+        fs::write(&store.path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let restored = store.load().unwrap();
+        assert_eq!(restored.version, WORKSPACE_VERSION);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&store.path).unwrap()).unwrap()["version"],
+            1
+        );
+        assert_eq!(restored.tabs[0].sql, "SELECT '草稿'");
+        assert!(restored.tabs[0].document.is_none());
+        assert!(restored.tabs[0].saved_query.is_none());
+        store.save(&restored).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&store.path).unwrap()).unwrap()["version"],
+            WORKSPACE_VERSION
+        );
     }
 
     #[test]

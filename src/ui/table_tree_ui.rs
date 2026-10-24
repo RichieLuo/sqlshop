@@ -361,11 +361,7 @@ pub(super) fn tables(
                             }
                         }
                         if set.truncated {
-                            ui.label(
-                                RichText::new("目录已截断，仅显示已读取项目")
-                                    .small()
-                                    .weak(),
-                            );
+                            ui.label(RichText::new("目录已截断，仅显示已读取项目").small().weak());
                         }
                     }
                 });

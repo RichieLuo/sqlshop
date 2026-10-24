@@ -387,10 +387,10 @@ impl App {
             self.fail(format!("{error:#}"));
             return;
         }
-        if let Some(doc) = self.redis_document_mut(id) {
-            if !doc.disconnect() {
-                self.fail("Redis 断开请求未发送".into());
-            }
+        if let Some(doc) = self.redis_document_mut(id)
+            && !doc.disconnect()
+        {
+            self.fail("Redis 断开请求未发送".into());
         }
     }
 
@@ -500,7 +500,7 @@ impl App {
         store.save_redis(&profiles)?;
         let active_id = self.tabs[self.active_tab].id;
         self.tabs
-            .retain(|tab| !tab.redis.as_ref().is_some_and(|doc| doc.profile_id() == id));
+            .retain(|tab| tab.redis.as_ref().is_none_or(|doc| doc.profile_id() != id));
         if self.tabs.is_empty() {
             self.tabs.push(QueryTab::new(self.next_tab));
             self.next_tab += 1;

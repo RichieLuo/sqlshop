@@ -125,10 +125,20 @@ impl PgConnection {
         buffer.put_slice(&key.0.to_be_bytes());
         buffer.put_slice(&key.1.to_be_bytes());
         stream.flush().await?;
-        // The backend closes this transport without a reply. Wait for EOF so
-        // a late cancel cannot race a subsequent execution on the query socket.
+        // The backend closes this transport without a reply. Windows servers
+        // can reset the socket instead of returning EOF. Only after the whole
+        // request was flushed are both close signals accepted; neither proves
+        // cancellation, which still requires the original query's response.
+        // Waiting for closure prevents a late cancel racing socket reuse.
         match stream.read_buffered(1).await {
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(true),
+            Err(Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(true)
+            }
             Err(error) => Err(error),
             Ok(_) => Err(err_protocol!("unexpected response to CancelRequest")),
         }

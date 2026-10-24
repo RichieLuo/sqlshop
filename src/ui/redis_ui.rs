@@ -1992,7 +1992,6 @@ mod tests {
             pointer(delete, egui::PointerButton::Primary, true),
         ]);
         frame(vec![pointer(delete, egui::PointerButton::Primary, false)]);
-        drop(frame);
         assert_eq!(requested, Some(b"app:".to_vec()));
     }
 
