@@ -24,12 +24,12 @@ pub fn icon_data() -> IconData {
     {
         // eframe installs this icon after application creation, so the viewport
         // must carry the rounded image rather than a separate startup override.
-        image_data(rounded_icon_image())
+        image_data(icon_image())
     }
     #[cfg(target_os = "windows")]
     {
         image_data(image::imageops::resize(
-            &rounded_icon_image(),
+            &icon_image(),
             256,
             256,
             image::imageops::FilterType::Lanczos3,
@@ -45,7 +45,7 @@ pub fn icon_data() -> IconData {
 #[path = "branding_icon.rs"]
 mod branding_icon;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
-use branding_icon::rounded_icon_image;
+use branding_icon::icon_image;
 
 fn decode_icon(png: &[u8]) -> IconData {
     let image = image::load_from_memory(png)
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn rounded_icon_has_a_solid_plate_and_transparent_rounded_exterior() {
-        let image = super::rounded_icon_image();
+        let image = super::icon_image();
         assert_eq!(image.dimensions(), (1024, 1024));
         for (x, y) in [(0, 0), (1023, 0), (0, 1023), (1023, 1023), (110, 110)] {
             assert_eq!(image.get_pixel(x, y)[3], 0);

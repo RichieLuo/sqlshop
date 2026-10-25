@@ -1,3 +1,5 @@
+//! SQLShop business modules. Desktop startup and presentation live in the binary.
+
 pub mod advanced;
 pub mod advanced_worker;
 pub mod backup;

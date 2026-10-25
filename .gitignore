@@ -6,3 +6,7 @@
 !.env.example
 /.workbuddy
 /.claude
+/dist/
+__pycache__/
+*.pyc
+Thumbs.db

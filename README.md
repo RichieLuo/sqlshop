@@ -143,9 +143,16 @@ Linux 编译还需要桌面图形库及 D-Bus 开发包；CI 的 Ubuntu 联测 j
 
 ## 跨平台构建与发布
 
-`.github/workflows/release.yml` 在 Windows、macOS（Intel / Apple Silicon）和 Linux 验证 `cargo build --release --locked`；仅推送 `v*` tag 时打包二进制、生成 SHA-256 校验文件并创建 GitHub Release。工作流不在普通分支或 PR 上发布。本地不执行发布；跨平台构建及三系统启动应以实际 Actions 和目标机器验证，不能据此称为正式发行。Linux 产物是原生二进制压缩包，需要目标系统具备相应动态库，并非 AppImage / deb / rpm；Windows 为 zip，macOS 为 tar.gz，不是安装程序或 `.app` 包。
+三个 Shop 项目的开发、目录和发布约定见 [架构与打包说明](docs/architecture.md)。Windows 使用：
 
-当前工作流**没有代码签名、Apple Developer ID 签名或 macOS 公证**，也没有 Windows Authenticode 签名。系统可能阻止或警告运行未签名程序；这些包不应被称为已签名或已公证的正式安装包。发布前请独立核验文件校验和，正式分发需自行配置签名证书、公证凭据和对应发布步骤。
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 verify
+powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
+```
+
+打包需要 Python 3.9+；生成 `dist/SQLShop-<version>-windows-x64/`、同名 ZIP 和 `.sha256`，内含使用说明、程序版本与第三方许可。macOS / Linux 使用 `python3 scripts/package.py`，输出带版本号的 tar.gz。已有同名包拒绝覆盖，可用 `-OutputDirectory` 指定新目录。
+
+发布工作流与本地共用打包脚本，只有推送与 Cargo 版本一致的 `v<version>` tag 才创建 GitHub Release。产物为未签名便携程序；macOS 未公证，Linux 需要系统动态库，不是安装包。跨平台构建与启动以实际 Actions 和目标机器验证为准。
 
 ## SSH 隧道
 
@@ -196,9 +203,11 @@ SQL Server 首版使用 SQL Server 用户名密码认证，不支持 Windows 集
 ## 项目结构
 
 ```text
-src/main.rs       桌面入口
+src/main.rs       精简桌面入口，调用 app::run()
+src/app.rs        窗口、截图模式及启动选项
+src/lib.rs        业务库模块边界
 src/branding.rs   内嵌猞猁图标、界面纹理及 macOS Dock 图标
-src/ui.rs         连接列表、对象目录、SQL 标签页、结果表格及 CSV 导入导出
+src/ui/mod.rs     连接列表、对象目录、SQL 标签页、结果表格及 CSV 导入导出
 src/model.rs      连接配置、结果模型、方言标识符引用和 CSV 编解码
 src/storage.rs    本地配置及加密凭据文件
 src/worker.rs     后台工作线程、目标校验、错误恢复和连接生命周期
@@ -234,7 +243,7 @@ cargo test --locked
 cargo build --locked
 ```
 
-GitHub Actions 的 `check` job 保持 macOS 的 fmt / clippy / 默认测试；独立的 `database-integration` job 在 GitHub 托管的 Ubuntu x86_64 运行器上使用 Docker Compose 等待三引擎健康后运行 ignored 测试，任一失败即使 job 失败。此 job 对 push / pull_request 均执行；若要在仓库设置中作为合并门禁，需将 `database-integration` 设为 required status check。默认 `cargo test --locked` 不会运行这些 ignored 用例。
+GitHub Actions 的 `check` job 在 Windows / macOS / Linux 执行 fmt / clippy / 默认测试及打包契约测试；独立的 `database-integration` job 在 GitHub 托管的 Ubuntu x86_64 运行器上使用 Docker Compose 等待三引擎健康后运行 ignored 测试，任一失败即使 job 失败。此 job 对 push / pull_request 均执行；若要在仓库设置中作为合并门禁，需将 `database-integration` 设为 required status check。默认 `cargo test --locked` 不会运行这些 ignored 用例。
 
 | 联测矩阵 | MySQL 8.4 | PostgreSQL 17 | SQL Server 2022 Developer |
 | --- | --- | --- | --- |

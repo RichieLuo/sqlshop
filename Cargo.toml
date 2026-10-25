@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.89"
 description = "A local-first Rust desktop database client"
 
+[package.metadata.shop]
+product-name = "SQLShop"
+
 [dependencies]
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 anyhow = "1"

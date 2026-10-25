@@ -17,49 +17,43 @@ jobs:
       matrix:
         include:
           - runner: windows-latest
-            platform: windows
-            artifact: sqlshop-windows-x86_64
+            target: x86_64-pc-windows-msvc
           - runner: macos-15-intel
-            platform: macos
-            artifact: sqlshop-macos-x86_64
+            target: x86_64-apple-darwin
           - runner: macos-latest
-            platform: macos
-            artifact: sqlshop-macos-arm64
+            target: aarch64-apple-darwin
           - runner: ubuntu-latest
-            platform: linux
-            artifact: sqlshop-linux-x86_64
+            target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
       - name: Install Linux build prerequisites
-        if: matrix.platform == 'linux'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libclang-dev clang libx11-dev libxkbcommon-dev libwayland-dev libdbus-1-dev libgtk-3-dev libasound2-dev libudev-dev libegl1-mesa-dev libgl1-mesa-dev
-      - name: Verify release compilation
-        run: cargo build --release --locked
-      - name: Package Unix binary (tag only)
-        if: startsWith(github.ref, 'refs/tags/') && matrix.platform != 'windows'
+      - name: Build and package
+        env:
+          EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          PACKAGE_TARGET: ${{ matrix.target }}
         shell: bash
-        run: |
-          mkdir -p dist
-          tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C target/release sqlshop
-          shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.tar.gz.sha256"
-      - name: Package Windows binary (tag only)
-        if: startsWith(github.ref, 'refs/tags/') && matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target/release/sqlshop.exe -DestinationPath "dist/${{ matrix.artifact }}.zip"
-          $hash = (Get-FileHash "dist/${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  ${{ matrix.artifact }}.zip" | Set-Content -Encoding ascii "dist/${{ matrix.artifact }}.zip.sha256"
+        run: python scripts/package.py --target "$PACKAGE_TARGET" --expected-tag "$EXPECTED_TAG"
       - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/*
+          name: ${{ github.event.repository.name }}-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
           if-no-files-found: error
 
   publish:
@@ -74,11 +68,9 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Publish tag assets
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         shell: bash
-        run: |
-          gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "Unsigned builds: macOS binaries are not notarized. Verify checksums before use."
+        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "Unsigned portable builds. Verify SHA-256 checksums before use."

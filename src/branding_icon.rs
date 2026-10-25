@@ -1,4 +1,4 @@
-pub fn rounded_icon_image() -> image::RgbaImage {
+pub fn icon_image() -> image::RgbaImage {
     let logo = image::load_from_memory(include_bytes!("../assets/branding/sqlshop-lynx-icon.png"))
         .expect("the embedded SQLShop logo must be a valid PNG")
         .resize_exact(760, 760, image::imageops::FilterType::Lanczos3)
