@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -OutputDirectory 
 已有完整包也可单独安装：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -PackageDirectory 'D:\Packages\SQLShop-0.1.0-windows-x64'
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -PackageDirectory 'D:\Packages\SQLShop-1.0.0-windows-x64'
 ```
 
 从解压包内执行 `install.ps1` 时可省略 `-PackageDirectory`。仓库中的入口会记录源仓库位置，供以后成功打包自动刷新；独立解压包安装没有源仓库，后续需再次安装新的包或在仓库中显式执行 `-Install`。
