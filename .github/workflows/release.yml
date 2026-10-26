@@ -1,4 +1,5 @@
-name: Release builds
+name: 跨平台打包
+run-name: ${{ github.event.repository.name }} · ${{ github.ref_name }} · ${{ github.event_name }}
 
 on:
   pull_request:
@@ -10,67 +11,120 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: packages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  RUST_VERSION: 1.95.0
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
+    name: 打包 ${{ matrix.platform }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-latest
+          - runner: windows-2022
+            platform: windows-x64
             target: x86_64-pc-windows-msvc
           - runner: macos-15-intel
+            platform: macos-x64
             target: x86_64-apple-darwin
-          - runner: macos-latest
+          - runner: macos-15
+            platform: macos-arm64
             target: aarch64-apple-darwin
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
+            platform: linux-x64
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
+    env:
+      PACKAGE_TARGET: ${{ matrix.target }}
+      EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages-${{ matrix.target }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
-      - name: Install Linux build prerequisites
+      - name: 安装 Linux 构建依赖
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libclang-dev clang libx11-dev libxkbcommon-dev libwayland-dev libdbus-1-dev libgtk-3-dev libasound2-dev libudev-dev libegl1-mesa-dev libgl1-mesa-dev
-      - name: Build and package
-        env:
-          EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          PACKAGE_TARGET: ${{ matrix.target }}
+      - name: Windows 构建与打包
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parameters = @{ Target = $env:PACKAGE_TARGET; NoInstall = $true }
+          if ($env:EXPECTED_TAG) { $parameters.ExpectedTag = $env:EXPECTED_TAG }
+          .\scripts\package.ps1 @parameters
+      - name: macOS / Linux 构建与打包
+        if: runner.os != 'Windows'
         shell: bash
-        run: python scripts/package.py --target "$PACKAGE_TARGET" --expected-tag "$EXPECTED_TAG"
-      - uses: actions/upload-artifact@v4
+        run: python scripts/package.py --target "$PACKAGE_TARGET" --expected-tag "$EXPECTED_TAG" --no-install
+      - name: 上传程序包与校验文件
+        id: upload
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}-${{ matrix.target }}
+          name: ${{ github.event.repository.name }}-${{ matrix.platform }}
           path: |
             dist/*.zip
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: 写入下载摘要
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          PACKAGE_PLATFORM: ${{ matrix.platform }}
+          REPOSITORY: ${{ github.repository }}
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          files = sorted(path for path in Path('dist').iterdir()
+                         if path.is_file() and path.name.endswith(('.zip', '.tar.gz', '.sha256')))
+          lines = [f"### {os.environ['REPOSITORY']} · {os.environ['PACKAGE_PLATFORM']}",
+                   f"[下载构建产物]({os.environ['ARTIFACT_URL']})（保留 30 天）",
+                   f"Rust {os.environ['RUST_VERSION']} · {os.environ['PACKAGE_TARGET']}",
+                   '', '| 文件 | 大小 |', '| --- | --- |']
+          lines += [f'| `{path.name}` | {path.stat().st_size / 1024 / 1024:.2f} MiB |' for path in files]
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('\n'.join(lines) + '\n')
 
   publish:
+    name: 发布版本附件
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: ${{ github.event.repository.name }}-*
           path: dist
           merge-multiple: true
-      - name: Publish tag assets
+      - name: 创建版本或更新附件
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         shell: bash
-        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "Unsigned portable builds. Verify SHA-256 checksums before use."
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "包含 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 便携包及 SHA-256 校验文件。程序包未签名，macOS 未公证。"
+          fi

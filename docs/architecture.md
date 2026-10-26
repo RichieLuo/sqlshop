@@ -88,6 +88,8 @@ Windows 安装和自动刷新通过真实 Explorer 桌面对象启动隐藏的 P
 
 ## CI 与发布
 
+构建平台、手动触发、产物下载与版本附件说明见 [GitHub Actions 构建与下载](github-actions.md)。
+
 `ci.yml` 在 Windows、macOS、Linux 运行格式检查、clippy、默认测试和打包契约测试。SQLShop 额外保留原有真实数据库集成任务。`release.yml` 在 Windows x64、macOS x64/arm64、Linux x64 调用相同的打包脚本，并上传压缩包和校验文件供检查。
 
 只有推送 `v<version>` tag 才创建 GitHub Release，tag 必须与 Cargo 版本一致；普通分支、PR 和手动运行只构建产物。包为未签名的便携程序，Windows 附带可选的当前用户安装脚本；macOS 为二进制 tar.gz，Linux 需要目标系统的动态库；macOS 未签名或公证。各平台是否构建及启动成功，以实际 CI 和目标机器验证为准。

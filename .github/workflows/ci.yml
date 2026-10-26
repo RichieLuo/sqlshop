@@ -10,27 +10,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-latest, macos-latest, ubuntu-latest]
+        runner: [windows-2022, macos-15, ubuntu-24.04]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
       - name: Install Linux build prerequisites
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libclang-dev clang libx11-dev libxkbcommon-dev libwayland-dev libdbus-1-dev libgtk-3-dev libasound2-dev libudev-dev libegl1-mesa-dev libgl1-mesa-dev
+      - name: Verify Rust on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\dev.ps1 verify
       - run: cargo fmt --all --check
+        if: runner.os != 'Windows'
       - run: cargo clippy --locked --all-targets -- -D warnings
+        if: runner.os != 'Windows'
       - run: cargo test --locked
+        if: runner.os != 'Windows'
       - run: python -m unittest discover -s scripts/tests -v
       - run: python scripts/check-structure.py
 
@@ -42,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux build dependencies
         run: |
