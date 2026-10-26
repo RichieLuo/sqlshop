@@ -1,6 +1,19 @@
-use crate::{branding, ui};
+use crate::{branding, shell_open, ui};
 
 pub fn run() -> eframe::Result {
+    let screenshot_mode = std::env::var_os("SQLSHOP_SCREENSHOT").is_some();
+    let instance = if screenshot_mode {
+        None
+    } else {
+        let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        let Some(instance) = shell_open::start("SQLShop", &arguments)
+            .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?
+        else {
+            return Ok(());
+        };
+        Some(instance)
+    };
+    let attachment = instance.as_ref().map(shell_open::Instance::attachment);
     #[cfg(target_os = "macos")]
     branding::enable_miniwindow_icons();
 
@@ -18,7 +31,6 @@ pub fn run() -> eframe::Result {
             .with_title_shown(false)
             .with_titlebar_buttons_shown(true);
     }
-    let screenshot_mode = std::env::var_os("SQLSHOP_SCREENSHOT").is_some();
     if screenshot_mode
         && let Ok(size) = std::env::var("SQLSHOP_SCREENSHOT_SIZE")
         && let Some((width, height)) = size.split_once('x')
@@ -42,11 +54,18 @@ pub fn run() -> eframe::Result {
             .map(|directory| directory.path().join("ui.ron")),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "SQLShop",
         options,
-        Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
-    )
+        Box::new(move |cc| {
+            if let Some(attachment) = attachment {
+                attachment.attach_context(&cc.egui_ctx);
+            }
+            Ok(Box::new(ui::App::new(cc)))
+        }),
+    );
+    drop(instance);
+    result
 }
 
 #[cfg(test)]

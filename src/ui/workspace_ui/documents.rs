@@ -134,7 +134,22 @@ impl App {
         else {
             return;
         };
-        let identity = sql_file_identity(&path);
+        self.open_sql_path(&path);
+    }
+
+    /// Load a file into an editor tab; never connect or execute its SQL.
+    pub(in crate::ui) fn open_sql_path(&mut self, path: &std::path::Path) -> bool {
+        if self.cell_editor.is_some() {
+            self.finish_inline_cell(false, CellMovement::Stay);
+            if self.cell_editor.is_some() {
+                return false;
+            }
+        }
+        if self.screenshot_path.is_some() {
+            self.fail("截图模式不打开外部 SQL 文件".into());
+            return false;
+        }
+        let identity = sql_file_identity(path);
         if let Some(index) = self.tabs.iter().position(|tab| {
             tab.table_target.is_none()
                 && tab
@@ -147,12 +162,12 @@ impl App {
             self.tabs[index].focus_editor = true;
             self.status = "已切换到打开的 SQL 文档，保留当前草稿与查询目标".into();
             self.error = false;
-            return;
+            return true;
         }
-        match read_sql_file(&path) {
+        match read_sql_file(path) {
             Ok(sql) => {
                 if !self.apply_ui_tab_action(TabAction::New) {
-                    return;
+                    return false;
                 }
                 let tab = &mut self.tabs[self.active_tab];
                 tab.name = path
@@ -162,9 +177,41 @@ impl App {
                     .into_owned();
                 tab.sql = sql.clone();
                 tab.saved_sql = sql;
-                tab.file_path = Some(path);
+                tab.file_path = Some(path.to_owned());
+                self.status = "SQL 文件已载入编辑器，未连接或执行".into();
+                self.error = false;
+                true
             }
-            Err(error) => self.fail(format!("打开 SQL 失败：{error:#}")),
+            Err(error) => {
+                self.fail(format!("打开 SQL 失败：{error:#}"));
+                false
+            }
+        }
+    }
+
+    /// Shell activation can open several documents without replacing existing drafts.
+    pub(in crate::ui) fn open_shell_paths(&mut self, paths: &[PathBuf]) {
+        let mut failures = Vec::new();
+        for path in paths {
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let opened = match extension.as_str() {
+                "sql" => self.open_sql_path(path),
+                "sqlite" | "sqlite3" | "db" | "db3" => self.open_local_database_path(path),
+                _ => {
+                    self.fail("不支持此文件类型；请打开 SQL 或已有的 SQLite 数据库文件".into());
+                    false
+                }
+            };
+            if !opened {
+                failures.push(format!("{}：{}", path.display(), self.status));
+            }
+        }
+        if !failures.is_empty() {
+            self.fail(format!("部分文件未打开：{}", failures.join("；")));
         }
     }
 

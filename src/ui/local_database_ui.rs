@@ -3,6 +3,69 @@ use super::*;
 use sqlshop::local_database::{LocalDatabaseWorker, LocalRequest};
 use sqlshop::workspace::SavedEngineDocument;
 
+impl App {
+    /// Shell/file-open activation only accepts an existing SQLite database.
+    pub(super) fn open_local_database_path(&mut self, path: &std::path::Path) -> bool {
+        if self.screenshot_path.is_some() {
+            self.fail("截图模式不打开外部 SQLite 文件".into());
+            return false;
+        }
+        let identity = (|| -> anyhow::Result<PathBuf> {
+            use std::io::Read;
+
+            let mut file = std::fs::File::open(path)?;
+            anyhow::ensure!(file.metadata()?.is_file(), "请选择已有的普通 SQLite 文件");
+            let mut header = [0_u8; 16];
+            file.read_exact(&mut header)?;
+            anyhow::ensure!(
+                header == *b"SQLite format 3\0",
+                "文件不是有效的 SQLite 数据库"
+            );
+            Ok(std::fs::canonicalize(path)?)
+        })();
+        match identity {
+            Ok(identity) => self.open_local_database_document(identity),
+            Err(error) => {
+                self.fail(format!(
+                    "打开 SQLite 文件失败（未创建或修改文件）：{error:#}"
+                ));
+                false
+            }
+        }
+    }
+
+    /// Manual open/new commands allow existing empty files, as SQLite does.
+    pub(super) fn open_local_database_document(&mut self, identity: PathBuf) -> bool {
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.local_database.as_ref().is_some_and(|doc| {
+                doc.path == identity || doc.path.canonicalize().is_ok_and(|path| path == identity)
+            })
+        }) {
+            self.active_tab = index;
+            self.browser_visible = false;
+            self.status = "已切换到打开的 SQLite 文档，保留草稿、事务与正在进行的操作".into();
+            self.error = false;
+            return true;
+        }
+        let name = identity
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if self
+            .management_tab(format!("SQLite · {name}"), None)
+            .is_none()
+        {
+            return false;
+        }
+        self.tabs[self.active_tab].local_database =
+            Some(LocalDocument::new(identity, self.context.clone()));
+        self.status = "已打开 SQLite 文件，仅载入版本与对象目录".into();
+        self.error = false;
+        true
+    }
+}
+
 pub(super) struct LocalDocument {
     worker: Option<LocalDatabaseWorker>,
     pub path: PathBuf,

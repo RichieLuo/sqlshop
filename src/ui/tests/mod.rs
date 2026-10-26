@@ -16,6 +16,7 @@ mod layout;
 
 mod cell_editor;
 
+mod file_open;
 mod table_drafts;
 
 use super::*;

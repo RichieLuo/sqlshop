@@ -15,8 +15,7 @@ pub fn enable_miniwindow_icons() {
     unsafe { defaults.registerDefaults(&registration) };
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const APP_ICON_PNG: &[u8] = include_bytes!("../assets/branding/sqlshop-lynx-app-icon.png");
+#[cfg(not(target_os = "windows"))]
 const LOGO_PNG: &[u8] = include_bytes!("../assets/branding/sqlshop-lynx-icon.png");
 
 pub fn icon_data() -> IconData {
@@ -37,16 +36,20 @@ pub fn icon_data() -> IconData {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        decode_icon(APP_ICON_PNG)
+        image_data(image::imageops::resize(
+            &icon_image(),
+            256,
+            256,
+            image::imageops::FilterType::Lanczos3,
+        ))
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
 #[path = "branding_icon.rs"]
 mod branding_icon;
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
 use branding_icon::icon_image;
 
+#[cfg(not(target_os = "windows"))]
 fn decode_icon(png: &[u8]) -> IconData {
     let image = image::load_from_memory(png)
         .expect("the embedded SQLShop brand image must be a valid PNG")
@@ -64,12 +67,30 @@ fn image_data(image: image::RgbaImage) -> IconData {
 }
 
 pub fn load_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    #[cfg(target_os = "windows")]
+    return title_texture(ctx);
+    #[cfg(not(target_os = "windows"))]
+    load_logo_texture(ctx)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn load_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
     let icon = decode_icon(LOGO_PNG);
     let image = egui::ColorImage::from_rgba_unmultiplied(
         [icon.width as usize, icon.height as usize],
         &icon.rgba,
     );
     ctx.load_texture("sqlshop-lynx", image, egui::TextureOptions::LINEAR)
+}
+
+#[cfg(target_os = "windows")]
+pub fn title_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = icon_data();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    ctx.load_texture("sqlshop-title-icon", image, egui::TextureOptions::LINEAR)
 }
 
 #[cfg(test)]

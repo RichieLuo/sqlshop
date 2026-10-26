@@ -471,7 +471,8 @@ impl App {
         if self.screenshot_path.is_some() {
             return;
         }
-        let dialog = rfd::FileDialog::new().add_filter("SQLite", &["sqlite", "sqlite3", "db"]);
+        let dialog =
+            rfd::FileDialog::new().add_filter("SQLite", &["sqlite", "sqlite3", "db", "db3"]);
         let path = if create {
             dialog.save_file()
         } else {
@@ -500,28 +501,7 @@ impl App {
                 return;
             }
         };
-        if let Some(index) = self.tabs.iter().position(|tab| {
-            tab.local_database
-                .as_ref()
-                .is_some_and(|doc| doc.path == identity)
-        }) {
-            self.active_tab = index;
-            self.browser_visible = false;
-            return;
-        }
-        let name = identity
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        if self
-            .management_tab(format!("SQLite · {name}"), None)
-            .is_some()
-        {
-            self.tabs[self.active_tab].local_database = Some(
-                local_database_ui::LocalDocument::new(identity, self.context.clone()),
-            );
-        }
+        self.open_local_database_document(identity);
     }
 
     pub(super) fn poll_management(&mut self) {

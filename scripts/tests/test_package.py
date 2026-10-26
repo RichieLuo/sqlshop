@@ -46,7 +46,12 @@ class PackageTests(unittest.TestCase):
         return path
 
     def build_package(self, target, **kwargs):
-        with patch.object(packaging, "cargo_json", return_value=self.metadata):
+        def launcher(path, _target):
+            Path(path).write_bytes(b"test launcher")
+        with patch.object(packaging, "cargo_json", return_value=self.metadata), \
+             patch.object(packaging, "build_windows_launcher", side_effect=launcher), \
+             patch.object(packaging, "refresh_install") as refresh:
+            refresh.return_value = None
             return packaging.package_project(self.root, target, **kwargs)
 
     def test_windows_archive_checksum_custom_target_and_vendored_license(self):
@@ -63,6 +68,10 @@ class PackageTests(unittest.TestCase):
             self.assertIn("driver", contents.read(prefix + "THIRD-PARTY-NOTICES.tsv").decode("utf-8-sig"))
             self.assertEqual(json.loads(contents.read(prefix + "package.json"))["target"], target)
             self.assertIn("启动说明", contents.read(prefix + "使用说明.txt").decode("utf-8-sig"))
+            self.assertEqual(contents.read(prefix + "shop-launcher.exe"), b"test launcher")
+            self.assertIn(prefix + "install.ps1", contents.namelist())
+            self.assertIn(prefix + "windows_desktop.py", contents.namelist())
+            self.assertIn(prefix + "launch-desktop.ps1", contents.namelist())
         with self.assertRaises(FileExistsError):
             self.build_package(target, skip_build=True)
 
@@ -110,6 +119,32 @@ class PackageTests(unittest.TestCase):
                 self.build_package(target)
                 self.assertEqual(run.call_args.kwargs["env"]["CARGO_ENCODED_RUSTFLAGS"],
                                  "-C\x1ftarget-feature=+crt-static")
+
+    def test_failed_build_never_refreshes_an_installed_pointer(self):
+        pointer = self.root / "installed" / "current.path"
+        pointer.parent.mkdir()
+        pointer.write_text("previous immutable payload.exe\n", encoding="utf-8")
+        before = pointer.read_bytes()
+        with patch.object(packaging, "cargo_json", return_value=self.metadata), \
+             patch.object(packaging, "refresh_install", side_effect=lambda *args: pointer.write_text("incorrect update")) as refresh, \
+             patch.object(packaging.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "cargo")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                packaging.package_project(self.root, "x86_64-pc-windows-msvc", install=True)
+            refresh.assert_not_called()
+        self.assertEqual(pointer.read_bytes(), before)
+
+    def test_skip_install_and_automatic_modes_reach_the_post_package_hook(self):
+        for index, mode in enumerate((None, False, True)):
+            target = "x86_64-pc-windows-msvc"
+            if index == 0:
+                self.executable(target)
+            def launcher(path, _target):
+                Path(path).write_bytes(b"test launcher")
+            with patch.object(packaging, "cargo_json", return_value=self.metadata), \
+                 patch.object(packaging, "build_windows_launcher", side_effect=launcher), \
+                 patch.object(packaging, "refresh_install", return_value=None) as refresh:
+                packaging.package_project(self.root, target, self.root / f"output-{index}", True, install=mode)
+                self.assertEqual(refresh.call_args.args[2], mode)
 
 
 if __name__ == "__main__":

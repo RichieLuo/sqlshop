@@ -2,6 +2,7 @@
 
 mod app;
 mod branding;
+mod shell_open;
 mod ui;
 
 fn main() -> eframe::Result {

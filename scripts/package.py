@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -11,9 +12,25 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+from windows_install import refresh_install
+
+
+def build_windows_launcher(destination, target):
+    arguments = ["rustc", "--edition", "2024", "--crate-name", "shop_launcher", "--target", target,
+                 "-O", "-C", "strip=symbols", "-C", "target-feature=+crt-static",
+                 str(SCRIPT_DIRECTORY / "windows" / "launcher.rs"), "-o", str(destination)]
+    linker = os.environ.get(f"CARGO_TARGET_{target.replace('-', '_').upper()}_LINKER")
+    if linker:
+        arguments.extend(["-C", f"linker={linker}"])
+    subprocess.run(arguments, check=True)
 
 
 def cargo_json(root, *arguments):
@@ -99,9 +116,11 @@ def write_archive(stage, destination, extension, executable_name):
             archive.add(stage, arcname=stage.name, filter=executable_mode)
 
 
-def package_project(root, target, output=None, skip_build=False, expected_tag=None):
+def package_project(root, target, output=None, skip_build=False, expected_tag=None, install=None):
     root = Path(root).resolve()
     platform, extension, executable_extension = platform_name(target)
+    if install and not executable_extension:
+        raise ValueError("Start menu installation requires a native Windows package")
     manifest = cargo_json(root, "metadata", "--no-deps", "--locked", "--offline", "--format-version", "1")
     package = next(item for item in manifest["packages"]
                    if Path(item["manifest_path"]).resolve() == root / "Cargo.toml")
@@ -153,11 +172,22 @@ def package_project(root, target, output=None, skip_build=False, expected_tag=No
             if (root / filename).is_file():
                 shutil.copyfile(root / filename, prepared / filename)
         copy_notices(metadata, package, prepared, root)
-        (prepared / "package.json").write_text(json.dumps({
+        package_metadata = {
             "name": package["name"], "product": product, "version": version,
             "target": target, "executable": executable.name,
             "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            "packaged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if executable_extension:
+            launcher = prepared / "shop-launcher.exe"
+            build_windows_launcher(launcher, target)
+            package_metadata.update(launcher=launcher.name, launcher_sha256=hashlib.sha256(launcher.read_bytes()).hexdigest())
+            for source, filename in (("install.ps1", "install.ps1"), ("windows_install.py", "windows_install.py"),
+                                     ("windows_desktop.py", "windows_desktop.py"),
+                                     ("windows/create-shortcut.ps1", "create-shortcut.ps1"),
+                                     ("windows/launch-desktop.ps1", "launch-desktop.ps1")):
+                shutil.copyfile(SCRIPT_DIRECTORY / source, prepared / filename)
+        (prepared / "package.json").write_text(json.dumps(package_metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary_archive = temporary / archive_path.name
         write_archive(prepared, temporary_archive, extension, executable.name)
         digest = hashlib.sha256(temporary_archive.read_bytes()).hexdigest()
@@ -166,6 +196,13 @@ def package_project(root, target, output=None, skip_build=False, expected_tag=No
         shutil.move(str(prepared), str(stage))
         shutil.move(str(temporary_archive), str(archive_path))
         shutil.move(str(temporary_checksum), str(checksum_path))
+    if executable_extension:
+        try:
+            installation = refresh_install(stage, root, install)
+            if installation:
+                print(f"Start menu launcher updated: {installation['launcher']}")
+        except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"Package created at {archive_path}, but installation refresh failed: {error}") from error
     return archive_path
 
 
@@ -175,12 +212,17 @@ def main():
     parser.add_argument("--output-directory", type=Path)
     parser.add_argument("--skip-build", action="store_true", help="Package an existing release build")
     parser.add_argument("--expected-tag", help="Require a v<version> tag matching Cargo.toml")
+    installation = parser.add_mutually_exclusive_group()
+    installation.add_argument("--install", dest="install", action="store_const", const=True, default=None,
+                              help="Install this native Windows package and register Start menu/Open With")
+    installation.add_argument("--no-install", dest="install", action="store_const", const=False,
+                              help="Build a package without updating an existing local installation")
     arguments = parser.parse_args()
     try:
         print(package_project(Path(__file__).resolve().parent.parent,
                               arguments.target or native_target(), arguments.output_directory,
-                              arguments.skip_build, arguments.expected_tag))
-    except (OSError, ValueError, KeyError, StopIteration, subprocess.CalledProcessError) as error:
+                              arguments.skip_build, arguments.expected_tag, arguments.install))
+    except (OSError, ValueError, KeyError, RuntimeError, StopIteration, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Package failed: {error}\n")
 
 

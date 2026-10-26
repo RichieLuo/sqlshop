@@ -642,6 +642,18 @@ impl eframe::App for App {
             session.completion_pause = false;
         }
         self.poll();
+        if self.screenshot_path.is_none() {
+            let incoming = if self.modal_open() || self.cell_editor.is_some() || self.allow_exit {
+                crate::shell_open::poll_when(ctx, false)
+            } else {
+                crate::shell_open::poll(ctx)
+            };
+            match incoming {
+                Ok(Some(paths)) => self.open_shell_paths(&paths),
+                Ok(None) => {}
+                Err(error) => self.fail(format!("读取文件打开请求失败：{error}")),
+            }
+        }
         apply_theme(ctx);
         egui::TopBottomPanel::top("title")
             .exact_height(window_chrome::TITLE_HEIGHT)
