@@ -125,6 +125,7 @@ enum Confirmation {
         prefix: Vec<u8>,
         count: usize,
         database: u32,
+        notice: Option<String>,
     },
 }
 
@@ -514,12 +515,14 @@ impl RedisDocument {
                             token,
                             prefix,
                             count,
+                            notice,
                         } => {
                             self.confirmation = Some(Confirmation::Namespace {
                                 token,
                                 prefix,
                                 count,
                                 database: self.database,
+                                notice,
                             });
                             self.status = "命名空间扫描完成 · 尚未删除，请确认快照范围".into();
                         }

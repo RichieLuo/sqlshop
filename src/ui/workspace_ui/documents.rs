@@ -107,14 +107,17 @@ impl App {
                 self.advanced_worker.close(id);
             }
         }
-        self.browser_visible = false;
-        self.tabs[self.active_tab].focus_editor = true;
-        self.context.data_mut(|data| {
-            data.insert_temp(
-                egui::Id::new("grid-keyboard-owner"),
-                self.tabs[self.active_tab].id,
-            )
-        });
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            self.browser_visible = false;
+            tab.focus_editor = true;
+            self.context
+                .data_mut(|data| data.insert_temp(egui::Id::new("grid-keyboard-owner"), tab.id));
+        } else {
+            self.browser_visible = true;
+            self.context.data_mut(|data| {
+                data.remove::<Uuid>(egui::Id::new("grid-keyboard-owner"));
+            });
+        }
         true
     }
 
@@ -216,9 +219,10 @@ impl App {
     }
 
     pub(in crate::ui) fn save_sql(&mut self, save_as: bool) -> bool {
-        if self.tabs[self.active_tab].management_document()
-            || self.tabs[self.active_tab].definition.is_some()
-        {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
+        if tab.management_document() || tab.definition.is_some() {
             return false;
         }
         if self.screenshot_path.is_some() {

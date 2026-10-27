@@ -211,6 +211,9 @@ impl App {
             catalog: session.and_then(|session| session.object_catalog.as_ref()),
             catalog_loading: session.is_some_and(|session| session.catalog_loading),
             catalog_error: session.and_then(|session| session.catalog_error.as_deref()),
+            queries: &self.catalog.queries,
+            profiles: &self.profiles,
+            queries_writable: self.catalog_store.is_some(),
             tables: session.map_or(&[], |session| session.tables.as_slice()),
         };
         let action = object_browser_ui::object_browser(ui, &data, &mut self.browser_state);
@@ -220,13 +223,13 @@ impl App {
     }
 
     pub(super) fn object_inspector(&mut self, ui: &mut egui::Ui) {
-        let tab = &self.tabs[self.active_tab];
-        let (scope, selected) = if self.browser_visible {
+        let tab = self.tabs.get(self.active_tab);
+        let (scope, selected) = if self.browser_visible || tab.is_none() {
             (
                 self.browser_scope.clone(),
                 self.browser_state.selected.clone(),
             )
-        } else if let Some(document) = &tab.definition {
+        } else if let Some(document) = tab.and_then(|tab| tab.definition.as_ref()) {
             (
                 Some(BrowserScope {
                     connection: document.connection,
@@ -239,7 +242,7 @@ impl App {
                     object: document.object.clone(),
                 }),
             )
-        } else if let Some(target) = &tab.table_target {
+        } else if let Some(target) = tab.and_then(|tab| tab.table_target.as_ref()) {
             let table =
                 self.sessions
                     .get(&target.connection)
@@ -253,7 +256,9 @@ impl App {
                     .unwrap_or_else(|| Table {
                         schema: target.schema.clone(),
                         name: target.name.clone(),
-                        kind: tab.table_kind.clone().unwrap_or_default(),
+                        kind: tab
+                            .and_then(|tab| tab.table_kind.clone())
+                            .unwrap_or_default(),
                     });
             (
                 Some(BrowserScope {
@@ -269,21 +274,22 @@ impl App {
             )
         } else {
             (
-                tab.target.as_ref().map(|target| BrowserScope {
-                    connection: target.connection,
-                    database: target.database.clone(),
-                    schema: target.schema.clone(),
-                }),
+                tab.and_then(|tab| tab.target.as_ref())
+                    .map(|target| BrowserScope {
+                        connection: target.connection,
+                        database: target.database.clone(),
+                        schema: target.schema.clone(),
+                    }),
                 None,
             )
         };
         let connection = scope.as_ref().map(|scope| scope.connection);
         let session = connection.and_then(|connection| self.sessions.get(&connection));
         let sql_document = !self.browser_visible
-            && !tab.management_document()
-            && tab.table_target.is_none()
-            && tab.definition.is_none();
-        let own_query = self.query_sessions.get(&tab.id);
+            && tab.is_some_and(|tab| {
+                !tab.management_document() && tab.table_target.is_none() && tab.definition.is_none()
+            });
+        let own_query = tab.and_then(|tab| self.query_sessions.get(&tab.id));
         let profile = connection.and_then(|connection| {
             self.profiles
                 .iter()
@@ -307,8 +313,7 @@ impl App {
                 session.is_some_and(|session| session.busy)
             },
             active_database: if sql_document {
-                tab.target
-                    .as_ref()
+                tab.and_then(|tab| tab.target.as_ref())
                     .and_then(|target| target.database.as_deref())
             } else {
                 session.and_then(|session| session.active_database.as_deref())
@@ -330,6 +335,9 @@ impl App {
             },
             catalog_loading: session.is_some_and(|session| session.catalog_loading),
             catalog_error: session.and_then(|session| session.catalog_error.as_deref()),
+            queries: &self.catalog.queries,
+            profiles: &self.profiles,
+            queries_writable: self.catalog_store.is_some(),
             tables: if sql_document {
                 &[]
             } else {
@@ -412,7 +420,8 @@ impl App {
                     .map(|structure| (structure, false))
             });
         let focused_column = if !self.browser_visible {
-            tab.selected_cell.and_then(|(_, column)| {
+            tab.and_then(|tab| {
+                let (_, column) = tab.selected_cell?;
                 tab.table_data
                     .as_ref()?
                     .columns
@@ -460,11 +469,28 @@ impl App {
                 selected: selected.as_ref(),
                 metadata,
                 structure,
-                query_preview: sql_document.then_some(object_browser_ui::QueryPreview {
-                    name: &tab.name,
-                    sql: &tab.sql,
-                    executed_sql: tab.last_executed_sql.as_deref(),
-                }),
+                query_preview: if self.browser_visible
+                    && self.browser_state.category == object_browser_ui::BrowserCategory::Queries
+                {
+                    self.catalog
+                        .queries
+                        .iter()
+                        .find(|query| Some(query.id) == self.browser_state.selected_query)
+                        .map(|query| object_browser_ui::QueryPreview {
+                            saved: true,
+                            name: &query.name,
+                            sql: &query.sql,
+                            executed_sql: None,
+                        })
+                } else {
+                    tab.filter(|_| sql_document)
+                        .map(|tab| object_browser_ui::QueryPreview {
+                            saved: false,
+                            name: &tab.name,
+                            sql: &tab.sql,
+                            executed_sql: tab.last_executed_sql.as_deref(),
+                        })
+                },
                 focused_column,
             },
         );

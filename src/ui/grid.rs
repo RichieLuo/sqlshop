@@ -118,10 +118,6 @@ pub(super) fn result_grid_inline(
         .cloned()
         .unwrap_or_default();
     grid_columns_ui::reconcile(&mut column_layout, &set.columns);
-    if grid_columns_ui::controls(ui, set, &mut column_layout, inline_editor.is_none()) {
-        tab.selected_cell = None;
-        tab.cell_anchor = None;
-    }
     let visible_columns = grid_columns_ui::visible(&column_layout, set.columns.len());
     let frozen_count = grid_columns_ui::frozen_count(&column_layout, &visible_columns);
     tab.grid_layouts

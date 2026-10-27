@@ -2,6 +2,8 @@
 //! drawing this module never connects, selects a database, or executes SQL.
 mod views;
 use views::*;
+mod saved_queries;
+pub(super) use saved_queries::query_in_scope;
 
 mod inspector;
 pub(super) use inspector::inspector;
@@ -9,6 +11,7 @@ pub(super) use inspector::inspector;
 use super::{accent, chrome, icons, surface};
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
+use sqlshop::catalog::SavedQuery;
 use sqlshop::model::{Engine, Profile, Table, TableColumn};
 use sqlshop::object_catalog::{CatalogObject, ObjectCatalog, ObjectKind};
 use uuid::Uuid;
@@ -30,6 +33,7 @@ pub(super) enum BrowserCategory {
     Procedures,
     Triggers,
     Sequences,
+    Queries,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +76,8 @@ pub(super) struct BrowserState {
     pub search: String,
     pub category: BrowserCategory,
     pub selected: Option<BrowserItem>,
+    pub selected_query: Option<Uuid>,
+    pub all_queries: bool,
     last_scope: Option<BrowserScope>,
     view: BrowserView,
     sort_column: usize,
@@ -90,10 +96,17 @@ pub(super) struct BrowserData<'a> {
     pub catalog: Option<&'a ObjectCatalog>,
     pub catalog_loading: bool,
     pub catalog_error: Option<&'a str>,
+    pub queries: &'a [SavedQuery],
+    pub profiles: &'a [Profile],
+    pub queries_writable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum BrowserAction {
+    OpenSavedQuery(Uuid),
+    RenameSavedQuery(Uuid),
+    DeleteSavedQuery(Uuid),
+    NewSavedQuery,
     Connect(Uuid),
     SelectDatabase {
         connection: Uuid,
@@ -134,6 +147,11 @@ pub(super) enum BrowserAction {
         database: String,
         schema: Option<String>,
     },
+    RenameTable {
+        connection: Uuid,
+        database: String,
+        table: Table,
+    },
 }
 
 pub(super) struct TableMetadata<'a> {
@@ -154,6 +172,7 @@ pub(super) struct InspectorData<'a> {
 }
 
 pub(super) struct QueryPreview<'a> {
+    pub saved: bool,
     pub name: &'a str,
     pub sql: &'a str,
     pub executed_sql: Option<&'a str>,
@@ -229,6 +248,8 @@ impl BrowserState {
         if self.last_scope.as_ref() != scope {
             self.last_scope = scope.cloned();
             self.selected = None;
+            self.selected_query = None;
+            self.all_queries = false;
             self.search.clear();
             self.category = BrowserCategory::All;
         }
@@ -329,6 +350,7 @@ fn category_matches(category: BrowserCategory, kind: ObjectKind) -> bool {
         BrowserCategory::Procedures => kind == ObjectKind::Procedure,
         BrowserCategory::Triggers => kind == ObjectKind::Trigger,
         BrowserCategory::Sequences => kind == ObjectKind::Sequence,
+        BrowserCategory::Queries => false,
     }
 }
 
@@ -575,6 +597,11 @@ pub(super) fn object_browser(
     state.set_scope(data.scope);
     let mut action = None;
     let Some(scope) = data.scope else {
+        if state.category == BrowserCategory::Queries {
+            ui.heading("查询");
+            ui.add(egui::TextEdit::singleline(&mut state.search).hint_text("搜索查询名称 / SQL"));
+            return saved_queries::workspace(ui, data, state);
+        }
         ui.vertical_centered(|ui| {
             ui.add_space(60.0);
             ui.heading("数据库对象");
@@ -604,8 +631,10 @@ pub(super) fn object_browser(
         );
     });
     ui.separator();
-    if data.connected && (databases || scope.database.as_deref() == data.active_database) {
-        category_controls(ui, data, state);
+    category_controls(ui, data, state);
+    if state.category == BrowserCategory::Queries {
+        state.selected = None;
+        return saved_queries::workspace(ui, data, state);
     }
     ui.horizontal_wrapped(|ui| {
         if ui

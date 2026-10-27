@@ -127,6 +127,11 @@ pub enum Request {
         database: String,
         table: Table,
     },
+    RenameTable {
+        database: String,
+        table: Table,
+        new_name: String,
+    },
     ChangeStructure {
         tab: Uuid,
         target: QueryTarget,
@@ -183,6 +188,11 @@ pub enum Response {
     DatabaseSelected(String),
     DatabaseContext(Option<String>),
     Tables(Vec<Table>),
+    TableRenamed {
+        database: String,
+        table: Table,
+        new_name: String,
+    },
     ObjectCatalog {
         database: String,
         catalog: ObjectCatalog,
@@ -597,6 +607,14 @@ impl Worker {
                                 match connection.drop_table(&database, &table).await {
                                     Ok(()) => Response::Tables(connection.tables().await?),
                                     Err(error) => Response::Error { message: format!("删除数据表失败：{error:#}"), disconnected: false },
+                                }
+                            }
+                            Request::RenameTable { database, table, new_name } => {
+                                let connection = session.as_mut().ok_or_else(|| anyhow::anyhow!("请先连接数据库"))?;
+                                match connection.rename_table(&database, &table, &new_name).await {
+                                    Ok(()) => Response::TableRenamed { database, table, new_name },
+                                    Err(error) if error.downcast_ref::<crate::db::EditRejected>().is_some() || crate::db::query_error_preserves_session(&error) => Response::Error { message: format!("重命名数据表失败：{error:#}"), disconnected: false },
+                                    Err(error) => return Err(error),
                                 }
                             }
                             Request::ChangeStructure { tab, target, table, change, preview_sql } => {

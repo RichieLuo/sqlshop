@@ -6,10 +6,11 @@ impl App {
             self.table_controls(ui);
             return;
         }
-        self.query_target_controls(ui);
-        ui.separator();
+        toolbar_style(ui);
         ui.horizontal_wrapped(|ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            self.query_target_controls(ui);
+            ui.separator();
             self.query_execution_controls(ui);
             ui.separator();
             ui.add_enabled_ui(self.screenshot_path.is_none(), |ui| {
@@ -19,16 +20,18 @@ impl App {
                 if ui.button("保存查询").clicked() {
                     self.save_query_command(false);
                 }
-                if ui.button("已保存查询").clicked() {
-                    self.library_open = true;
-                }
-                if ui.button("保存 SQL 文件").clicked() {
-                    self.save_sql(false);
-                }
-                if ui.button("SQL 文件另存为…").clicked() {
-                    self.save_sql(true);
-                }
+                ui.menu_button("文件选项", |ui| {
+                    if ui.button("保存 SQL 文件").clicked() {
+                        self.save_sql(false);
+                        ui.close();
+                    }
+                    if ui.button("SQL 文件另存为…").clicked() {
+                        self.save_sql(true);
+                        ui.close();
+                    }
+                });
             });
+            ui.separator();
             if ui.button("查找 / 替换").clicked() {
                 self.tabs[self.active_tab].find_open ^= true;
             }
@@ -141,175 +144,172 @@ impl App {
         }) + if postgres { 150.0 } else { 0.0 };
         let combo_width =
             ((ui.available_width() - extra) / if postgres { 3.0 } else { 2.0 }).clamp(84.0, 180.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            ui.add_enabled_ui(enabled, |ui| {
-                ui.label("连接");
-                let name = connection
-                    .and_then(|id| self.profiles.iter().find(|p| p.id == id))
-                    .map(|p| p.name.as_str())
-                    .unwrap_or(if connection.is_some() {
-                        "原连接已删除"
-                    } else {
-                        "请选择连接"
-                    });
-                egui::ComboBox::from_id_salt(("query-connection", tab_id))
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.label("连接");
+            let name = connection
+                .and_then(|id| self.profiles.iter().find(|p| p.id == id))
+                .map(|p| p.name.as_str())
+                .unwrap_or(if connection.is_some() {
+                    "原连接已删除"
+                } else {
+                    "请选择连接"
+                });
+            egui::ComboBox::from_id_salt(("query-connection", tab_id))
+                .width(combo_width)
+                .wrap_mode(egui::TextWrapMode::Truncate)
+                .selected_text(name)
+                .show_ui(ui, |ui| {
+                    for profile in &self.profiles {
+                        ui.selectable_value(&mut connection, Some(profile.id), &profile.name)
+                            .on_hover_text(format!("{}:{}", profile.host, profile.port));
+                    }
+                });
+            if connection != previous_connection
+                && let Some(id) = connection
+            {
+                let database = self
+                    .sessions
+                    .get(&id)
+                    .and_then(|s| s.active_database.clone());
+                self.select_query_target(QueryTarget {
+                    connection: id,
+                    database,
+                    schema: None,
+                });
+            }
+            let target = self.tabs[self.active_tab].target.clone().or(target.clone());
+            connection = target.as_ref().map(|target| target.connection);
+            let session = connection.and_then(|id| self.sessions.get(&id));
+            let connected = session.is_some_and(|s| s.connected.is_some())
+                || self
+                    .query_sessions
+                    .get(&tab_id)
+                    .is_some_and(|s| s.connected && Some(s.target.connection) == connection);
+            let busy = session.is_some_and(|s| s.busy);
+            let mut databases = session.map(|s| s.databases.clone()).unwrap_or_default();
+            if let Some(name) = target.as_ref().and_then(|t| t.database.as_ref())
+                && !databases.contains(name)
+            {
+                databases.push(name.clone());
+            }
+            let active_database = session.and_then(|s| s.active_database.clone());
+            let mut database = target.as_ref().and_then(|t| t.database.clone());
+            let previous_database = database.clone();
+            ui.label("数据库");
+            ui.add_enabled_ui(connected, |ui| {
+                egui::ComboBox::from_id_salt(("query-database", tab_id))
                     .width(combo_width)
                     .wrap_mode(egui::TextWrapMode::Truncate)
-                    .selected_text(name)
+                    .selected_text(database.as_deref().unwrap_or(if connected {
+                        "请选择数据库"
+                    } else {
+                        "请先连接"
+                    }))
                     .show_ui(ui, |ui| {
-                        for profile in &self.profiles {
-                            ui.selectable_value(&mut connection, Some(profile.id), &profile.name)
-                                .on_hover_text(format!("{}:{}", profile.host, profile.port));
+                        if active_database.is_none() {
+                            ui.selectable_value(&mut database, None, "服务器（未选库）");
+                        }
+                        for name in &databases {
+                            ui.selectable_value(&mut database, Some(name.clone()), name);
                         }
                     });
-                if connection != previous_connection
-                    && let Some(id) = connection
+            });
+            if database != previous_database
+                && let Some(id) = connection
+            {
+                self.select_query_target(QueryTarget {
+                    connection: id,
+                    database: database.clone(),
+                    schema: None,
+                });
+            }
+            let target = self.tabs[self.active_tab].target.clone().or(target.clone());
+            let postgres = connection.and_then(|id| self.profiles.iter().find(|p| p.id == id))
+                .is_some_and(|profile| profile.engine == Engine::Postgres);
+            if postgres {
+                if let Some(target) = &target
+                    && connected
+                    && target.database.is_some()
                 {
-                    let database = self
-                        .sessions
-                        .get(&id)
-                        .and_then(|s| s.active_database.clone());
-                    self.select_query_target(QueryTarget {
-                        connection: id,
-                        database,
-                        schema: None,
-                    });
+                    self.request_query_schemas(target, false);
                 }
-                let target = self.tabs[self.active_tab].target.clone().or(target.clone());
-                connection = target.as_ref().map(|target| target.connection);
-                let session = connection.and_then(|id| self.sessions.get(&id));
-                let connected = session.is_some_and(|s| s.connected.is_some())
-                    || self
-                        .query_sessions
-                        .get(&tab_id)
-                        .is_some_and(|s| s.connected && Some(s.target.connection) == connection);
-                let busy = session.is_some_and(|s| s.busy);
-                let mut databases = session.map(|s| s.databases.clone()).unwrap_or_default();
-                if let Some(name) = target.as_ref().and_then(|t| t.database.as_ref())
-                    && !databases.contains(name)
+                let state = self.query_sessions.get(&tab_id);
+                let loading = state.is_some_and(|s| s.schemas_loading);
+                let schema_error = state.and_then(|s| s.schemas_error.clone());
+                let mut schemas = state.map(|s| s.schemas.clone()).unwrap_or_default();
+                let mut schema = target.as_ref().and_then(|t| t.schema.clone());
+                if let Some(schema) = &schema
+                    && !schemas.contains(schema)
                 {
-                    databases.push(name.clone());
+                    schemas.push(schema.clone());
                 }
-                let active_database = session.and_then(|s| s.active_database.clone());
-                let mut database = target.as_ref().and_then(|t| t.database.clone());
-                let previous_database = database.clone();
-                ui.label("数据库");
-                ui.add_enabled_ui(connected, |ui| {
-                    egui::ComboBox::from_id_salt(("query-database", tab_id))
+                let previous_schema = schema.clone();
+                ui.label("Schema");
+                ui.add_enabled_ui(connected && database.is_some() && !loading, |ui| {
+                    egui::ComboBox::from_id_salt(("query-schema", tab_id))
                         .width(combo_width)
                         .wrap_mode(egui::TextWrapMode::Truncate)
-                        .selected_text(database.as_deref().unwrap_or(if connected {
-                            "请选择数据库"
-                        } else {
-                            "请先连接"
-                        }))
+                        .selected_text(if loading { "正在读取…" } else { schema.as_deref().unwrap_or("连接默认") })
                         .show_ui(ui, |ui| {
-                            if active_database.is_none() {
-                                ui.selectable_value(&mut database, None, "服务器（未选库）");
+                            ui.selectable_value(&mut schema, None, "连接默认");
+                            for name in &schemas {
+                                ui.selectable_value(&mut schema, Some(name.clone()), name);
                             }
-                            for name in &databases {
-                                ui.selectable_value(&mut database, Some(name.clone()), name);
-                            }
-                        });
+                        })
+                        .response
+                        .on_hover_text("为本查询设置 search_path；更改已使用的会话会先确认结束其事务。连接默认使用数据库角色的默认搜索路径。");
                 });
-                if database != previous_database
-                    && let Some(id) = connection
+                if schema != previous_schema
+                    && let Some(mut target) = target.clone()
                 {
-                    self.select_query_target(QueryTarget {
-                        connection: id,
-                        database: database.clone(),
-                        schema: None,
-                    });
+                    target.schema = schema;
+                    self.select_query_target(target);
                 }
-                let target = self.tabs[self.active_tab].target.clone().or(target.clone());
-                let postgres = connection.and_then(|id| self.profiles.iter().find(|p| p.id == id))
-                    .is_some_and(|profile| profile.engine == Engine::Postgres);
-                if postgres {
-                    if let Some(target) = &target
-                        && connected
-                        && target.database.is_some()
-                    {
-                        self.request_query_schemas(target, false);
-                    }
-                    let state = self.query_sessions.get(&tab_id);
-                    let loading = state.is_some_and(|s| s.schemas_loading);
-                    let schema_error = state.and_then(|s| s.schemas_error.clone());
-                    let mut schemas = state.map(|s| s.schemas.clone()).unwrap_or_default();
-                    let mut schema = target.as_ref().and_then(|t| t.schema.clone());
-                    if let Some(schema) = &schema
-                        && !schemas.contains(schema)
-                    {
-                        schemas.push(schema.clone());
-                    }
-                    let previous_schema = schema.clone();
-                    ui.label("Schema");
-                    ui.add_enabled_ui(connected && database.is_some() && !loading, |ui| {
-                        egui::ComboBox::from_id_salt(("query-schema", tab_id))
-                            .width(combo_width)
-                            .wrap_mode(egui::TextWrapMode::Truncate)
-                            .selected_text(if loading { "正在读取…" } else { schema.as_deref().unwrap_or("连接默认") })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut schema, None, "连接默认");
-                                for name in &schemas {
-                                    ui.selectable_value(&mut schema, Some(name.clone()), name);
-                                }
-                            })
-                            .response
-                            .on_hover_text("为本查询设置 search_path；更改已使用的会话会先确认结束其事务。连接默认使用数据库角色的默认搜索路径。");
-                    });
-                    if schema != previous_schema
-                        && let Some(mut target) = target.clone()
-                    {
-                        target.schema = schema;
-                        self.select_query_target(target);
-                    }
-                    if let Some(error) = schema_error {
-                        ui.label(RichText::new("Schema 读取失败").color(ui.visuals().error_fg_color))
-                            .on_hover_text(error);
-                    }
-                    if connected && !loading
-                        && ui.small_button("↻").on_hover_text("刷新 Schema 列表").clicked()
-                        && let Some(target) = &target
-                    {
-                        self.request_query_schemas(target, true);
-                    }
-                } else if connection.and_then(|id| self.profiles.iter().find(|p| p.id == id))
-                    .is_some_and(|profile| profile.engine == Engine::SqlServer)
+                if let Some(error) = schema_error {
+                    ui.label(RichText::new("Schema 读取失败").color(ui.visuals().error_fg_color))
+                        .on_hover_text(error);
+                }
+                if connected && !loading
+                    && ui.small_button("↻").on_hover_text("刷新 Schema 列表").clicked()
+                    && let Some(target) = &target
                 {
-                    let actual = target.as_ref().and_then(|target| target.schema.as_deref());
-                    let label = actual.map(|schema| format!("绑定 Schema {schema}"))
-                        .unwrap_or_else(|| "默认 Schema".into());
-                    ui.label(RichText::new(label).small().weak())
-                        .on_hover_text("SQL Server 默认 Schema 在连接或主动检查上下文时读取；访问其他 Schema 请写 schema.object，查询后不自动探测，以保留 @@ROWCOUNT。");
+                    self.request_query_schemas(target, true);
                 }
-                if !connected
-                    && ui
-                        .add_enabled(
-                            connection.is_some_and(|id| self.profiles.iter().any(|p| p.id == id))
-                                && !busy,
-                            egui::Button::new("连接服务器"),
-                        )
-                        .clicked()
-                {
-                    self.selected = connection;
-                    self.connect_selected();
-                }
-            });
-            let state = self.query_sessions.get(&tab_id);
-            ui.label(
-                RichText::new(if state.is_some_and(|session| session.busy) {
-                    "执行中"
-                } else if state.is_some_and(|session| session.connected) {
-                    "会话已连接"
-                } else {
-                    "未建立会话"
-                })
-                .small()
-                .weak(),
-            )
-            .on_hover_text("每个 SQL 标签使用独立数据库会话；首次运行时建立连接");
+            } else if connection.and_then(|id| self.profiles.iter().find(|p| p.id == id))
+                .is_some_and(|profile| profile.engine == Engine::SqlServer)
+            {
+                let actual = target.as_ref().and_then(|target| target.schema.as_deref());
+                let label = actual.map(|schema| format!("绑定 Schema {schema}"))
+                    .unwrap_or_else(|| "默认 Schema".into());
+                ui.label(RichText::new(label).small().weak())
+                    .on_hover_text("SQL Server 默认 Schema 在连接或主动检查上下文时读取；访问其他 Schema 请写 schema.object，查询后不自动探测，以保留 @@ROWCOUNT。");
+            }
+            if !connected
+                && ui
+                    .add_enabled(
+                        connection.is_some_and(|id| self.profiles.iter().any(|p| p.id == id))
+                            && !busy,
+                        egui::Button::new("连接服务器"),
+                    )
+                    .clicked()
+            {
+                self.selected = connection;
+                self.connect_selected();
+            }
         });
+        let state = self.query_sessions.get(&tab_id);
+        ui.label(
+            RichText::new(if state.is_some_and(|session| session.busy) {
+                "执行中"
+            } else if state.is_some_and(|session| session.connected) {
+                "会话已连接"
+            } else {
+                "未建立会话"
+            })
+            .small()
+            .weak(),
+        )
+        .on_hover_text("每个 SQL 标签使用独立数据库会话；首次运行时建立连接");
     }
 
     pub(super) fn query_execution_controls(&mut self, ui: &mut egui::Ui) {
@@ -320,15 +320,14 @@ impl App {
         if ui
             .add_enabled(
                 enabled && self.can_execute(),
-                egui::Button::new(
-                    RichText::new(if self.tabs[self.active_tab].selection.trim().is_empty() {
+                primary_button(
+                    ui,
+                    if self.tabs[self.active_tab].selection.trim().is_empty() {
                         "▶  运行全文"
                     } else {
                         "▶  运行选区"
-                    })
-                    .color(Color32::WHITE),
-                )
-                .fill(accent(ui)),
+                    },
+                ),
             )
             .on_hover_text("Ctrl / ⌘ + Enter · 执行选中内容，无选区时执行整段 SQL")
             .clicked()
@@ -359,7 +358,7 @@ impl App {
 
     pub(in crate::ui) fn executed_sql_footer(&self, ui: &mut egui::Ui) {
         let sql = self.tabs[self.active_tab].last_executed_sql.as_deref();
-        let size = egui::vec2(ui.available_width().max(0.0), 22.0);
+        let size = egui::vec2(ui.available_width().max(0.0), 20.0);
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
         let hovered = ui.rect_contains_pointer(rect);
         let text_rect = egui::Rect::from_min_max(rect.min, rect.max - egui::vec2(28.0, 0.0));
@@ -377,7 +376,7 @@ impl App {
             if hovered {
                 let icon_rect = egui::Rect::from_center_size(
                     egui::pos2(rect.right() - 12.0, rect.center().y),
-                    egui::vec2(22.0, 22.0),
+                    egui::vec2(20.0, 20.0),
                 );
                 let copy = ui
                     .interact(

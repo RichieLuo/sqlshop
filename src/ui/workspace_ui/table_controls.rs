@@ -208,6 +208,7 @@ impl App {
         let mut export = false;
         let mut import = false;
         let tab = &mut self.tabs[self.active_tab];
+        grid_columns_ui::load_table_layout(tab, &self.table_grid_layouts);
         let columns = tab
             .table_data
             .as_ref()
@@ -218,52 +219,65 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-                describe = ui
-                    .add(egui::Button::new("结构 / DDL").frame(false))
-                    .clicked();
-                ui.separator();
-                let active = !tab.browse.filters.is_empty() || !tab.browse.sorts.is_empty();
-                let label = if !tab.browse_draft.matches(&tab.browse) {
-                    "筛选与排序 · 待应用"
-                } else if active {
-                    "筛选与排序 · 已应用"
-                } else {
-                    "筛选与排序"
-                };
-                if ui
-                    .add_enabled(
-                        actions.can_read(),
-                        egui::Button::selectable(tab.filters_open, label),
-                    )
-                    .on_hover_text("展开筛选与排序；检查条件后点击应用，才会重新读取数据库")
-                    .clicked()
-                {
-                    tab.filters_open ^= true;
-                }
-                ui.separator();
-                import = ui
-                    .add_enabled(actions.can_write(), egui::Button::new("导入 CSV…"))
-                    .clicked();
-                ui.separator();
-                ui.add_enabled_ui(
-                    tab.output
-                        .as_ref()
-                        .and_then(|o| o.sets.get(tab.result_index))
-                        .is_some_and(|set| !set.columns.is_empty()),
-                    |ui| {
-                        ui.menu_button("复制", |ui| result_copy_controls(ui, tab, true));
-                        ui.menu_button("导出", |ui| {
-                            if ui.button("导出 CSV…").clicked() {
-                                export = true;
-                                ui.close();
+        ui.scope(|ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt(("table-toolbar", tab.id))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+                        ui.add_enabled_ui(enabled, |ui| {
+                            describe = ui
+                                .add(egui::Button::new("结构 / DDL").frame(false))
+                                .clicked();
+                            ui.separator();
+                            let active =
+                                !tab.browse.filters.is_empty() || !tab.browse.sorts.is_empty();
+                            let label = if !tab.browse_draft.matches(&tab.browse) {
+                                "筛选与排序 · 待应用"
+                            } else if active {
+                                "筛选与排序 · 已应用"
+                            } else {
+                                "筛选与排序"
+                            };
+                            if ui
+                                .add_enabled(
+                                    actions.can_read(),
+                                    egui::Button::selectable(tab.filters_open, label),
+                                )
+                                .on_hover_text(
+                                    "展开筛选与排序；检查条件后点击应用，才会重新读取数据库",
+                                )
+                                .clicked()
+                            {
+                                tab.filters_open ^= true;
                             }
+                            ui.separator();
+                            import = ui
+                                .add_enabled(actions.can_write(), egui::Button::new("导入 CSV…"))
+                                .clicked();
+                            ui.separator();
+                            ui.add_enabled_ui(
+                                tab.output
+                                    .as_ref()
+                                    .and_then(|o| o.sets.get(tab.result_index))
+                                    .is_some_and(|set| !set.columns.is_empty()),
+                                |ui| {
+                                    ui.menu_button("复制", |ui| {
+                                        result_copy_controls(ui, tab, true)
+                                    });
+                                    ui.menu_button("导出", |ui| {
+                                        if ui.button("导出 CSV…").clicked() {
+                                            export = true;
+                                            ui.close();
+                                        }
+                                    });
+                                },
+                            );
                         });
-                    },
-                );
-            });
+                        grid_columns_ui::tab_controls(ui, tab, true);
+                    });
+                });
             if tab.filters_open {
                 ui.separator();
                 ui.add_enabled_ui(actions.can_read(), |ui| {

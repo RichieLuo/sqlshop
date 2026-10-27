@@ -93,11 +93,14 @@ impl RedisDocument {
                 self.profile.host, self.profile.port, self.database
             ));
             match confirmation {
-                Confirmation::Namespace { prefix, count, database, .. } => {
+                Confirmation::Namespace { prefix, count, database, notice, .. } => {
                     ui.colored_label(ui.visuals().warn_fg_color, format!("删除 db{database} 中命名空间下预览到的 {count} 个键（不可撤销）"));
                     ui.monospace(display_bytes(prefix));
                     ui.label("删除预览内的全部键；可能部分完成，不可撤销。")
                         .on_hover_text("按字面前缀匹配，包括未加载键；仅删除预览键名，同名键被并发替换仍会删除。分批 UNLINK，不自动重试。");
+                    if let Some(notice) = notice {
+                        ui.colored_label(ui.visuals().warn_fg_color, notice);
+                    }
                 }
                 Confirmation::Mutation { key, label, .. } => {
                     ui.label(label);

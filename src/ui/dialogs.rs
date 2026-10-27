@@ -117,18 +117,23 @@ impl App {
         let mut save = false;
         let mut connect = false;
         let mut test = false;
+        let mut cancel = false;
         let mut selection_error = None;
         dialog_window("数据库连接", ctx)
             .open(&mut open)
             .resizable(true)
-            .default_width((ctx.content_rect().width() - 120.0).clamp(620.0, 860.0))
+            .default_width((ctx.content_rect().width() - 120.0).clamp(620.0, 940.0))
             .min_width(620.0)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     connection_heading(ui, form);
                     ui.separator();
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     egui::ScrollArea::vertical()
                         .id_salt("connection-fields")
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
                         .max_height((ctx.content_rect().height() - 340.0).max(180.0))
                         .show(ui, |ui| {
                             if ui.available_width() >= 820.0 {
@@ -171,6 +176,7 @@ impl App {
                         });
                     ui.add_space(10.0);
                     ui.separator();
+                    ui.add_space(4.0);
                     let can_save = form.kind != ConnectionKind::Redis || redis_save_error.is_none();
                     if !can_save {
                         ui.colored_label(
@@ -182,17 +188,12 @@ impl App {
                         test = ui.button("测试连接").clicked();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             connect = ui
-                                .add_enabled(
-                                    can_save,
-                                    egui::Button::new(
-                                        RichText::new("保存并连接").color(Color32::WHITE),
-                                    )
-                                    .fill(accent(ui)),
-                                )
+                                .add_enabled(can_save, primary_button(ui, "保存并连接"))
                                 .clicked();
                             save = ui
                                 .add_enabled(can_save, egui::Button::new("保存"))
                                 .clicked();
+                            cancel = ui.button("取消").clicked();
                         });
                     });
                 });
@@ -212,7 +213,7 @@ impl App {
         let profile = form.profile.clone();
         let redis_profile = form.redis_profile.clone();
         let credentials = form.credentials();
-        if !open {
+        if !open || cancel {
             self.form = None;
         }
         if let Some(error) = selection_error {
@@ -292,11 +293,11 @@ impl App {
             {
                 ui.label("将关闭此连接的所有会话，未提交事务可能回滚。");
             }
-            ui.horizontal(|ui| {
-                cancel = ui.button("取消").clicked();
+            dialog_actions(ui, |ui| {
                 delete = ui
-                    .add_enabled(!busy, egui::Button::new("删除连接"))
+                    .add_enabled(!busy, danger_button(ui, "删除连接"))
                     .clicked();
+                cancel = ui.button("取消").clicked();
             });
         });
         if cancel {
@@ -364,11 +365,11 @@ impl App {
                 target.name,
                 key_values.len()
             ));
-            ui.horizontal(|ui| {
-                cancel = ui.button("取消").clicked();
+            dialog_actions(ui, |ui| {
                 confirm = ui
-                    .add_enabled(can_delete, egui::Button::new("删除行"))
+                    .add_enabled(can_delete, danger_button(ui, "删除行"))
                     .clicked();
+                cancel = ui.button("取消").clicked();
             });
         });
         if cancel {
@@ -396,6 +397,42 @@ impl App {
     }
 
     pub(super) fn schema_dialog_window(&mut self, ctx: &egui::Context) {
+        let rename_preview = self.schema_dialog.as_ref().and_then(|dialog| {
+            let SchemaDialogAction::RenameTable {
+                connection,
+                database,
+                table,
+            } = &dialog.action
+            else {
+                return None;
+            };
+            Some(
+                if let Some(message) = self.table_rename_rejection(*connection, database, table) {
+                    Err(message)
+                } else {
+                    let session = &self.sessions[connection];
+                    let engine = session
+                        .connected
+                        .as_ref()
+                        .expect("connected rename target")
+                        .engine;
+                    let new_name = dialog.name.trim();
+                    sqlshop::db::rename_table_sql(engine, table, new_name)
+                        .map_err(|error| error.to_string())
+                        .and_then(|sql| {
+                            if session
+                                .tables
+                                .iter()
+                                .any(|known| known.schema == table.schema && known.name == new_name)
+                            {
+                                Err("新表名称已存在".into())
+                            } else {
+                                Ok(sql)
+                            }
+                        })
+                },
+            )
+        });
         let Some(dialog) = self.schema_dialog.as_mut() else {
             return;
         };
@@ -403,15 +440,37 @@ impl App {
         let mut confirm = false;
         let mut cancel = false;
         let title = match dialog.action {
+            SchemaDialogAction::RenameTable { .. } => "重命名数据表",
             SchemaDialogAction::CreateDatabase { .. } => "新建数据库",
             SchemaDialogAction::DropDatabase { .. } => "删除数据库",
             SchemaDialogAction::DropTable { .. } => "删除数据表",
         };
         dialog_window(title, ctx).open(&mut open).show(ctx, |ui| {
             match &mut dialog.action {
+                SchemaDialogAction::RenameTable {
+                    database, table, ..
+                } => {
+                    ui.label(format!(
+                        "当前数据表：{database}.{}.{}",
+                        table.schema, table.name
+                    ));
+                    ui.label("新表名称");
+                    ui.add(dialog_input(&mut dialog.name).desired_width(480.0));
+                    match &rename_preview {
+                        Some(Ok(sql)) => {
+                            ui.label("将执行以下 SQL：");
+                            ui.monospace(sql);
+                        }
+                        Some(Err(message)) => {
+                            ui.colored_label(ui.visuals().warn_fg_color, message);
+                        }
+                        None => {}
+                    }
+                    ui.label("引用旧表名的 SQL、视图或存储过程可能需要更新。");
+                }
                 SchemaDialogAction::CreateDatabase { .. } => {
                     ui.label("数据库名称");
-                    ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(360.0));
+                    ui.add(dialog_input(&mut dialog.name).desired_width(360.0));
                 }
                 SchemaDialogAction::DropDatabase { database, .. } => {
                     ui.label(format!(
@@ -427,10 +486,10 @@ impl App {
                     ));
                 }
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                cancel = ui.button("取消").clicked();
-                let label = if matches!(
+            dialog_actions(ui, |ui| {
+                let label = if matches!(dialog.action, SchemaDialogAction::RenameTable { .. }) {
+                    "重命名"
+                } else if matches!(
                     dialog.action,
                     SchemaDialogAction::DropDatabase { .. } | SchemaDialogAction::DropTable { .. }
                 ) {
@@ -438,7 +497,19 @@ impl App {
                 } else {
                     "创建"
                 };
-                confirm = ui.button(label).clicked();
+                confirm = ui
+                    .add_enabled(
+                        rename_preview
+                            .as_ref()
+                            .is_none_or(|preview| preview.is_ok()),
+                        if label == "删除" {
+                            danger_button(ui, label)
+                        } else {
+                            primary_button(ui, label)
+                        },
+                    )
+                    .clicked();
+                cancel = ui.button("取消").clicked();
             });
         });
         if cancel || !open {
@@ -450,6 +521,20 @@ impl App {
         }
         let dialog = self.schema_dialog.take().expect("dialog still set");
         let (connection, request, status, created_database) = match dialog.action {
+            SchemaDialogAction::RenameTable {
+                connection,
+                database,
+                table,
+            } => (
+                connection,
+                Request::RenameTable {
+                    database,
+                    table,
+                    new_name: dialog.name.trim().into(),
+                },
+                "正在重命名数据表…",
+                None,
+            ),
             SchemaDialogAction::CreateDatabase { connection } => {
                 let database = dialog.name.trim().to_owned();
                 (
@@ -627,12 +712,14 @@ impl App {
                     if stale {
                         ui.label("表数据已过期，请取消并刷新后重新导入。");
                     }
-                    submit = ui
-                        .add_enabled(
-                            valid && !busy && !stale,
-                            egui::Button::new(format!("确认事务导入 {} 行", form.rows.len())),
-                        )
-                        .clicked();
+                    dialog_actions(ui, |ui| {
+                        submit = ui
+                            .add_enabled(
+                                valid && !busy && !stale,
+                                primary_button(ui, format!("确认事务导入 {} 行", form.rows.len())),
+                            )
+                            .clicked();
+                    });
                 });
             if !open && !busy {
                 self.csv_import = None;
@@ -669,6 +756,7 @@ impl App {
         };
         let mut open = true;
         let mut export = false;
+        let mut cancel = false;
         let selected_count = self.export_rows.as_ref().map(|(_, rows)| rows.len());
         let complete_table =
             selected_count.is_none() && self.tabs[self.active_tab].table_target.is_some();
@@ -686,7 +774,7 @@ impl App {
         .default_width(500.0)
         .show(ctx, |ui| {
             ui.label("保存路径");
-            ui.add(egui::TextEdit::singleline(path).desired_width(f32::INFINITY));
+            ui.add(dialog_input(path).desired_width(f32::INFINITY));
             ui.label(
                 RichText::new(if let Some(count) = selected_count {
                     format!("导出所选的 {count} 行；NULL 为未引号空字段，文本始终加引号。")
@@ -698,10 +786,13 @@ impl App {
                 .small()
                 .weak(),
             );
-            export = ui.button("保存 CSV").clicked();
+            dialog_actions(ui, |ui| {
+                export = ui.add(primary_button(ui, "保存 CSV")).clicked();
+                cancel = ui.button("取消").clicked();
+            });
         });
         let destination = PathBuf::from(path.as_str());
-        if !open {
+        if !open || cancel {
             self.export_path = None;
             self.export_rows = None;
         }

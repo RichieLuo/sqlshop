@@ -99,6 +99,28 @@ fn reopening_sql_reuses_canonical_file_and_keeps_unsaved_changes() {
 }
 
 #[test]
+fn shell_opens_sql_dump_above_the_former_16_mib_limit_without_truncation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("large.sql");
+    let sql = format!("{}SELECT '文件末尾 🦀';", "-- dump\n".repeat(2_100_000));
+    assert!(sql.len() > 16 * 1024 * 1024);
+    std::fs::write(&path, &sql).unwrap();
+    let mut app = session_test_app();
+
+    app.open_shell_paths(std::slice::from_ref(&path));
+
+    assert!(!app.error, "{}", app.status);
+    assert_eq!(app.tabs.len(), 2);
+    let tab = &app.tabs[app.active_tab];
+    assert_eq!(tab.sql, sql);
+    assert_eq!(tab.saved_sql, sql);
+    assert_eq!(tab.file_path.as_ref(), Some(&path));
+    assert!(!tab.query_started);
+    assert!(app.sessions.is_empty());
+    assert!(app.query_sessions.is_empty());
+}
+
+#[test]
 fn invalid_utf8_and_oversized_sql_leave_existing_documents_unchanged() {
     let directory = tempfile::tempdir().unwrap();
     let bad_utf8 = directory.path().join("invalid.sql");

@@ -5,6 +5,8 @@ impl App {
         if matches!(
             action,
             BrowserAction::Connect(_)
+                | BrowserAction::OpenSavedQuery(_)
+                | BrowserAction::NewSavedQuery
                 | BrowserAction::SelectDatabase { .. }
                 | BrowserAction::OpenData { .. }
                 | BrowserAction::OpenStructure { .. }
@@ -15,6 +17,72 @@ impl App {
             return;
         }
         match action {
+            BrowserAction::OpenSavedQuery(id) => {
+                if let Some(query) = self
+                    .catalog
+                    .queries
+                    .iter()
+                    .find(|query| query.id == id)
+                    .cloned()
+                {
+                    self.open_saved_query(query);
+                }
+            }
+            BrowserAction::RenameSavedQuery(id) => {
+                if let Some(query) = self
+                    .catalog
+                    .queries
+                    .iter()
+                    .find(|query| query.id == id)
+                    .cloned()
+                {
+                    self.catalog_dialog = Some(catalog_ui::CatalogDialog::Query {
+                        id: Some(id),
+                        name: query.name.clone(),
+                        sql: query.sql.clone(),
+                        target: query.target.clone(),
+                        source_tab: None,
+                        expected: Some(Box::new(query)),
+                    });
+                }
+            }
+            BrowserAction::DeleteSavedQuery(id) => {
+                if let Some(query) = self.catalog.queries.iter().find(|query| query.id == id) {
+                    self.catalog_dialog = Some(catalog_ui::CatalogDialog::DeleteQuery(
+                        id,
+                        query.name.clone(),
+                    ));
+                }
+            }
+            BrowserAction::NewSavedQuery => {
+                if !self.browser_state.all_queries
+                    && let Some(scope) = self.browser_scope.clone()
+                {
+                    self.handle_browser_action(BrowserAction::NewQuery {
+                        connection: scope.connection,
+                        database: scope.database,
+                        schema: scope.schema,
+                        table: None,
+                    });
+                } else if self.apply_ui_tab_action(TabAction::New) {
+                    self.tabs[self.active_tab].target = None;
+                    self.browser_visible = false;
+                }
+            }
+            BrowserAction::RenameTable {
+                connection,
+                database,
+                table,
+            } => {
+                self.schema_dialog = Some(SchemaDialog {
+                    name: table.name.clone(),
+                    action: SchemaDialogAction::RenameTable {
+                        connection,
+                        database,
+                        table,
+                    },
+                });
+            }
             BrowserAction::Connect(connection) => {
                 self.selected = Some(connection);
                 self.connect_selected();
@@ -178,7 +246,7 @@ impl App {
                 });
                 self.table_create =
                     Some(new_table_create_form(connection, database, schema, engine));
-                self.browser_visible = false;
+                self.browser_visible = self.tabs.is_empty();
             }
         }
     }

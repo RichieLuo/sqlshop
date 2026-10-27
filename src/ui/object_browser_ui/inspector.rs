@@ -107,20 +107,36 @@ pub(in crate::ui) fn inspector(
             InspectorPage::Query => {
                 if let Some(preview) = &data.query_preview {
                     property(ui, "查询", preview.name);
-                    ui.label(RichText::new("当前文稿").strong())
-                        .on_hover_text("编辑器中的 SQL，包含未执行的改动");
+                    ui.label(
+                        RichText::new(if preview.saved {
+                            "已保存 SQL"
+                        } else {
+                            "当前文稿"
+                        })
+                        .strong(),
+                    );
                     if preview.sql.is_empty() {
                         ui.label(RichText::new("文稿为空。").weak());
                     } else {
-                        inspector_sql(ui, preview.sql, "复制当前文稿");
+                        inspector_sql(
+                            ui,
+                            preview.sql,
+                            if preview.saved {
+                                "复制 SQL"
+                            } else {
+                                "复制当前文稿"
+                            },
+                        );
                     }
-                    ui.separator();
-                    ui.label(RichText::new("最近执行").strong())
-                        .on_hover_text("最近发送给服务器的 SQL，可能是选区或当前语句");
-                    if let Some(sql) = preview.executed_sql {
-                        inspector_sql(ui, sql, "复制最近执行 SQL");
-                    } else {
-                        ui.label(RichText::new("此文档尚无执行记录。").weak());
+                    if !preview.saved {
+                        ui.separator();
+                        ui.label(RichText::new("最近执行").strong())
+                            .on_hover_text("最近发送给服务器的 SQL，可能是选区或当前语句");
+                        if let Some(sql) = preview.executed_sql {
+                            inspector_sql(ui, sql, "复制最近执行 SQL");
+                        } else {
+                            ui.label(RichText::new("此文档尚无执行记录。").weak());
+                        }
                     }
                 }
             }
@@ -153,6 +169,14 @@ pub(super) fn inspector_general(
     data: &InspectorData<'_>,
     action: &mut Option<InspectorAction>,
 ) {
+    if let Some(preview) = &data.query_preview
+        && preview.saved
+    {
+        property(ui, "名称", preview.name);
+        property(ui, "类型", "查询");
+        inspector_sql(ui, preview.sql, "复制 SQL");
+        return;
+    }
     let Some(profile) = data.browser.profile else {
         ui.label(RichText::new("选择连接或数据库对象查看信息").weak());
         return;

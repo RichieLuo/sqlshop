@@ -277,7 +277,7 @@ impl App {
         let mut open = true;
         let mut operation = None;
         let mut close = false;
-        egui::Window::new(if doc.schema_action==255{"对象设计器"}else{"Schema / 数据库管理"}).id(egui::Id::new(KEY)).open(&mut open).default_width(850.).resizable(true).show(&self.context,|ui|{
+        dialog_window(if doc.schema_action==255{"对象设计器"}else{"Schema / 数据库管理"}, &self.context).id(egui::Id::new(KEY)).open(&mut open).default_width(850.).resizable(true).show(&self.context,|ui|{
             let engine=doc.source.profile.engine;
             ui.strong(format!("{} · {}:{} · {} · {}",doc.source.profile.name,doc.source.profile.host,doc.source.profile.port,doc.source.target.database.as_deref().unwrap_or_default(),engine.label()));
             ui.small("连接和数据库已绑定；执行使用独立连接。修改连接配置后必须重新打开设计器。");
@@ -389,21 +389,21 @@ impl App {
             }
         }
         if doc.discard_requested {
-            egui::Window::new("丢弃未保存的设计草稿？")
+            dialog_window("丢弃未保存的设计草稿？", &self.context)
                 .id(egui::Id::new("object-design-discard-confirm"))
                 .collapsible(false)
                 .resizable(false)
                 .show(&self.context, |ui| {
                     ui.label("当前对象定义或 Schema 设置尚未保存。关闭后将丢弃这份草稿。");
-                    ui.horizontal(|ui| {
-                        if ui.button("继续编辑").clicked() {
-                            doc.discard_requested = false;
-                        }
+                    dialog_actions(ui, |ui| {
                         if ui
-                            .add_enabled(!busy, egui::Button::new("丢弃草稿并关闭"))
+                            .add_enabled(!busy, danger_button(ui, "丢弃草稿并关闭"))
                             .clicked()
                         {
                             discard = true;
+                        }
+                        if ui.button("继续编辑").clicked() {
+                            doc.discard_requested = false;
                         }
                     });
                 });

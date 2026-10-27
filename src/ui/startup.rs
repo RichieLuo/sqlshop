@@ -15,17 +15,7 @@ impl App {
             egui::ThemePreference::System
         };
         cc.egui_ctx.set_theme(theme);
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-            style.spacing.button_padding = egui::vec2(13.0, 8.0);
-            style.spacing.interact_size.y = 30.0;
-            style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.window_corner_radius = egui::CornerRadius::same(14);
-            style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-        });
+        cc.egui_ctx.all_styles_mut(configure_style);
         let context = cc.egui_ctx.clone();
         let mut app = Self {
             advanced_worker: sqlshop::advanced_worker::AdvancedWorker::new(cc.egui_ctx.clone()),
@@ -93,11 +83,9 @@ impl App {
             confirm_exit: false,
             allow_exit: false,
             confirm_request: None,
-            confirm_sql: None,
             catalog: Catalog::default(),
             catalog_store: None,
             library_open: false,
-            library_search: String::new(),
             catalog_dialog: None,
         };
         if app.screenshot_path.is_none() {
@@ -114,6 +102,7 @@ impl App {
             }
             app.restore_redis_connections();
             app.restore_workspace();
+            panel_layout_ui::migrate_legacy(&app.context, cc.storage);
             app.restore_catalog();
         }
         if app.screenshot_path.is_some()
@@ -142,6 +131,8 @@ impl App {
                     | "grid-selection"
                     | "browser"
                     | "browser-offline"
+                    | "saved-queries"
+                    | "saved-queries-offline"
                     | "objects-rich"
                     | "objects-icons"
                     | "object-definition"
@@ -178,6 +169,8 @@ impl App {
                     | "tree-details"
                     | "tree-document"
                     | "browser-offline"
+                    | "saved-queries"
+                    | "saved-queries-offline"
                     | "objects-rich"
                     | "objects-icons"
                     | "object-definition"
@@ -740,6 +733,7 @@ FROM users;"
                 app.tabs[app.active_tab].definition.as_mut().unwrap().sql = Some("-- Offline layout example; no database connection.\nCREATE OR REPLACE FUNCTION public.calculate_total(amount numeric, tax_rate numeric)\nRETURNS numeric\nLANGUAGE sql\nIMMUTABLE\nAS $function$\n  SELECT round(amount * (1 + tax_rate), 2);\n$function$;".into());
             }
         }
+        app.saved_query_fixture();
         app.management_fixture();
         app.table_tree_fixture();
         app

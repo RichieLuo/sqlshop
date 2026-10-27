@@ -1,5 +1,32 @@
 use super::*;
 
+fn query_collection_node(
+    ui: &mut egui::Ui,
+    selection: &mut TreeSelection,
+    queries: &[SavedQuery],
+    connection: Uuid,
+    database: Option<&str>,
+    schema: Option<&str>,
+) -> Option<TreeNode> {
+    let scope = object_browser_ui::BrowserScope {
+        connection,
+        database: database.map(str::to_owned),
+        schema: schema.map(str::to_owned),
+    };
+    let count = queries
+        .iter()
+        .filter(|query| object_browser_ui::query_in_scope(query, Some(&scope)))
+        .count();
+    let node = TreeNode::Queries(connection, scope.database, scope.schema);
+    let leaf = tree_navigation_ui::leaf(
+        ui,
+        selection,
+        node.clone(),
+        format!("查询 ({count})").into(),
+    );
+    (leaf.response.clicked() || leaf.activated).then_some(node)
+}
+
 impl App {
     pub(super) fn workspace_shortcuts(&mut self, ctx: &egui::Context) {
         if self.modal_open() || egui::Popup::is_any_open(ctx) {
@@ -68,8 +95,6 @@ impl App {
         ui.visuals_mut().indent_has_left_vline = false;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.add_space(4.0);
-        self.saved_queries_sidebar(ui);
-        ui.separator();
         let search_width =
             (ui.available_width() - 56.0 - 2.0 * ui.spacing().item_spacing.x).max(60.0);
         ui.horizontal(|ui| {
@@ -148,6 +173,7 @@ impl App {
         let mut refresh_databases = None;
         let mut refresh_tables = None;
         let mut to_select = None;
+        let mut cancel_database_opens = Vec::new();
         let mut preview = None;
         let mut schema_dialog = None;
         let mut table_create = None;
@@ -256,8 +282,6 @@ impl App {
                             let databases =
                                 session.map(|s| s.databases.as_slice()).unwrap_or_default();
                             let active_database = session.and_then(|s| s.active_database.as_ref());
-                            let catalog_tables =
-                                session.map(|s| s.tables.as_slice()).unwrap_or_default();
                             let empty_entries = HashMap::new();
                             let tree_entries = session
                                 .map(|s| &s.tree_metadata.entries)
@@ -298,6 +322,16 @@ impl App {
                                 tree_activation = Some(TreeNode::Connection(profile.id));
                             }
                             server_header.body(|ui| {
+                                if let Some(node) = query_collection_node(
+                                    ui,
+                                    &mut self.tree_selection,
+                                    &self.catalog.queries,
+                                    profile.id,
+                                    None,
+                                    None,
+                                ) {
+                                    tree_activation = Some(node);
+                                }
                                 if !connected {
                                     return;
                                 }
@@ -331,7 +365,20 @@ impl App {
                                     };
                                     let matches_database =
                                         database.to_lowercase().contains(&filter);
-                                    if !filter.is_empty() && !matches_database && !active {
+                                    let database_tables =
+                                        session.and_then(|s| s.tree_tables(database));
+                                    let matches_tables = database_tables.is_some_and(|tables| {
+                                        tables.iter().any(|table| {
+                                            format!("{}.{}", table.schema, table.name)
+                                                .to_lowercase()
+                                                .contains(&filter)
+                                        })
+                                    });
+                                    if !filter.is_empty()
+                                        && !matches_database
+                                        && !active
+                                        && !matches_tables
+                                    {
                                         continue;
                                     }
                                     let title =
@@ -341,6 +388,7 @@ impl App {
                                         profile.id,
                                         database,
                                         tree_generation,
+                                        session.map(|s| s.database_tree.generation),
                                     ));
                                     let database_header = tree_navigation_ui::branch(
                                         ui,
@@ -360,11 +408,17 @@ impl App {
                                         true,
                                     );
                                     let database_response = database_header.response.clone();
-                                    if (database_header.opened || database_header.activated)
-                                        && !busy
-                                        && !active
+                                    if database_header.opened
+                                        || (database_header.activated && database_header.is_open())
                                     {
                                         to_select = Some((profile.id, database.clone()));
+                                    }
+                                    if !database_header.is_open()
+                                        && session.is_some_and(|s| {
+                                            s.database_tree.pending.contains(database)
+                                        })
+                                    {
+                                        cancel_database_opens.push((profile.id, database.clone()));
                                     }
                                     if database_header.activated
                                         && (!active || database_header.is_open())
@@ -373,25 +427,34 @@ impl App {
                                             Some(TreeNode::Database(profile.id, database.clone()));
                                     }
                                     database_header.body(|ui| {
-                                        if !active {
-                                            ui.label(
-                                                RichText::new(if busy {
-                                                    "当前连接忙，请稍后打开数据库"
-                                                } else {
-                                                    "展开或双击打开数据库"
-                                                })
-                                                .small()
-                                                .weak(),
-                                            );
-                                            if ui
-                                                .add_enabled(!busy, egui::Button::new("打开数据库"))
-                                                .clicked()
-                                            {
-                                                to_select = Some((profile.id, database.clone()));
-                                            }
-                                            return;
+                                        if let Some(node) = query_collection_node(
+                                            ui,
+                                            &mut self.tree_selection,
+                                            &self.catalog.queries,
+                                            profile.id,
+                                            Some(database),
+                                            None,
+                                        ) {
+                                            tree_activation = Some(node);
                                         }
-                                        let tables: Vec<_> = catalog_tables
+                                        if session.is_some_and(|session| {
+                                            database_tree_ui::database_status(ui, session, database)
+                                        }) {
+                                            to_select = Some((profile.id, database.clone()));
+                                        }
+                                        let Some(database_tables) = database_tables else {
+                                            return;
+                                        };
+                                        if database_tables.is_empty()
+                                            && !session.is_some_and(|s| {
+                                                active
+                                                    && (s.catalog_loading
+                                                        || s.catalog_error.is_some())
+                                            })
+                                        {
+                                            ui.label(RichText::new("暂无表或视图").small().weak());
+                                        }
+                                        let tables: Vec<_> = database_tables
                                             .iter()
                                             .filter(|table| {
                                                 matches_database
@@ -457,6 +520,16 @@ impl App {
                                                     ));
                                                 }
                                                 schema_header.body(|ui| {
+                                                    if let Some(node) = query_collection_node(
+                                                        ui,
+                                                        &mut self.tree_selection,
+                                                        &self.catalog.queries,
+                                                        profile.id,
+                                                        Some(database),
+                                                        Some(schema),
+                                                    ) {
+                                                        tree_activation = Some(node);
+                                                    }
                                                     let schema_tables: Vec<_> = tables
                                                         .iter()
                                                         .copied()
@@ -502,16 +575,7 @@ impl App {
                                                 });
                                             }
                                         }
-                                        if catalog_tables.is_empty() {
-                                            ui.label(
-                                                RichText::new(if busy {
-                                                    "正在读取表目录…"
-                                                } else {
-                                                    "没有表或视图"
-                                                })
-                                                .weak(),
-                                            );
-                                        } else if tables.is_empty() {
+                                        if !database_tables.is_empty() && tables.is_empty() {
                                             ui.label(RichText::new("没有匹配的表或视图").weak());
                                         }
                                     });
@@ -625,6 +689,7 @@ impl App {
                         TreeNode::Connection(id)
                         | TreeNode::Database(id, _)
                         | TreeNode::Schema(id, _, _)
+                        | TreeNode::Queries(id, _, _)
                         | TreeNode::Table(id, _, _)
                         | TreeNode::TablePart(id, _, _, _, _) => Some(*id),
                     };
@@ -645,11 +710,13 @@ impl App {
                 .then(|| self.tree_selection.selected.clone())
                 .flatten()
         }) {
+            let queries_node = matches!(&node, TreeNode::Queries(..));
             // Redis selection belongs only to the tree. It must never become a SQL BrowserScope.
             let redis_node = match &node {
                 TreeNode::Connection(id)
                 | TreeNode::Database(id, _)
                 | TreeNode::Schema(id, _, _)
+                | TreeNode::Queries(id, _, _)
                 | TreeNode::Table(id, _, _)
                 | TreeNode::TablePart(id, _, _, _, _) => self.is_redis_connection(*id),
                 TreeNode::Group(_) => false,
@@ -659,6 +726,14 @@ impl App {
             } else {
                 match node {
                     TreeNode::Group(_) => None,
+                    TreeNode::Queries(connection, database, schema) => Some((
+                        object_browser_ui::BrowserScope {
+                            connection,
+                            database,
+                            schema,
+                        },
+                        None,
+                    )),
                     TreeNode::Connection(connection) => Some((
                         object_browser_ui::BrowserScope {
                             connection,
@@ -699,10 +774,14 @@ impl App {
                 }
             };
             if let Some((scope, item)) = scope {
-                if tree_activation.is_some() {
+                if tree_activation.is_some() || queries_node {
                     self.show_object_scope(scope, item);
                 } else {
                     self.select_object_scope(scope, item);
+                }
+                if queries_node && self.browser_visible {
+                    self.browser_state.category = object_browser_ui::BrowserCategory::Queries;
+                    self.browser_state.all_queries = false;
                 }
             }
         }
@@ -747,6 +826,14 @@ impl App {
             self.selected = Some(id);
             self.connect_selected();
         }
+        for (connection, database) in cancel_database_opens {
+            if let Some(session) = self.sessions.get_mut(&connection) {
+                session
+                    .database_tree
+                    .pending
+                    .retain(|name| name != &database);
+            }
+        }
         if let Some((id, database)) = to_select {
             self.selected = Some(id);
             if self.is_redis_connection(id) {
@@ -757,7 +844,7 @@ impl App {
                     Err(_) => self.fail("Redis 数据库编号无效".into()),
                 }
             } else {
-                self.request_on(id, Request::SelectDatabase(database), "正在选择数据库…");
+                self.open_tree_database(id, database);
             }
         }
         if let Some((connection, database, engine, table)) = preview {

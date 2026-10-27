@@ -85,44 +85,59 @@ fn completion_tables_require_matching_bound_connected_database_and_schema() {
     assert!(app.completion_tables().is_empty());
 }
 
-#[test]
-fn execution_scope_preserves_target_and_confirms_only_the_requested_sql() {
+// Port zero keeps these dispatch tests independent of any real database.
+fn direct_execution_fixture() -> (App, QueryTarget, QueryTarget) {
     let mut app = session_test_app();
     let a = add_test_session(&mut app, "A", "db_a");
     let b = add_test_session(&mut app, "B", "db_b");
+    app.profiles[0].host = "127.0.0.1".into();
+    app.profiles[0].port = 0;
+    app.sessions.get_mut(&a.connection).unwrap().connected = Some(app.profiles[0].clone());
+    app.credentials.insert(a.connection, Credentials::default());
     app.selected = Some(b.connection);
     app.tabs[0].target = Some(a.clone());
-    let first = "UPDATE items SET note = '中文;值' WHERE id = 1;";
-    let second = "DELETE FROM items WHERE id = 2;";
-    let sql = format!("{first}\n{second}");
-    app.tabs[0].sql = sql.clone();
-    app.tabs[0].selection = first.into();
-    app.tabs[0].cursor = first.chars().count() + 5;
-    app.tabs[0].output = Some(QueryOutput::default());
+    (app, a, b)
+}
 
-    for (scope, expected) in [
-        (SqlExecutionScope::CurrentStatement, second),
-        (SqlExecutionScope::All, sql.as_str()),
-        (SqlExecutionScope::SelectionOrAll, first),
+#[test]
+fn execution_scope_dispatches_reads_writes_and_batches_directly_to_bound_target() {
+    for (first, second) in [
+        ("SELECT 1;", "SELECT 2;"),
+        (
+            "UPDATE items SET note = '中文;值' WHERE id = 1;",
+            "DELETE FROM items WHERE id = 2;",
+        ),
+        ("CREATE TABLE t (id int);", "DROP TABLE t;"),
     ] {
-        app.execute_scope(scope);
-        let pending = app.confirm_sql.take().expect("writes require confirmation");
-        assert_eq!(pending.sql, expected);
-        assert_eq!(pending.target, a);
-        assert_eq!(pending.connection_name, "A");
-        assert!(app.tabs[0].output.is_some());
-        assert!(app.pending_history.is_empty());
-        assert!(!app.sessions[&a.connection].busy);
-        assert!(!app.sessions[&b.connection].busy);
+        let sql = format!("{first}\n{second}");
+        for (scope, expected) in [
+            (SqlExecutionScope::CurrentStatement, second),
+            (SqlExecutionScope::All, sql.as_str()),
+            (SqlExecutionScope::SelectionOrAll, first),
+        ] {
+            let (mut app, a, b) = direct_execution_fixture();
+            app.tabs[0].sql = sql.clone();
+            app.tabs[0].selection = first.into();
+            app.tabs[0].cursor = first.chars().count() + 5;
+            app.tabs[0].output = Some(QueryOutput::default());
+            app.execute_scope(scope);
+            let id = app.tabs[0].id;
+            let dispatched = &app.pending_history[&id];
+            assert_eq!(dispatched.sql, expected);
+            assert_eq!(dispatched.target, a);
+            assert!(app.query_sessions[&id].busy);
+            assert!(!app.sessions[&b.connection].busy);
+            assert!(app.tabs[0].output.is_none());
+            assert!(!app.modal_open());
+            assert_eq!(app.tabs[0].sql, sql);
+            assert_eq!(app.tabs[0].selection, first);
+        }
     }
-    assert_eq!(app.tabs[0].sql, sql);
-    assert_eq!(app.tabs[0].selection, first);
 }
 
 #[test]
 fn current_statement_shortcut_does_not_fall_back_to_full_document_or_edit_sql() {
-    let mut app = session_test_app();
-    let a = add_test_session(&mut app, "A", "db_a");
+    let (mut app, a, _) = direct_execution_fixture();
     app.sessions.get_mut(&a.connection).unwrap().tables.clear();
     app.tabs[0].target = Some(a);
     let sql = "UPDATE items SET note = '中文;值' WHERE id = 1;\nDELETE FROM items WHERE id = 2;";
@@ -155,10 +170,11 @@ fn current_statement_shortcut_does_not_fall_back_to_full_document_or_edit_sql() 
     );
     assert_eq!(app.tabs[0].sql, sql);
     assert_eq!(
-        app.confirm_sql.as_ref().unwrap().sql,
+        app.pending_history[&app.tabs[0].id].sql,
         "DELETE FROM items WHERE id = 2;"
     );
-    assert!(app.pending_history.is_empty());
+    assert!(app.query_sessions[&app.tabs[0].id].busy);
+    assert!(!app.modal_open());
 }
 
 #[test]
@@ -176,7 +192,6 @@ fn rejected_current_statement_keeps_results_and_does_not_dispatch() {
         app.tabs[0].cursor = 0;
         app.execute_scope(SqlExecutionScope::CurrentStatement);
         assert!(app.error, "{sql}");
-        assert!(app.confirm_sql.is_none());
         assert!(app.tabs[0].output.is_some());
         assert!(app.pending_history.is_empty());
         assert!(!app.sessions[&a.connection].busy);

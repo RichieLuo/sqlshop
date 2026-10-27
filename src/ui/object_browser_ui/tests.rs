@@ -32,7 +32,63 @@ fn data<'a>(scope: &'a BrowserScope, profile: &'a Profile, tables: &'a [Table]) 
         catalog: None,
         catalog_loading: false,
         catalog_error: None,
+        queries: &[],
+        profiles: std::slice::from_ref(profile),
+        queries_writable: true,
     }
+}
+
+#[test]
+fn saved_query_list_remains_available_offline_and_opens_only_on_double_click() {
+    let profile = Profile::default();
+    let scope = BrowserScope {
+        connection: profile.id,
+        database: Some("app_dev".into()),
+        schema: None,
+    };
+    let queries = vec![SavedQuery {
+        id: Uuid::new_v4(),
+        name: "daily_report".into(),
+        sql: "SELECT 1".into(),
+        target: Some(sqlshop::workspace::QueryTarget {
+            connection: profile.id,
+            database: Some("app_dev".into()),
+            schema: None,
+        }),
+    }];
+    let data = BrowserData {
+        connected: false,
+        busy: true,
+        queries: &queries,
+        ..data(&scope, &profile, &[])
+    };
+    let ctx = egui::Context::default();
+    let mut state = BrowserState::default();
+    state.set_scope(Some(&scope));
+    state.category = BrowserCategory::Queries;
+    let mut frame = |time, events| {
+        let mut action = None;
+        let output = ctx.run(input(time, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = object_browser(ui, &data, &mut state);
+            });
+        });
+        (output, action)
+    };
+    frame(0.0, vec![]);
+    let position = text_position(&frame(0.01, vec![]).0, "daily_report");
+    frame(0.02, click(position, egui::PointerButton::Primary, true));
+    assert!(
+        frame(0.04, click(position, egui::PointerButton::Primary, false))
+            .1
+            .is_none()
+    );
+    frame(0.10, click(position, egui::PointerButton::Primary, true));
+    assert_eq!(
+        frame(0.12, click(position, egui::PointerButton::Primary, false)).1,
+        Some(BrowserAction::OpenSavedQuery(queries[0].id))
+    );
+    assert_eq!(state.selected_query, Some(queries[0].id));
 }
 
 fn input(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
@@ -70,6 +126,63 @@ fn click(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> Vec<egu
             modifiers: egui::Modifiers::NONE,
         },
     ]
+}
+
+#[test]
+fn browser_context_menu_requests_rename_for_the_selected_table() {
+    for (kind, busy) in [("BASE TABLE", false), ("BASE TABLE", true), ("VIEW", false)] {
+        let profile = Profile::default();
+        let tables = tables();
+        let scope = BrowserScope {
+            connection: profile.id,
+            database: Some("app_dev".into()),
+            schema: None,
+        };
+        let mut data = data(&scope, &profile, &tables);
+        data.busy = busy;
+        let table = Table {
+            kind: kind.into(),
+            ..tables[0].clone()
+        };
+        let item = BrowserItem::Object {
+            connection: profile.id,
+            database: "app_dev".into(),
+            table: table.clone(),
+        };
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let mut render = |ctx: &egui::Context| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| object_context_menu(ui, &data, &item, &mut action));
+        };
+        let output = ctx.run(input(0.0, vec![]), &mut render);
+        if kind == "VIEW" {
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "重命名…")));
+            continue;
+        }
+        let pos = text_position(&output, "重命名…");
+        for (step, pressed) in [true, false].into_iter().enumerate() {
+            let _ = ctx.run(
+                input(
+                    0.1 + step as f64 * 0.1,
+                    click(pos, egui::PointerButton::Primary, pressed),
+                ),
+                &mut render,
+            );
+        }
+        if busy {
+            assert!(action.is_none());
+        } else {
+            assert_eq!(
+                action,
+                Some(BrowserAction::RenameTable {
+                    connection: profile.id,
+                    database: "app_dev".into(),
+                    table
+                })
+            );
+        }
+    }
 }
 
 #[test]

@@ -21,6 +21,12 @@ pub(super) fn category_controls(
         return;
     };
     let databases = scope.database.is_none();
+    let last_category_id = ui.id().with("last-object-category");
+    let category_changed = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<BrowserCategory>(last_category_id);
+        data.insert_temp(last_category_id, state.category);
+        previous != Some(state.category)
+    });
     let rows: Vec<_> = catalog_rows(data)
         .into_iter()
         .filter(|entry| {
@@ -45,9 +51,20 @@ pub(super) fn category_controls(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if databases {
-                    ui.add_sized(
-                        [110.0, 32.0],
-                        egui::Label::new(format!("数据库  {}", data.databases.len())),
+                    ui.selectable_value(
+                        &mut state.category,
+                        BrowserCategory::All,
+                        format!("数据库  {}", data.databases.len()),
+                    );
+                    let count = data
+                        .queries
+                        .iter()
+                        .filter(|query| query_in_scope(query, Some(scope)))
+                        .count();
+                    ui.selectable_value(
+                        &mut state.category,
+                        BrowserCategory::Queries,
+                        format!("查询  {count}"),
                     );
                 } else {
                     for (category, name) in [
@@ -58,6 +75,7 @@ pub(super) fn category_controls(
                         (BrowserCategory::Procedures, "过程"),
                         (BrowserCategory::Triggers, "触发器"),
                         (BrowserCategory::Sequences, "序列"),
+                        (BrowserCategory::Queries, "查询"),
                     ] {
                         if category == BrowserCategory::Sequences
                             && data
@@ -66,20 +84,27 @@ pub(super) fn category_controls(
                         {
                             continue;
                         }
-                        let count = rows
-                            .iter()
-                            .filter(|entry| {
-                                entry
-                                    .kind()
-                                    .is_some_and(|kind| category_matches(category, kind))
-                            })
-                            .count();
-                        let unavailable = data.catalog.is_some_and(|catalog| {
-                            catalog
-                                .unavailable_kinds
+                        let count = if category == BrowserCategory::Queries {
+                            data.queries
                                 .iter()
-                                .any(|kind| category_matches(category, *kind))
-                        });
+                                .filter(|query| query_in_scope(query, Some(scope)))
+                                .count()
+                        } else {
+                            rows.iter()
+                                .filter(|entry| {
+                                    entry
+                                        .kind()
+                                        .is_some_and(|kind| category_matches(category, kind))
+                                })
+                                .count()
+                        };
+                        let unavailable = category != BrowserCategory::Queries
+                            && data.catalog.is_some_and(|catalog| {
+                                catalog
+                                    .unavailable_kinds
+                                    .iter()
+                                    .any(|kind| category_matches(category, *kind))
+                            });
                         let count_label = if unavailable {
                             "—".into()
                         } else {
@@ -100,6 +125,9 @@ pub(super) fn category_controls(
                             egui::Sense::click(),
                         );
                         let selected = state.category == category;
+                        if selected && category_changed {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                        }
                         if selected || response.hovered() {
                             ui.painter().rect_filled(
                                 rect.shrink2(egui::vec2(1.0, 1.0)),
@@ -155,17 +183,31 @@ pub(super) fn category_controls(
             });
         });
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - if databases { 0.0 } else { 145.0 }).max(80.0);
+        let queries = state.category == BrowserCategory::Queries;
+        let width = (ui.available_width()
+            - if queries {
+                120.0
+            } else if databases {
+                0.0
+            } else {
+                145.0
+            })
+        .max(80.0);
         ui.add(
             egui::TextEdit::singleline(&mut state.search)
-                .hint_text(if databases {
+                .hint_text(if queries {
+                    "搜索查询名称 / SQL"
+                } else if databases {
                     "搜索数据库"
                 } else {
                     "搜索名称、Schema、注释或所有者"
                 })
                 .desired_width(width),
         );
-        if !databases {
+        if queries {
+            ui.checkbox(&mut state.all_queries, "全部连接")
+                .on_hover_text("包括未绑定及连接已删除的查询");
+        } else if !databases {
             ui.selectable_value(&mut state.view, BrowserView::Details, "列表");
             ui.selectable_value(&mut state.view, BrowserView::Icons, "图标");
             ui.menu_button("列", |ui| {
@@ -220,6 +262,23 @@ pub(super) fn object_context_menu(
             .clicked()
     {
         *action = Some(next);
+        ui.close();
+    }
+    if let BrowserItem::Object {
+        connection,
+        database,
+        table,
+    } = item
+        && table.kind.eq_ignore_ascii_case("BASE TABLE")
+        && ui
+            .add_enabled(data.item_ready(item), egui::Button::new("重命名…"))
+            .clicked()
+    {
+        *action = Some(BrowserAction::RenameTable {
+            connection: *connection,
+            database: database.clone(),
+            table: table.clone(),
+        });
         ui.close();
     }
     if ui.button("新建查询").clicked() {

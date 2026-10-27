@@ -1,8 +1,7 @@
-mod query_safety;
-use query_safety::*;
-
 mod commands;
 mod connections;
+mod database_tree_ui;
+mod dialog_style;
 mod dialogs;
 mod editor;
 mod events;
@@ -58,6 +57,7 @@ mod object_browser_host;
 mod object_browser_ui;
 mod object_design_ui;
 mod oracle_database_ui;
+mod panel_layout_ui;
 mod query_result_ui;
 mod query_session_ui;
 mod recovery_ui;
@@ -68,6 +68,7 @@ use sqlshop::redis_database::{RedisProfile, RedisWorker};
 mod structure_ui;
 mod tab_bar_ui;
 mod table_insert_ui;
+mod table_rename_ui;
 mod table_tree_ui;
 mod tree_navigation_ui;
 mod window_chrome;
@@ -251,9 +252,6 @@ impl QueryTab {
     }
 }
 
-#[cfg(test)]
-mod sql_risk_tests;
-
 #[derive(Clone, Copy)]
 enum SqlExecutionScope {
     SelectionOrAll,
@@ -315,6 +313,7 @@ enum TreeNode {
     Connection(Uuid),
     Database(Uuid, String),
     Schema(Uuid, String, String),
+    Queries(Uuid, Option<String>, Option<String>),
     Table(Uuid, String, Table),
     TablePart(
         Uuid,
@@ -326,6 +325,11 @@ enum TreeNode {
 }
 
 enum SchemaDialogAction {
+    RenameTable {
+        connection: Uuid,
+        database: String,
+        table: Table,
+    },
     CreateDatabase {
         connection: Uuid,
     },
@@ -432,6 +436,7 @@ struct ConnectionSession {
     databases: Vec<String>,
     active_database: Option<String>,
     tables: Vec<Table>,
+    database_tree: database_tree_ui::DatabaseTree,
     object_catalog: Option<sqlshop::object_catalog::ObjectCatalog>,
     catalog_loading: bool,
     catalog_error: Option<String>,
@@ -521,6 +526,7 @@ impl ConnectionSession {
             databases: Vec::new(),
             active_database: None,
             tables: Vec::new(),
+            database_tree: Default::default(),
             object_catalog: None,
             catalog_loading: false,
             catalog_error: None,
@@ -628,11 +634,9 @@ pub struct App {
     confirm_exit: bool,
     allow_exit: bool,
     confirm_request: Option<(Uuid, Request, String)>,
-    confirm_sql: Option<PendingSqlExecution>,
     catalog: Catalog,
     catalog_store: Option<CatalogStore>,
     library_open: bool,
-    library_search: String,
     catalog_dialog: Option<CatalogDialog>,
 }
 
@@ -744,9 +748,10 @@ impl eframe::App for App {
                 .frame(
                     egui::Frame::new()
                         .fill(chrome(ctx))
-                        .inner_margin(egui::Margin::symmetric(18, 8)),
+                        .inner_margin(egui::Margin::symmetric(18, 2)),
                 )
                 .show(ctx, |ui| {
+                    ui.spacing_mut().interact_size.y = 20.0;
                     let (status, error) = self.workspace_status();
                     ui.horizontal(|ui| {
                         ui.label(format!(
@@ -761,7 +766,7 @@ impl eframe::App for App {
                             ui.visuals().weak_text_color()
                         };
                         ui.add_sized(
-                            [width, 22.0],
+                            [width, 20.0],
                             egui::Label::new(RichText::new(&status).small().color(color))
                                 .truncate(),
                         )
@@ -794,7 +799,7 @@ impl eframe::App for App {
         if self.view.navigation && !self.view.focus {
             egui::SidePanel::left("sidebar")
                 .default_width(240.0)
-                .width_range(200.0..=340.0)
+                .width_range(200.0..=800.0)
                 .frame(
                     egui::Frame::new()
                         .fill(chrome(ctx))
@@ -974,45 +979,52 @@ fn apply_tab_action(
     next: &mut usize,
     action: TabAction,
 ) {
-    let active_id = tabs[*active].id;
+    if tabs.is_empty() {
+        *next = 1;
+    }
+    let active_id = tabs.get(*active).map(|tab| tab.id);
     match action {
-        TabAction::Select(index) => *active = index,
+        TabAction::Select(index) if index < tabs.len() => *active = index,
         TabAction::New => {
             tabs.push(QueryTab::new(*next));
             *next += 1;
             *active = tabs.len() - 1;
         }
-        TabAction::Close(index) => {
+        TabAction::Close(index) if index < tabs.len() => {
             tabs.remove(index);
-            if tabs.is_empty() {
-                tabs.push(QueryTab::new(*next));
-                *next += 1;
-            }
             *active = tabs
                 .iter()
-                .position(|tab| tab.id == active_id)
-                .unwrap_or_else(|| index.min(tabs.len() - 1));
+                .position(|tab| Some(tab.id) == active_id)
+                .unwrap_or_else(|| index.min(tabs.len().saturating_sub(1)));
         }
-        TabAction::CloseOthers(index) => {
+        TabAction::CloseOthers(index) if index < tabs.len() => {
             let keep = tabs[index].id;
             tabs.retain(|tab| tab.id == keep);
             *active = 0;
         }
-        TabAction::CloseRight(index) => {
+        TabAction::CloseRight(index) if index < tabs.len() => {
             tabs.truncate(index + 1);
             *active = tabs
                 .iter()
-                .position(|tab| tab.id == active_id)
+                .position(|tab| Some(tab.id) == active_id)
                 .unwrap_or(index);
         }
+        _ => {}
+    }
+    if tabs.is_empty() {
+        *next = 1;
     }
 }
 
 /// Open a centered dialog while retaining the user's subsequent dragged position.
 fn dialog_window(title: impl Into<String>, ctx: &egui::Context) -> egui::Window<'static> {
-    egui::Window::new(title.into())
+    egui::Window::new(RichText::new(title.into()).strong().size(20.0))
+        .frame(dialog_style::frame(ctx))
         .collapsible(false)
         .resizable(false)
+        .default_width(440.0)
+        .min_width(360.0)
+        .max_width((ctx.content_rect().width() - 80.0).max(360.0))
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center())
 }

@@ -22,11 +22,13 @@ pub use security::{account_change_preview, security_change_sql};
 mod structure;
 mod structure_edit;
 mod table_edit;
+mod table_rename;
 mod table_tree;
 pub use browser::{
     ColumnFilter, ColumnSort, FilterOperator, TableBrowseOptions, TablePage, TableStructure,
 };
 pub use structure_edit::{ColumnEditInfo, StructureChange, column_edit_info, structure_change_sql};
+pub use table_rename::rename_table_sql;
 mod values;
 
 pub(crate) use object_catalog::ObjectDefinitionRejected;

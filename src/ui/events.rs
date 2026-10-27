@@ -63,6 +63,7 @@ impl App {
                 self.handle_response(connection, response);
             }
         }
+        self.poll_database_opens();
     }
 
     pub(super) fn invalidate_table_snapshots(&mut self, connection: Uuid) {
@@ -319,6 +320,7 @@ impl App {
                 };
                 if disconnected {
                     self.invalidate_table_snapshots(connection);
+                    session.database_tree = Default::default();
                     session.connected = None;
                     session.active_database = None;
                     session.databases.clear();
@@ -338,6 +340,7 @@ impl App {
                 profile,
             } => {
                 self.invalidate_table_snapshots(connection);
+                session.database_tree = Default::default();
                 session.connected = Some(profile.clone());
                 session.active_database = target.database.clone();
                 session.raw_session_used = false;
@@ -350,6 +353,7 @@ impl App {
             }
             Response::Connected(id) => {
                 self.invalidate_table_snapshots(connection);
+                session.database_tree = Default::default();
                 session.clear_columns();
                 session.raw_session_used = false;
                 session.connected = self.profiles.iter().find(|p| p.id == id).cloned();
@@ -363,6 +367,7 @@ impl App {
             }
             Response::Disconnected => {
                 self.invalidate_table_snapshots(connection);
+                session.database_tree = Default::default();
                 session.clear_columns();
                 session.raw_session_used = false;
                 session.connected = None;
@@ -408,6 +413,18 @@ impl App {
                 );
                 // Discovery must not silently alter the worker's database context.
                 session.databases = databases;
+                session
+                    .database_tree
+                    .tables
+                    .retain(|database, _| session.databases.contains(database));
+                session
+                    .database_tree
+                    .pending
+                    .retain(|database| session.databases.contains(database));
+                session
+                    .database_tree
+                    .errors
+                    .retain(|database, _| session.databases.contains(database));
                 if let Some((pending_connection, database)) = self.database_create_pending.as_ref()
                     && *pending_connection == connection
                 {
@@ -438,11 +455,48 @@ impl App {
                     "正在读取对象目录与属性…",
                 ));
             }
+            Response::TableRenamed {
+                database,
+                table,
+                new_name,
+            } => {
+                let engine = session
+                    .connected
+                    .as_ref()
+                    .map(|profile| profile.engine)
+                    .unwrap_or_default();
+                self.apply_table_rename(connection, &database, &table, &new_name, engine);
+                session.clear_columns();
+                if let Some(tables) = session.database_tree.tables.get_mut(&database) {
+                    for known in tables {
+                        if *known == table {
+                            known.name = new_name.clone();
+                        }
+                    }
+                }
+                if session.active_database.as_deref() == Some(database.as_str()) {
+                    for known in &mut session.tables {
+                        if *known == table {
+                            known.name = new_name.clone();
+                        }
+                    }
+                    session.object_catalog = None;
+                    follow_up = Some((
+                        Request::ObjectCatalog { database },
+                        "数据表已重命名 · 正在刷新对象目录…",
+                    ));
+                }
+                self.status = format!("数据表已重命名：{} → {new_name}", table.name);
+            }
             Response::Tables(tables) => {
                 session.clear_columns();
                 self.status = format!("已连接 · {} 个表 / 视图", tables.len());
                 session.tables = tables;
                 if let Some(database) = session.active_database.clone() {
+                    session
+                        .database_tree
+                        .tables
+                        .insert(database.clone(), session.tables.clone());
                     follow_up = Some((
                         Request::ObjectCatalog { database },
                         "正在读取对象目录与属性…",
@@ -456,6 +510,10 @@ impl App {
             }
             Response::ObjectCatalog { database, catalog } => {
                 session.catalog_loading = false;
+                session.database_tree.errors.remove(&database);
+                if session.database_tree.opening.as_ref() == Some(&database) {
+                    session.database_tree.opening = None;
+                }
                 if session.active_database.as_ref() == Some(&database) {
                     session.catalog_error = None;
                     session.clear_columns();
@@ -464,6 +522,10 @@ impl App {
                         .iter()
                         .filter_map(|object| object.as_table())
                         .collect();
+                    session
+                        .database_tree
+                        .tables
+                        .insert(database.clone(), session.tables.clone());
                     self.status = format!("已读取 {} 个对象", catalog.objects.len());
                     if let Some(object_browser_ui::BrowserItem::CatalogObject {
                         connection: selected_connection,
@@ -705,6 +767,12 @@ impl App {
                 message,
                 disconnected,
             } => {
+                if let Some(database) = session.database_tree.opening.take() {
+                    session
+                        .database_tree
+                        .errors
+                        .insert(database, message.clone());
+                }
                 if let Some(source) = session
                     .running_tab
                     .and_then(|id| self.tabs.iter_mut().find(|tab| tab.id == id))
@@ -744,6 +812,7 @@ impl App {
                 }
                 if disconnected {
                     self.invalidate_table_snapshots(connection);
+                    session.database_tree = Default::default();
                     session.connected = None;
                     session.databases.clear();
                     session.active_database = None;

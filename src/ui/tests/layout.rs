@@ -105,6 +105,59 @@ fn theme_text_colors_remain_readable_in_light_and_dark_modes() {
 }
 
 #[test]
+fn short_dialog_footer_stays_next_to_content_without_filling_window_height() {
+    for dark in [false, true] {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(if dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+        apply_theme(&ctx);
+        install_font(&ctx);
+        for frame in 0..3 {
+            let _ =
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 820.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let mut footer = egui::Rect::NOTHING;
+                        let dialog = dialog_window("退出前确认", ctx).show(ctx, |ui| {
+                    ui.label("退出将丢弃表数据暂存，未提交事务可能回滚；SQL 草稿可选择保存。");
+                    footer = dialog_actions(ui, |ui| {
+                        ui.add(primary_button(ui, "保存草稿并退出"));
+                        ui.add(danger_button(ui, "不保存草稿，直接退出"));
+                        ui.button("取消").clicked()
+                    }).response.rect;
+                }).unwrap().response.rect;
+                        // egui measures a new window before applying its center
+                        // pivot. Compare child and window coordinates only once
+                        // the window position has settled.
+                        if frame < 2 {
+                            return;
+                        }
+                        assert!(footer.height() <= 40.0, "footer expanded: {footer:?}");
+                        // Allow the shared 24 px padding and 20 px title while
+                        // still rejecting a footer that consumes viewport height.
+                        assert!(dialog.height() < 240.0, "short dialog expanded: {dialog:?}");
+                        assert!(
+                            // 24 px frame padding plus the 8 px item gap and stroke.
+                            dialog.bottom() - footer.bottom() <= 34.0,
+                            "blank space below footer: dialog={dialog:?}, footer={footer:?}"
+                        );
+                        assert!(dialog.contains_rect(footer));
+                    },
+                );
+        }
+    }
+}
+
+#[test]
 fn dialog_windows_open_centered_on_screen() {
     let ctx = egui::Context::default();
     let mut rect = None;

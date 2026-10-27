@@ -162,9 +162,9 @@ return 1
     }
 }
 
-const MAX_NAMESPACE_KEYS: usize = 10_000;
-const MAX_NAMESPACE_KEY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_NAMESPACE_SCAN_PAGES: usize = 10_000;
+// These thresholds only add a notice; they never truncate or reject a preview.
+const LARGE_NAMESPACE_KEYS: usize = 10_000;
+const LARGE_NAMESPACE_KEY_BYTES: usize = 4 * 1024 * 1024;
 const NAMESPACE_DELETE_BATCH: usize = 100;
 static NEXT_NAMESPACE_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -187,56 +187,46 @@ async fn preview_namespace(
 ) -> Result<RedisData> {
     connection.namespace = None;
     let pattern = namespace_pattern(&prefix);
-    let scan = async {
-        let mut cursor = 0;
-        let mut seen = HashSet::new();
-        let mut key_bytes = 0usize;
-        for _ in 0..MAX_NAMESPACE_SCAN_PAGES {
-            let (next, page): (u64, Vec<Vec<u8>>) = connection
-                .query(
-                    redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(MAX_COLLECTION_ITEMS),
-                    false,
-                )
-                .await?;
-            for key in page {
-                // MATCH is not a security boundary: check literal binary identity as well.
-                // A parent key "foo" is not in namespace "foo:".
-                if !key.starts_with(&prefix) || seen.contains(&key) {
-                    continue;
-                }
-                anyhow::ensure!(
-                    seen.len() < MAX_NAMESPACE_KEYS
-                        && key.len() <= MAX_NAMESPACE_KEY_BYTES - key_bytes,
-                    "命名空间预览超过安全上限（10000 个 Key / 4 MiB 键名）；未生成删除令牌，请缩小前缀"
-                );
-                key_bytes += key.len();
-                seen.insert(key);
+    let mut cursor = 0;
+    let mut seen = HashSet::new();
+    let mut key_bytes = 0usize;
+    // Large namespaces may take many pages and longer than a single command's
+    // timeout. Keep scanning until Redis finishes; query still times out stalled I/O.
+    loop {
+        let (next, page): (u64, Vec<Vec<u8>>) = connection
+            .query(
+                redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(MAX_COLLECTION_ITEMS),
+                false,
+            )
+            .await?;
+        for key in page {
+            // MATCH is not a security boundary: check literal binary identity as well.
+            // A parent key "foo" is not in namespace "foo:".
+            if !key.starts_with(&prefix) || seen.contains(&key) {
+                continue;
             }
-            cursor = next;
-            if cursor == 0 {
-                return Ok::<_, anyhow::Error>(seen.into_iter().collect::<Vec<_>>());
-            }
+            key_bytes += key.len();
+            seen.insert(key);
         }
-        bail!("命名空间扫描页数超过安全上限；预览不完整，未生成删除令牌")
-    };
-    let keys = match tokio::time::timeout(TIMEOUT, scan).await {
-        Ok(result) => result?,
-        Err(_) => {
-            connection.broken = true;
-            bail!("命名空间完整预览超时，连接已关闭；未生成删除令牌")
+        cursor = next;
+        if cursor == 0 {
+            break;
         }
-    };
+    }
+    let keys: Vec<_> = seen.into_iter().collect();
     let token = NEXT_NAMESPACE_TOKEN
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
             token.checked_add(1)
         })
         .map_err(|_| anyhow::anyhow!("命名空间删除令牌耗尽，请重新启动应用"))?;
     let count = keys.len();
+    let notice = (count > LARGE_NAMESPACE_KEYS || key_bytes > LARGE_NAMESPACE_KEY_BYTES)
+        .then(|| "命名空间较大，删除可能耗时较长；请核对范围后确认执行。".to_owned());
     connection.namespace = Some(super::transport::NamespaceSnapshot {
         token,
         database,
@@ -249,6 +239,7 @@ async fn preview_namespace(
         token,
         prefix,
         count,
+        notice,
     })
 }
 

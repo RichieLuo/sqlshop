@@ -1,7 +1,7 @@
 use super::*;
 
 impl App {
-    pub(super) fn open_jobs(&mut self) {
+    pub(in crate::ui) fn open_jobs(&mut self) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.jobs.is_some()) {
             self.active_tab = index;
             self.browser_visible = false;
@@ -16,7 +16,11 @@ impl App {
             profile: source.profile.id,
             database: source.target.database.unwrap(),
             schema: source.target.schema,
-            sql: self.tabs[self.active_tab].sql.clone(),
+            sql: self
+                .tabs
+                .get(self.active_tab)
+                .map(|tab| tab.sql.clone())
+                .unwrap_or_default(),
             schedule: JobSchedule::EveryMinutes(60),
             enabled: false,
             connection_fingerprint: Some(

@@ -1,5 +1,10 @@
 use super::*;
 
+mod appearance;
+mod large_file;
+use appearance::{layout_sql, line_height_control};
+pub(super) use appearance::{line_height, set_line_height};
+
 pub(super) fn sql_editor(
     ui: &mut egui::Ui,
     tab: &mut QueryTab,
@@ -28,15 +33,21 @@ pub(super) fn sql_editor(
         .corner_radius(10)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
+            toolbar_style(ui);
+            if tab.sql.len() > large_file::LARGE_SQL_BYTES {
+                large_file::show(ui, tab, editor_height);
+                return;
+            }
             let fold_id = egui::Id::new(("sql-fold-mode", tab.id));
             let error_id = egui::Id::new(("sql-format-error", tab.id));
             let mut folded = ui
                 .ctx()
                 .data_mut(|data| data.get_temp::<bool>(fold_id).unwrap_or(false));
-            ui.horizontal(|ui| {
+            let mut line_height = line_height(ui.ctx());
+            ui.horizontal_wrapped(|ui| {
                 for (label, compact) in [("格式化 SQL", false), ("压缩 SQL", true)] {
                     if ui
-                        .small_button(label)
+                        .button(label)
                         .on_hover_text("有选区时处理选区，否则处理全文；保留字符串和注释")
                         .clicked()
                     {
@@ -73,15 +84,21 @@ pub(super) fn sql_editor(
                 }
                 ui.checkbox(&mut folded, "折叠视图")
                     .on_hover_text("折叠多行括号和注释；点击编辑可返回全文并定位源代码");
+                ui.separator();
+                line_height = line_height_control(ui);
             });
             ui.ctx().data_mut(|data| data.insert_temp(fold_id, folded));
             if let Some(error) = ui.ctx().data_mut(|data| data.get_temp::<String>(error_id)) {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
+            ui.separator();
+            ui.add_space(4.0);
+            let content_height =
+                (editor_height - 28.0 - (ui.cursor().top() - ui.min_rect().top())).max(40.0);
             if folded {
                 egui::ScrollArea::both()
                     .id_salt(("folded-sql", tab.id))
-                    .max_height(editor_height - 60.0)
+                    .max_height(content_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         match sqlshop::sql_editor::folding_ranges(&tab.sql, engine) {
@@ -89,7 +106,11 @@ pub(super) fn sql_editor(
                                 let mut previous = 0;
                                 for range in ranges {
                                     if previous < range.start {
-                                        ui.monospace(&tab.sql[previous..range.start]);
+                                        ui.label(layout_sql(
+                                            ui,
+                                            &tab.sql[previous..range.start],
+                                            line_height,
+                                        ));
                                     }
                                     let line = tab.sql[..range.start]
                                         .bytes()
@@ -107,7 +128,11 @@ pub(super) fn sql_editor(
                                     ))
                                     .id_salt((tab.id, range.start))
                                     .show(ui, |ui| {
-                                        ui.monospace(&tab.sql[range.clone()]);
+                                        ui.label(layout_sql(
+                                            ui,
+                                            &tab.sql[range.clone()],
+                                            line_height,
+                                        ));
                                     })
                                     .header_response
                                     .context_menu(|ui| {
@@ -122,7 +147,7 @@ pub(super) fn sql_editor(
                                     previous = range.end;
                                 }
                                 if previous < tab.sql.len() {
-                                    ui.monospace(&tab.sql[previous..]);
+                                    ui.label(layout_sql(ui, &tab.sql[previous..], line_height));
                                 }
                             }
                             Err(error) => {
@@ -134,13 +159,13 @@ pub(super) fn sql_editor(
             }
             egui::ScrollArea::both()
                 .id_salt(("editor", tab.id))
-                .min_scrolled_height(editor_height - 28.0)
-                .max_height(editor_height - 28.0)
+                .min_scrolled_height(content_height)
+                .max_height(content_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut layouter =
                         |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
-                            let job = highlight_sql(text.as_str(), ui.visuals().dark_mode);
+                            let job = layout_sql(ui, text.as_str(), line_height);
                             ui.fonts_mut(|fonts| fonts.layout_job(job))
                         };
                     let editor_id = ui.make_persistent_id(egui::Id::new(tab.id));

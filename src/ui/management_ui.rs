@@ -171,7 +171,11 @@ impl App {
             self.browser_visible = false;
             return;
         }
-        let sql = self.tabs[self.active_tab].sql.clone();
+        let sql = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.sql.clone())
+            .unwrap_or_default();
         let Some(id) = self.management_tab(
             format!(
                 "{} · {}",

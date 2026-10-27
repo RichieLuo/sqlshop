@@ -104,66 +104,81 @@ pub(super) fn controls(
     layout: &mut GridColumnLayout,
     enabled: bool,
 ) -> bool {
+    reconcile(layout, &set.columns);
     let before = layout.clone();
-    ui.horizontal(|ui| {
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.menu_button("列设置", |ui| {
-                if ui.button("显示全部列").clicked() {
-                    for entry in &mut layout.columns {
-                        entry.hidden = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.menu_button("列设置", |ui| {
+            if ui.button("显示全部列").clicked() {
+                for entry in &mut layout.columns {
+                    entry.hidden = false;
+                }
+            }
+            if ui
+                .button("全部列自动适宽")
+                .on_hover_text("根据表头与当前页前 1000 行测量")
+                .clicked()
+            {
+                for (index, entry) in layout.columns.iter_mut().enumerate() {
+                    entry.width = auto_fit(ui, set, index);
+                }
+            }
+            if ui.button("取消冻结").clicked() {
+                layout.frozen_through = None;
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    for index in 0..layout.columns.len() {
+                        let visible_count =
+                            layout.columns.iter().filter(|entry| !entry.hidden).count();
+                        let entry = &mut layout.columns[index];
+                        ui.horizontal(|ui| {
+                            let mut shown = !entry.hidden;
+                            if ui
+                                .add_enabled(
+                                    entry.hidden || visible_count > 1,
+                                    egui::Checkbox::new(&mut shown, &entry.identity.name),
+                                )
+                                .changed()
+                            {
+                                entry.hidden = !shown;
+                            }
+                            if ui.small_button("适宽").clicked() {
+                                entry.width = auto_fit(ui, set, index);
+                            }
+                            if ui.small_button("冻结至此").clicked() {
+                                layout.frozen_through = Some(entry.identity.clone());
+                            }
+                        });
                     }
-                }
-                if ui
-                    .button("全部列自动适宽")
-                    .on_hover_text("根据表头与当前页前 1000 行测量")
-                    .clicked()
-                {
-                    for (index, entry) in layout.columns.iter_mut().enumerate() {
-                        entry.width = auto_fit(ui, set, index);
-                    }
-                }
-                if ui.button("取消冻结").clicked() {
-                    layout.frozen_through = None;
-                }
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        for index in 0..layout.columns.len() {
-                            let visible_count =
-                                layout.columns.iter().filter(|entry| !entry.hidden).count();
-                            let entry = &mut layout.columns[index];
-                            ui.horizontal(|ui| {
-                                let mut shown = !entry.hidden;
-                                if ui
-                                    .add_enabled(
-                                        entry.hidden || visible_count > 1,
-                                        egui::Checkbox::new(&mut shown, &entry.identity.name),
-                                    )
-                                    .changed()
-                                {
-                                    entry.hidden = !shown;
-                                }
-                                if ui.small_button("适宽").clicked() {
-                                    entry.width = auto_fit(ui, set, index);
-                                }
-                                if ui.small_button("冻结至此").clicked() {
-                                    layout.frozen_through = Some(entry.identity.clone());
-                                }
-                            });
-                        }
-                    });
-            });
+                });
         });
-        let hidden = layout.columns.iter().filter(|entry| entry.hidden).count();
-        if hidden > 0 {
-            ui.label(RichText::new(format!("已隐藏 {hidden} 列")).small().weak());
-        }
-        if layout.frozen_through.is_some() {
-            ui.label(RichText::new("左侧列已冻结").small().weak());
-        }
     });
+    let hidden = layout.columns.iter().filter(|entry| entry.hidden).count();
+    if hidden > 0 {
+        ui.label(RichText::new(format!("已隐藏 {hidden} 列")).small().weak());
+    }
+    if layout.frozen_through.is_some() {
+        ui.label(RichText::new("左侧列已冻结").small().weak());
+    }
     *layout != before
+}
+
+pub(super) fn tab_controls(ui: &mut egui::Ui, tab: &mut QueryTab, enabled: bool) {
+    let Some(set) = tab
+        .output
+        .as_ref()
+        .and_then(|output| output.sets.get(tab.result_index))
+        .filter(|set| !set.columns.is_empty())
+    else {
+        return;
+    };
+    let layout = tab.grid_layouts.entry(tab.result_index).or_default();
+    if controls(ui, set, layout, enabled) {
+        tab.selected_cell = None;
+        tab.cell_anchor = None;
+    }
 }
 
 /// Shift frozen cells into the viewport, and clip the scrolling cells behind them.

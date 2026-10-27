@@ -12,6 +12,10 @@ impl App {
     }
 
     pub(super) fn workspace_body(&mut self, ui: &mut egui::Ui) {
+        if self.table_create.is_some() {
+            self.workspace_content(ui);
+            return;
+        }
         if !self.browser_visible
             && self.tabs[self.active_tab].management_document()
             && self.table_create.is_none()
@@ -54,7 +58,6 @@ impl App {
     }
 
     pub(super) fn workspace_content(&mut self, ui: &mut egui::Ui) {
-        let busy = self.tab_busy(self.active_tab);
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.spacing_mut().button_padding.y = 4.0;
         ui.spacing_mut().interact_size.y = 24.0;
@@ -62,6 +65,7 @@ impl App {
             self.table_create_workspace(ui);
             return;
         }
+        let busy = self.tab_busy(self.active_tab);
         let table_tab = self.tabs[self.active_tab].table_target.is_some();
         self.workspace_tools(ui);
         ui.add_space(4.0);
@@ -184,25 +188,49 @@ impl App {
             return;
         };
         if !table_tab {
-            ui.horizontal(|ui| {
-                ui.strong("查询结果");
-                ui.label(format!(
-                    "{} 行 · {} 列 · {} ms",
-                    set.rows.len(),
-                    set.columns.len(),
-                    output.elapsed_ms
-                ))
-                .on_hover_text(&tab.source);
-                if let Some(affected) = set.affected {
-                    ui.label(RichText::new(format!("数据库报告行数: {affected}")).weak());
-                }
-                if !set.columns.is_empty() {
-                    ui.menu_button("复制", |ui| result_copy_controls(ui, tab, true));
-                    if ui.button("导出 CSV").clicked() {
-                        self.export_path = Some(default_csv_export_path());
-                    }
-                }
-            });
+            let mut column_layout = tab
+                .grid_layouts
+                .get(&tab.result_index)
+                .cloned()
+                .unwrap_or_default();
+            let mut columns_changed = false;
+            egui::ScrollArea::horizontal()
+                .id_salt(("query-result-toolbar", tab.id))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("查询结果");
+                        ui.label(format!(
+                            "{} 行 · {} 列 · {} ms",
+                            set.rows.len(),
+                            set.columns.len(),
+                            output.elapsed_ms
+                        ))
+                        .on_hover_text(&tab.source);
+                        if let Some(affected) = set.affected {
+                            ui.label(RichText::new(format!("数据库报告行数: {affected}")).weak());
+                        }
+                        if !set.columns.is_empty() {
+                            ui.menu_button("复制", |ui| result_copy_controls(ui, tab, true));
+                            if ui.button("导出 CSV").clicked() {
+                                self.export_path = Some(default_csv_export_path());
+                            }
+                            columns_changed = grid_columns_ui::controls(
+                                ui,
+                                set,
+                                &mut column_layout,
+                                self.cell_editor.is_none(),
+                            );
+                        }
+                    });
+                });
+            if !set.columns.is_empty() {
+                tab.grid_layouts.insert(tab.result_index, column_layout);
+            }
+            if columns_changed {
+                tab.selected_cell = None;
+                tab.cell_anchor = None;
+            }
         }
         if set.truncated {
             ui.colored_label(

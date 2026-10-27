@@ -45,6 +45,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -PackageDirectory
 
 每次启动都解析最新指针，并将原始 Windows 参数转交给对应程序，支持空格和中文路径。已运行的实例保留当前会话；关闭后重新打开才使用新版本。安装器不会强杀进程、替换正在运行的程序或删除旧版本目录，因此不影响未保存的工作。旧目录暂不自动清理。
 
+SQLShop 的导航栏和对象信息栏宽度按固定字段保存在用户配置目录的 `workspace.json` 中，和主题、面板显隐一起跨版本保留，不依赖界面框架的编译缓存。旧版本留下的面板宽度缓存会在首次启动时兼容读取。
+
 三个仓库共用相同的 `src/shell_open.rs`。Windows 下，同一用户登录会话中的同一产品只保留一个 GUI 实例；从开始菜单或文件再次启动会向现有窗口转发请求并恢复、聚焦窗口。SQLShop 只载入 SQL 文件供编辑，不自动执行；SQLite 使用已有本地数据库入口。LinkShop 调用已有 Postman collection / environment 导入。RPShop 打开文件前保留现有未保存确认流程。纯命令行功能继续独立运行，不占用 GUI 单实例入口。
 
 ## 文件类型与默认应用

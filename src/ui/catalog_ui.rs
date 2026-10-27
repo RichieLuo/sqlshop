@@ -19,6 +19,117 @@ pub(super) enum CatalogDialog {
 }
 
 impl App {
+    pub(super) fn saved_query_fixture(&mut self) {
+        if self.screenshot_path.is_none() {
+            return;
+        }
+        let mode = std::env::var("SQLSHOP_SCREENSHOT_VIEW").unwrap_or_default();
+        if !matches!(mode.as_str(), "saved-queries" | "saved-queries-offline") {
+            return;
+        }
+        let connection = self.profiles[0].id;
+        for (name, database, schema, sql) in [
+            (
+                "每日订单汇总",
+                "app_dev",
+                "public",
+                "SELECT date_trunc('day', created_at) AS day, count(*) AS orders\nFROM public.orders\nGROUP BY 1\nORDER BY 1 DESC;",
+            ),
+            (
+                "待发货订单",
+                "app_dev",
+                "public",
+                "SELECT * FROM public.orders WHERE status = 'pending';",
+            ),
+            (
+                "活跃用户",
+                "app_dev",
+                "public",
+                "SELECT * FROM public.users WHERE active = true;",
+            ),
+            (
+                "审计记录",
+                "app_dev",
+                "audit",
+                "SELECT * FROM audit.events ORDER BY created_at DESC;",
+            ),
+            (
+                "月度营收",
+                "analytics",
+                "public",
+                "SELECT * FROM public.monthly_revenue;",
+            ),
+        ] {
+            self.catalog.queries.push(SavedQuery {
+                id: Uuid::new_v4(),
+                name: name.into(),
+                sql: sql.into(),
+                target: Some(QueryTarget {
+                    connection,
+                    database: Some(database.into()),
+                    schema: Some(schema.into()),
+                }),
+            });
+        }
+        self.catalog.queries.push(SavedQuery {
+            id: Uuid::new_v4(),
+            name: "未绑定查询示例".into(),
+            sql: "SELECT 1;".into(),
+            target: None,
+        });
+        self.show_object_scope(
+            object_browser_ui::BrowserScope {
+                connection,
+                database: Some("app_dev".into()),
+                schema: None,
+            },
+            None,
+        );
+        self.browser_state.category = object_browser_ui::BrowserCategory::Queries;
+        self.browser_state.selected_query = Some(self.catalog.queries[0].id);
+        self.tree_selection.selected =
+            Some(TreeNode::Queries(connection, Some("app_dev".into()), None));
+        self.status = "查询列表布局示例 · 未连接数据库".into();
+        if mode == "saved-queries-offline" {
+            self.sessions.get_mut(&connection).unwrap().connected = None;
+        }
+    }
+
+    pub(super) fn show_saved_queries(&mut self) {
+        let unbound_document = !self.browser_visible && self.tabs[self.active_tab].target.is_none();
+        if !self.browser_visible {
+            if let Some(target) = self.tabs[self.active_tab].target.clone() {
+                self.show_object_scope(
+                    object_browser_ui::BrowserScope {
+                        connection: target.connection,
+                        database: target.database,
+                        schema: target.schema,
+                    },
+                    None,
+                );
+            } else {
+                self.show_selected_objects();
+            }
+        } else {
+            self.show_selected_objects();
+        }
+        if self.browser_visible {
+            if self
+                .browser_scope
+                .as_ref()
+                .is_some_and(|scope| self.is_redis_connection(scope.connection))
+            {
+                self.browser_scope = None;
+                self.browser_state.set_scope(None);
+            }
+            self.browser_state.category = object_browser_ui::BrowserCategory::Queries;
+            self.browser_state.selected = None;
+            self.browser_state.selected_query = None;
+            self.browser_state.search.clear();
+            self.browser_state.all_queries = unbound_document || self.browser_scope.is_none();
+        }
+    }
+
     pub(super) fn restore_catalog(&mut self) {
         let Some(store) = &self.store else { return };
         let store = CatalogStore::new(store.directory.clone());
@@ -77,7 +188,6 @@ impl App {
             || self.confirm_tab_action.is_some()
             || self.confirm_rebind.is_some()
             || self.confirm_request.is_some()
-            || self.confirm_sql.is_some()
             || self.confirm_exit
             || self.history_open
             || self.library_open
@@ -93,7 +203,9 @@ impl App {
     }
 
     pub(super) fn can_save_query(&self) -> bool {
-        let tab = &self.tabs[self.active_tab];
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
         !self.browser_visible
             && !tab.management_document()
             && self.table_create.is_none()
@@ -311,7 +423,13 @@ impl App {
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("关闭当前标签").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !self.tabs.is_empty(),
+                                    egui::Button::new("关闭当前标签"),
+                                )
+                                .clicked()
+                            {
                                 self.change_tab(TabAction::Close(self.active_tab));
                                 ui.close();
                             }
@@ -457,8 +575,8 @@ impl App {
                                 self.save_query_command(true);
                                 ui.close();
                             }
-                            if ui.button("已保存查询…").clicked() {
-                                self.library_open = true;
+                            if ui.button("查询列表").clicked() {
+                                self.show_saved_queries();
                                 ui.close();
                             }
                             if ui.button("查询历史…").clicked() {
@@ -517,9 +635,7 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
-                ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-                ui.spacing_mut().interact_size.y = 30.0;
+                toolbar_style(ui);
                 ui.visuals_mut().widgets.noninteractive.bg_stroke = divider;
                 ui.add_enabled_ui(available, |ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -555,8 +671,12 @@ impl App {
                         {
                             self.save_query_command(false);
                         }
-                        if ui.button("已保存查询").clicked() {
-                            self.library_open = true;
+                        if ui
+                            .button("查询")
+                            .on_hover_text("在对象页浏览当前连接和数据库的查询")
+                            .clicked()
+                        {
+                            self.show_saved_queries();
                         }
                         ui.separator();
                         if ui
@@ -587,46 +707,6 @@ impl App {
         }
     }
 
-    pub(super) fn saved_queries_sidebar(&mut self, ui: &mut egui::Ui) {
-        let mut selected = None;
-        egui::CollapsingHeader::new(format!("已保存查询 ({})", self.catalog.queries.len()))
-            .id_salt("saved-queries-sidebar")
-            .default_open(true)
-            .show(ui, |ui| {
-                if ui.button("打开查询库…").clicked() {
-                    self.library_open = true;
-                }
-                if self.catalog.queries.is_empty() {
-                    ui.label(
-                        RichText::new("在查询页点击“保存查询”即可添加")
-                            .small()
-                            .weak(),
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("saved-queries-sidebar-list")
-                        .max_height(140.0)
-                        .show(ui, |ui| {
-                            for query in &self.catalog.queries {
-                                let active = !self.browser_visible
-                                    && self.tabs[self.active_tab].saved_query.as_ref()
-                                        == Some(query);
-                                if ui
-                                    .selectable_label(active, &query.name)
-                                    .on_hover_text("打开命名查询，保留执行目标")
-                                    .clicked()
-                                {
-                                    selected = Some(query.clone());
-                                }
-                            }
-                        });
-                }
-            });
-        if let Some(query) = selected {
-            self.open_saved_query(query);
-        }
-    }
-
     pub(super) fn open_saved_query(&mut self, query: SavedQuery) {
         // Reuse the named document without replacing unsaved edits.
         if let Some(index) = self
@@ -650,63 +730,62 @@ impl App {
     pub(super) fn catalog_windows(&mut self, ctx: &egui::Context) {
         if self.library_open {
             let mut open = true;
-            let mut selected_query = None;
-            dialog_window("已保存查询", ctx)
-                .open(&mut open).default_width(740.0).default_height(480.0)
+            dialog_window("连接分组", ctx)
+                .open(&mut open)
+                .default_width(440.0)
                 .show(ctx, |ui| {
                     ui.add_enabled_ui(self.catalog_dialog.is_none(), |ui| {
-                        if self.catalog_store.is_none() { ui.colored_label(Color32::from_rgb(230, 130, 90), "查询库不可用，修改已禁用；请检查状态栏错误并重启。"); }
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.library_search).hint_text("搜索查询名称 / SQL"));
-                            if ui.add_enabled(self.catalog_store.is_some() && self.can_save_query(), egui::Button::new("保存当前查询…")).on_hover_text("命名查询独立于草稿和历史；SQL 以明文保存在本机，可能含敏感信息").clicked() { self.save_to_library(None); }
-                        });
-                        let needle = self.library_search.to_lowercase();
-                        egui::ScrollArea::vertical().id_salt("saved-query-list").max_height(280.0).show(ui, |ui| {
-                            if self.catalog.queries.is_empty() { ui.label("暂无命名查询"); }
-                            for query in self.catalog.queries.clone() {
-                                if !format!("{} {}", query.name, query.sql).to_lowercase().contains(&needle) { continue; }
-                                ui.push_id(query.id, |ui| { ui.group(|ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.strong(&query.name);
-                                        if ui.button("打开").clicked() { selected_query = Some(query.clone()); }
-                                        ui.add_enabled_ui(self.catalog_store.is_some(), |ui| {
-                                            if ui.button("重命名…").clicked() { self.catalog_dialog = Some(CatalogDialog::Query { id: Some(query.id), name: query.name.clone(), sql: query.sql.clone(), target: query.target.clone(), source_tab: None, expected: Some(Box::new(query.clone())) }); }
-                                            if ui.add_enabled(self.can_save_query(), egui::Button::new("用当前查询更新…")).on_hover_text("确认后覆盖此命名查询的 SQL 和执行目标，不修改 SQL 文件").clicked() { self.save_to_library(Some(query.id)); }
-                                            if ui.button("删除…").clicked() { self.catalog_dialog = Some(CatalogDialog::DeleteQuery(query.id, query.name.clone())); }
-                                        });
-                                    });
-                                    let target = query.target.as_ref().map(|target| {
-                                        let connection = self.profiles.iter().find(|p| p.id == target.connection).map(|p| p.name.clone()).unwrap_or_else(|| format!("已删除 / 不可用连接 {}", target.connection));
-                                        format!("{} / {}", connection, target.database.as_deref().unwrap_or("服务器"))
-                                    }).unwrap_or_else(|| "未绑定（首次执行时绑定当前连接）".into());
-                                    ui.label(RichText::new(target).small().weak());
-                                    ui.label(RichText::new(query.sql.chars().take(150).collect::<String>()).monospace().small());
-                                }); });
-                            }
-                        });
+                        if self.catalog_store.is_none() {
+                            ui.label("连接分组不可写，请检查配置目录。");
+                        }
                         ui.separator();
                         ui.horizontal(|ui| {
-                            ui.strong("连接分组").on_hover_text("右键侧栏连接可移动到分组");
-                            if ui.add_enabled(self.catalog_store.is_some(), egui::Button::new("新建分组…")).clicked() { self.catalog_dialog = Some(CatalogDialog::Group { id: None, name: String::new() }); }
-                        });
-                        egui::ScrollArea::vertical().id_salt("group-list").max_height(150.0).show(ui, |ui| {
-                            for group in self.catalog.groups.clone() {
-                                ui.push_id(group.id, |ui| { ui.horizontal(|ui| {
-                                    ui.label(&group.name);
-                                    ui.add_enabled_ui(self.catalog_store.is_some(), |ui| {
-                                        if ui.button("重命名…").clicked() { self.catalog_dialog = Some(CatalogDialog::Group { id: Some(group.id), name: group.name.clone() }); }
-                                        if ui.button("删除分组…").clicked() { self.catalog_dialog = Some(CatalogDialog::DeleteGroup(group.id, group.name.clone())); }
-                                    });
-                                }); });
+                            ui.strong("连接分组")
+                                .on_hover_text("右键侧栏连接可移动到分组");
+                            if ui
+                                .add_enabled(
+                                    self.catalog_store.is_some(),
+                                    egui::Button::new("新建分组…"),
+                                )
+                                .clicked()
+                            {
+                                self.catalog_dialog = Some(CatalogDialog::Group {
+                                    id: None,
+                                    name: String::new(),
+                                });
                             }
                         });
+                        egui::ScrollArea::vertical()
+                            .id_salt("group-list")
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                for group in self.catalog.groups.clone() {
+                                    ui.push_id(group.id, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(&group.name);
+                                            ui.add_enabled_ui(self.catalog_store.is_some(), |ui| {
+                                                if ui.button("重命名…").clicked() {
+                                                    self.catalog_dialog =
+                                                        Some(CatalogDialog::Group {
+                                                            id: Some(group.id),
+                                                            name: group.name.clone(),
+                                                        });
+                                                }
+                                                if ui.button("删除分组…").clicked() {
+                                                    self.catalog_dialog =
+                                                        Some(CatalogDialog::DeleteGroup(
+                                                            group.id,
+                                                            group.name.clone(),
+                                                        ));
+                                                }
+                                            });
+                                        });
+                                    });
+                                }
+                            });
                     });
                 });
             self.library_open = open;
-            if let Some(query) = selected_query {
-                self.open_saved_query(query);
-                self.library_open = false;
-            }
         }
         if let Some(mut dialog) = self.catalog_dialog.take() {
             let mut cancel = false;
@@ -721,7 +800,7 @@ impl App {
                             } else {
                                 "新建连接分组"
                             });
-                            ui.text_edit_singleline(name);
+                            ui.add(dialog_input(name).desired_width(f32::INFINITY));
                         }
                         CatalogDialog::Query {
                             id, name, target, ..
@@ -731,7 +810,7 @@ impl App {
                             } else {
                                 "新建命名查询（不会覆盖同名条目）"
                             });
-                            ui.text_edit_singleline(name);
+                            ui.add(dialog_input(name).desired_width(f32::INFINITY));
                             ui.label(format!(
                                 "执行目标：{}",
                                 target
@@ -755,15 +834,18 @@ impl App {
                             ));
                         }
                     }
-                    ui.horizontal(|ui| {
-                        cancel = ui.button("取消").clicked();
+                    dialog_actions(ui, |ui| {
+                        let button = match dialog {
+                            CatalogDialog::DeleteGroup(..) | CatalogDialog::DeleteQuery(..) => {
+                                danger_button(ui, "确认删除")
+                            }
+                            _ => primary_button(ui, "保存"),
+                        };
                         confirm = ui
-                            .add_enabled(
-                                self.catalog_store.is_some(),
-                                egui::Button::new("确认保存 / 删除"),
-                            )
+                            .add_enabled(self.catalog_store.is_some(), button)
                             .on_hover_text("仅修改本机查询库，不执行 SQL，也不更改 SQL 文件")
                             .clicked();
+                        cancel = ui.button("取消").clicked();
                     });
                 });
             let completed = confirm && self.apply_catalog_dialog(&dialog);

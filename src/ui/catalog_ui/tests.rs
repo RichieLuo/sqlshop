@@ -22,6 +22,51 @@ fn save_new_query(app: &mut App, name: &str) -> SavedQuery {
 }
 
 #[test]
+fn query_list_uses_document_target_without_losing_edits_or_opening_a_modal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = library_app(dir.path());
+    let target = QueryTarget {
+        connection: Uuid::new_v4(),
+        database: Some("sales".into()),
+        schema: Some("public".into()),
+    };
+    app.tabs[0].target = Some(target.clone());
+    app.tabs[0].sql = "SELECT 'unsaved'".into();
+    app.show_saved_queries();
+    assert!(app.browser_visible);
+    assert_eq!(
+        app.browser_scope,
+        Some(object_browser_ui::BrowserScope {
+            connection: target.connection,
+            database: target.database,
+            schema: target.schema
+        })
+    );
+    assert_eq!(
+        app.browser_state.category,
+        object_browser_ui::BrowserCategory::Queries
+    );
+    assert_eq!(app.tabs[0].sql, "SELECT 'unsaved'");
+    assert!(app.tabs[0].dirty());
+    assert!(!app.modal_open());
+    assert!(app.query_sessions.is_empty());
+    assert!(!app.tabs[0].query_started);
+}
+
+#[test]
+fn unbound_query_list_shows_all_queries_and_new_query_stays_unbound() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = library_app(dir.path());
+    app.tabs[0].target = None;
+    app.show_saved_queries();
+    assert!(app.browser_visible && app.browser_state.all_queries);
+    app.handle_browser_action(object_browser_ui::BrowserAction::NewSavedQuery);
+    assert!(!app.browser_visible);
+    assert!(app.tabs[app.active_tab].target.is_none());
+    assert!(app.query_sessions.is_empty());
+}
+
+#[test]
 fn named_query_save_update_and_restart_preserve_identity_sql_and_target() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = library_app(dir.path());

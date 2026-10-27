@@ -102,6 +102,66 @@ fn postgres_table_designer() {
 fn sqlserver_table_designer() {
     exercise(Engine::SqlServer, "MSSQL")
 }
+
+fn exercise_table_rename(engine: Engine, prefix: &str) {
+    let (profile, credentials) = config(engine, prefix);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let suffix = &Uuid::new_v4().simple().to_string()[..12];
+        let table = Table {
+            schema: match engine { Engine::MySql => "sqlshop_test", Engine::Postgres => "public", Engine::SqlServer => "dbo" }.into(),
+            name: format!("rename_{suffix}"), kind: "BASE TABLE".into(),
+        };
+        let renamed = Table { name: format!("renamed_{suffix}`\"]'"), ..table.clone() };
+        let occupied = Table { name: format!("occupied_{suffix}"), ..table.clone() };
+        let view = Table { name: format!("view_{suffix}"), kind: "VIEW".into(), ..table.clone() };
+        let qualified = |table: &Table| format!("{}.{}", engine.quote(&table.schema), engine.quote(&table.name));
+        let mut seed = connect(&profile, &credentials).await;
+        seed.query(&format!("CREATE TABLE {} (id INT PRIMARY KEY, note VARCHAR(40)); INSERT INTO {} VALUES (7, 'preserved'); CREATE TABLE {} (id INT);", qualified(&table), qualified(&table), qualified(&occupied))).await.unwrap();
+        seed.query(&format!("CREATE VIEW {} AS SELECT id FROM {}", qualified(&view), qualified(&table))).await.unwrap();
+        drop(seed);
+        let result = std::panic::AssertUnwindSafe(async {
+            let mut session = connect(&profile, &credentials).await;
+            assert!(session.rename_table("wrong_database", &table, &renamed.name).await.is_err());
+            assert!(session.rename_table("sqlshop_test", &table, &occupied.name).await.is_err());
+            assert!(session.rename_table("sqlshop_test", &view, "not_a_table").await.is_err());
+            let disguised_view = Table { kind: "BASE TABLE".into(), ..view.clone() };
+            assert!(session.rename_table("sqlshop_test", &disguised_view, "not_a_table").await.is_err());
+            session.rename_table("sqlshop_test", &table, &renamed.name).await.unwrap();
+            let tables = session.tables().await.unwrap();
+            assert!(tables.contains(&renamed));
+            assert!(!tables.contains(&table));
+            assert!(session.rename_table("sqlshop_test", &table, "missing_source").await.is_err());
+            let output = session.query(&format!("SELECT id, note FROM {}", qualified(&renamed))).await.unwrap();
+            assert_eq!(output.sets[0].rows[0], vec![Some("7".into()), Some("preserved".into())]);
+        }).catch_unwind().await;
+        let mut cleanup = connect(&profile, &credentials).await;
+        cleanup.query(&format!("DROP VIEW {}", qualified(&view))).await.unwrap();
+        for candidate in [&table, &renamed, &occupied] {
+            if cleanup.tables().await.unwrap().contains(candidate) {
+                cleanup.query(&format!("DROP TABLE {}", qualified(candidate))).await.unwrap();
+            }
+        }
+        if let Err(panic) = result { std::panic::resume_unwind(panic); }
+    });
+}
+
+#[test]
+#[ignore = "dedicated local containers"]
+fn mysql_table_rename() {
+    exercise_table_rename(Engine::MySql, "MYSQL");
+}
+
+#[test]
+#[ignore = "dedicated local containers"]
+fn postgres_table_rename() {
+    exercise_table_rename(Engine::Postgres, "PG");
+}
+
+#[test]
+#[ignore = "dedicated local containers"]
+fn sqlserver_table_rename() {
+    exercise_table_rename(Engine::SqlServer, "MSSQL");
+}
 fn response(w: &Worker) -> Response {
     w.receiver
         .recv_timeout(Duration::from_secs(20))

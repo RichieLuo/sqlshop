@@ -283,11 +283,7 @@ impl App {
             document_sql: tab.sql.clone(),
             document_char_start,
         };
-        if sql_needs_confirmation(&pending.sql) {
-            self.confirm_sql = Some(pending);
-        } else {
-            self.send_sql(pending);
-        }
+        self.send_sql(pending);
     }
 
     pub(super) fn send_sql(&mut self, pending: PendingSqlExecution) {
@@ -496,7 +492,7 @@ pub(super) fn connection_heading(ui: &mut egui::Ui, form: &mut ConnectionForm) {
             ConnectionKind::Redis => &mut form.redis_profile.name,
         };
         ui.add(
-            egui::TextEdit::singleline(name)
+            dialog_input(name)
                 .hint_text("例如：开发数据库")
                 .desired_width((ui.available_width() - 20.0).min(440.0)),
         );
@@ -545,14 +541,12 @@ pub(super) fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
         });
         ui.horizontal(|ui| {
             ui.label("命名实例");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.profile.sqlserver_instance).hint_text("可选"),
-            );
+            ui.add(dialog_input(&mut form.profile.sqlserver_instance).hint_text("可选"));
         });
         if form.profile.sqlserver_auth == sqlshop::model::SqlServerAuth::AadToken {
             ui.horizontal(|ui| {
                 ui.label("初始数据库");
-                ui.add(egui::TextEdit::singleline(&mut form.profile.database).hint_text("可选"));
+                ui.add(dialog_input(&mut form.profile.database).hint_text("可选"));
             });
         }
     }
@@ -562,15 +556,13 @@ pub(super) fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
         .spacing([14.0, 12.0])
         .show(ui, |ui| {
             ui.label("主机");
-            ui.add(egui::TextEdit::singleline(&mut form.profile.host).desired_width(input_width));
+            ui.add(dialog_input(&mut form.profile.host).desired_width(input_width));
             ui.end_row();
             ui.label("端口");
             ui.add(egui::DragValue::new(&mut form.profile.port).range(1..=65535));
             ui.end_row();
             ui.label("用户名");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.profile.username).desired_width(input_width),
-            );
+            ui.add(dialog_input(&mut form.profile.username).desired_width(input_width));
             ui.end_row();
             ui.label(
                 if form.profile.engine == Engine::SqlServer
@@ -582,7 +574,7 @@ pub(super) fn database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm) {
                 },
             );
             ui.add(
-                egui::TextEdit::singleline(&mut form.password)
+                dialog_input(&mut form.password)
                     .password(true)
                     .desired_width(input_width),
             );
@@ -628,13 +620,13 @@ pub(super) fn ssh_fields(
             .spacing([14.0, 10.0])
             .show(ui, |ui| {
                 ui.label("主机");
-                ui.add(egui::TextEdit::singleline(&mut ssh.host).desired_width(input_width));
+                ui.add(dialog_input(&mut ssh.host).desired_width(input_width));
                 ui.end_row();
                 ui.label("端口");
                 ui.add(egui::DragValue::new(&mut ssh.port).range(1..=65535));
                 ui.end_row();
                 ui.label("用户名");
-                ui.add(egui::TextEdit::singleline(&mut ssh.username).desired_width(input_width));
+                ui.add(dialog_input(&mut ssh.username).desired_width(input_width));
                 ui.end_row();
                 ui.label("认证方式");
                 let previous = ssh.auth;
@@ -655,7 +647,7 @@ pub(super) fn ssh_fields(
                     ui.label("私钥文件");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut ssh.private_key)
+                            dialog_input(&mut ssh.private_key)
                                 .desired_width((input_width - 100.0).max(90.0)),
                         )
                         .on_hover_text(&ssh.private_key);
@@ -675,7 +667,7 @@ pub(super) fn ssh_fields(
                     "私钥口令"
                 });
                 ui.add(
-                    egui::TextEdit::singleline(&mut (*ssh_secret))
+                    dialog_input(&mut (*ssh_secret))
                         .password(true)
                         .desired_width(input_width)
                         .hint_text(if ssh.auth == SshAuth::PrivateKey {
@@ -692,10 +684,10 @@ pub(super) fn ssh_fields(
             .default_open(false)
             .show(ui, |ui| {
                 ui.label("known_hosts 文件");
-                ui.add(egui::TextEdit::singleline(&mut ssh.known_hosts).desired_width(input_width));
+                ui.add(dialog_input(&mut ssh.known_hosts).desired_width(input_width));
                 ui.label("服务器指纹（可选）");
                 ui.add(
-                    egui::TextEdit::singleline(&mut ssh.fingerprint)
+                    dialog_input(&mut ssh.fingerprint)
                         .hint_text("SHA256:…")
                         .desired_width(input_width),
                 );

@@ -182,6 +182,23 @@ pub(super) fn tables(
                 ui.close();
             }
             ui.separator();
+            if ui
+                .add_enabled(
+                    !busy && table.kind.eq_ignore_ascii_case("BASE TABLE"),
+                    egui::Button::new("重命名…"),
+                )
+                .clicked()
+            {
+                *schema_dialog = Some(SchemaDialog {
+                    action: SchemaDialogAction::RenameTable {
+                        connection,
+                        database: database.into(),
+                        table: table.clone(),
+                    },
+                    name: table.name.clone(),
+                });
+                ui.close();
+            }
             if ui.button("刷新表节点").clicked() {
                 render
                     .requests
@@ -468,7 +485,12 @@ impl App {
             }
             for response in session.tree_metadata.worker.receiver.try_iter() {
                 if !same_profile
-                    || session.active_database != response.target.database
+                    || !response
+                        .target
+                        .database
+                        .as_deref()
+                        .and_then(|database| session.tree_tables(database))
+                        .is_some_and(|tables| tables.contains(&response.table))
                     || session.connected.as_ref().is_none_or(|profile| {
                         serde_json::to_value(profile).ok()
                             != serde_json::to_value(&response.profile).ok()
@@ -513,7 +535,10 @@ impl App {
             let Some(profile) = session.connected.clone() else {
                 continue;
             };
-            if session.active_database.as_deref() != Some(&database) {
+            if !session
+                .tree_tables(&database)
+                .is_some_and(|tables| tables.contains(&table))
+            {
                 continue;
             }
             let key = key(&database, &table);

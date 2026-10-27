@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn closed_last_query_stays_closed_after_workspace_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = session_test_app();
+    app.workspace_store = Some(WorkspaceStore::new(directory.path().to_owned()));
+    app.change_tab(TabAction::Close(0));
+    assert!(app.autosave_workspace(true));
+    let saved = app.workspace_store.as_ref().unwrap().load().unwrap();
+    assert!(saved.tabs.is_empty());
+    assert!(app.workspace_matches(&saved));
+
+    let mut restored = session_test_app();
+    restored.store = Some(Store {
+        directory: directory.path().to_owned(),
+    });
+    restored.restore_workspace();
+    assert!(restored.tabs.is_empty());
+    assert!(restored.browser_visible);
+    assert_eq!(restored.active_tab, 0);
+    assert_eq!(restored.next_tab, 1);
+    assert!(restored.workspace_matches(&saved));
+    assert!(restored.autosave_workspace(true));
+
+    let path = directory.path().join("reopened.sql");
+    std::fs::write(&path, "SELECT 1;").unwrap();
+    assert!(restored.open_sql_path(&path));
+    assert_eq!(restored.tabs.len(), 1);
+    assert_eq!(restored.tabs[0].sql, "SELECT 1;");
+    assert!(!restored.browser_visible);
+    assert!(restored.query_sessions.is_empty());
+}
+
+#[test]
+fn restoring_an_empty_older_workspace_discards_the_previous_query_counter() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = WorkspaceStore::new(directory.path().to_owned());
+    store
+        .save(&Workspace {
+            next_tab: 176,
+            ..Workspace::default()
+        })
+        .unwrap();
+    let mut app = session_test_app();
+    app.store = Some(Store {
+        directory: directory.path().to_owned(),
+    });
+    app.restore_workspace();
+    assert!(app.tabs.is_empty());
+    assert_eq!(app.next_tab, 1);
+    app.change_tab(TabAction::New);
+    assert_eq!(app.tabs[0].name, "查询 1");
+}
+
+#[test]
 fn workspace_borrowed_comparison_tracks_all_persisted_fields() {
     let mut app = session_test_app();
     let mut saved = app.workspace_snapshot();

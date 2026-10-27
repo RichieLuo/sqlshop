@@ -498,18 +498,18 @@ impl App {
             .collect();
         store.forget_credentials(id)?;
         store.save_redis(&profiles)?;
-        let active_id = self.tabs[self.active_tab].id;
+        let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
         self.tabs
             .retain(|tab| tab.redis.as_ref().is_none_or(|doc| doc.profile_id() != id));
+        self.browser_visible |= self.tabs.is_empty();
         if self.tabs.is_empty() {
-            self.tabs.push(QueryTab::new(self.next_tab));
-            self.next_tab += 1;
+            self.next_tab = 1;
         }
         self.active_tab = self
             .tabs
             .iter()
-            .position(|tab| tab.id == active_id)
-            .unwrap_or_else(|| self.active_tab.min(self.tabs.len() - 1));
+            .position(|tab| Some(tab.id) == active_id)
+            .unwrap_or_else(|| self.active_tab.min(self.tabs.len().saturating_sub(1)));
         self.redis_profiles = profiles;
         self.credentials.remove(&id);
         self.selected = self
@@ -545,11 +545,14 @@ impl App {
                             s.databases
                                 .iter()
                                 .any(|db| db.to_lowercase().contains(filter))
-                                || s.tables.iter().any(|table| {
-                                    format!("{}.{}", table.schema, table.name)
-                                        .to_lowercase()
-                                        .contains(filter)
-                                })
+                                || s.tables
+                                    .iter()
+                                    .chain(s.database_tree.tables.values().flatten())
+                                    .any(|table| {
+                                        format!("{}.{}", table.schema, table.name)
+                                            .to_lowercase()
+                                            .contains(filter)
+                                    })
                         }))
             })
             .cloned()
@@ -787,21 +790,21 @@ pub(super) fn redis_database_fields(ui: &mut egui::Ui, form: &mut ConnectionForm
         .spacing([14.0, 12.0])
         .show(ui, |ui| {
             ui.label("主机");
-            ui.add(egui::TextEdit::singleline(&mut profile.host).desired_width(width));
+            ui.add(dialog_input(&mut profile.host).desired_width(width));
             ui.end_row();
             ui.label("端口");
             ui.add(egui::DragValue::new(&mut profile.port).range(1..=65535));
             ui.end_row();
             ui.label("用户名");
             ui.add(
-                egui::TextEdit::singleline(&mut profile.username)
+                dialog_input(&mut profile.username)
                     .hint_text("可留空；ACL 用户名")
                     .desired_width(width),
             );
             ui.end_row();
             ui.label("密码");
             ui.add(
-                egui::TextEdit::singleline(&mut form.password)
+                dialog_input(&mut form.password)
                     .password(true)
                     .hint_text("无认证 Redis 可留空")
                     .desired_width(width),

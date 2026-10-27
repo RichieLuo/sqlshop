@@ -241,6 +241,7 @@ pub enum RedisData {
         token: u64,
         prefix: Vec<u8>,
         count: usize,
+        notice: Option<String>,
     },
     NamespaceDeleted {
         prefix: Vec<u8>,

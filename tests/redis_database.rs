@@ -171,6 +171,7 @@ fn namespace_preview(worker: &RedisWorker, prefix: &[u8], expected: usize) -> u6
         token,
         prefix: returned,
         count,
+        ..
     } = run(
         worker,
         RedisRequest::PreviewNamespace {

@@ -234,11 +234,78 @@ fn namespace_delete_requires_a_clean_stable_database() {
         prefix: b"app:".to_vec(),
         count: 20,
         database: 0,
+        notice: None,
     });
     assert!(!doc.select_database(1));
     assert!(!doc.disconnect());
     assert!(!doc.preview_namespace(b"cache:".to_vec()));
     assert!(!doc.busy);
+}
+
+#[test]
+fn large_namespace_notice_keeps_confirmation_enabled() {
+    for dark in [false, true] {
+        let context = egui::Context::default();
+        context.set_visuals(if dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+        let mut doc = RedisDocument::fixture(&context);
+        let notice = "命名空间较大，删除可能耗时较长；请核对范围后确认执行。";
+        doc.confirmation = Some(Confirmation::Namespace {
+            token: 1,
+            prefix: b"app:".to_vec(),
+            count: 10_001,
+            database: doc.database,
+            notice: Some(notice.into()),
+        });
+        let mut time = 0.0;
+        let mut frame = |events| {
+            time += 0.1;
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 720.0),
+                    )),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| doc.confirmation_ui(ui));
+                },
+            )
+        };
+        frame(vec![]);
+        let output = frame(vec![]);
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text().contains(notice)
+        )));
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "确认执行" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("confirmation button should remain visible");
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(position), pointer(true)]);
+        frame(vec![pointer(false)]);
+        assert!(doc.confirmation.is_none());
+        assert!(doc.busy, "large namespace deletion must be submitted");
+        assert!(doc.error.is_none());
+    }
 }
 
 #[test]

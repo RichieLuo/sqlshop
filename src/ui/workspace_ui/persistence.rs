@@ -38,15 +38,19 @@ impl App {
                         tab
                     })
                     .collect();
-                if self.tabs.is_empty() {
-                    self.tabs.push(QueryTab::new(1));
-                }
-                self.active_tab = workspace.active_tab.min(self.tabs.len() - 1);
-                self.next_tab = workspace.next_tab.max(self.tabs.len() + 1);
+                self.active_tab = workspace.active_tab.min(self.tabs.len().saturating_sub(1));
+                self.browser_visible |= self.tabs.is_empty();
+                self.next_tab = if self.tabs.is_empty() {
+                    1
+                } else {
+                    workspace.next_tab.max(self.tabs.len() + 1)
+                };
                 self.editor_height = workspace.editor_height;
                 self.history = workspace.history;
                 self.table_grid_layouts = workspace.table_grid_layouts;
                 if let Some(layout) = workspace.layout {
+                    panel_layout_ui::restore(&self.context, &layout);
+                    editor::set_line_height(&self.context, layout.sql_line_height);
                     self.view.navigation = layout.navigation;
                     self.inspector_visible = layout.information;
                     self.view.information_force = layout.information_force;
@@ -97,26 +101,30 @@ impl App {
         let Some(layout) = &saved.layout else {
             return false;
         };
+        let (navigation_width, information_width) = panel_layout_ui::widths(&self.context);
         if saved.version != sqlshop::workspace::WORKSPACE_VERSION
             || saved.next_tab != self.next_tab
             || saved.editor_height != self.editor_height
             || layout.navigation != self.view.navigation
+            || layout.navigation_width != navigation_width
             || layout.information != self.inspector_visible
+            || layout.information_width != information_width
             || layout.information_force != self.view.information_force
             || layout.toolbar != self.view.toolbar
             || layout.status != self.view.status
             || layout.focus != self.view.focus
             || layout.connected_only != self.view.connected_only
             || layout.theme != self.workspace_theme()
+            || layout.sql_line_height != editor::line_height(&self.context)
             || saved.history != self.history
             || saved.table_grid_layouts != self.table_grid_layouts
         {
             return false;
         }
-        let active_id = self.tabs[self.active_tab].id;
+        let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
         let active_tab = self
             .workspace_tabs()
-            .position(|tab| tab.id == active_id)
+            .position(|tab| Some(tab.id) == active_id)
             .unwrap_or(0);
         if saved.active_tab != active_tab {
             return false;
@@ -134,12 +142,16 @@ impl App {
     }
 
     pub(in crate::ui) fn workspace_snapshot(&self) -> Workspace {
+        let (navigation_width, information_width) = panel_layout_ui::widths(&self.context);
         let tabs: Vec<_> = self
             .workspace_tabs()
             .map(QueryTab::workspace_saved_tab)
             .collect();
-        let active_id = self.tabs[self.active_tab].id;
-        let active_tab = tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
+        let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+        let active_tab = tabs
+            .iter()
+            .position(|t| Some(t.id) == active_id)
+            .unwrap_or(0);
         Workspace {
             tabs,
             active_tab,
@@ -149,13 +161,16 @@ impl App {
             editor_height: self.editor_height,
             layout: Some(sqlshop::workspace::WorkspaceLayout {
                 navigation: self.view.navigation,
+                navigation_width,
                 information: self.inspector_visible,
+                information_width,
                 information_force: self.view.information_force,
                 toolbar: self.view.toolbar,
                 status: self.view.status,
                 focus: self.view.focus,
                 connected_only: self.view.connected_only,
                 theme: self.workspace_theme().into(),
+                sql_line_height: editor::line_height(&self.context),
             }),
             ..Workspace::default()
         }

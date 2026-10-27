@@ -13,7 +13,8 @@ use uuid::Uuid;
 // their SQL as an unbound query for a different database engine.
 pub const WORKSPACE_VERSION: u32 = 2;
 pub const MAX_HISTORY_ENTRIES: usize = 200;
-pub const MAX_SQL_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SQL_FILE_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_SQL_LINE_HEIGHT: f32 = 1.5;
 const MAX_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,29 +67,35 @@ pub struct HistoryEntry {
     pub success: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WorkspaceLayout {
     pub navigation: bool,
+    pub navigation_width: Option<f32>,
     pub information: bool,
+    pub information_width: Option<f32>,
     pub information_force: bool,
     pub toolbar: bool,
     pub status: bool,
     pub focus: bool,
     pub connected_only: bool,
     pub theme: String,
+    pub sql_line_height: f32,
 }
 impl Default for WorkspaceLayout {
     fn default() -> Self {
         Self {
             navigation: true,
+            navigation_width: None,
             information: true,
+            information_width: None,
             information_force: false,
             toolbar: true,
             status: true,
             focus: false,
             connected_only: false,
             theme: "system".into(),
+            sql_line_height: DEFAULT_SQL_LINE_HEIGHT,
         }
     }
 }
@@ -168,6 +175,14 @@ impl Workspace {
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
         self.next_tab = self.next_tab.max(self.tabs.len().saturating_add(1));
         self.editor_height = self.editor_height.filter(|h| h.is_finite() && *h > 0.0);
+        if let Some(layout) = &mut self.layout {
+            layout.navigation_width = layout
+                .navigation_width
+                .filter(|w| w.is_finite() && *w > 0.0);
+            layout.information_width = layout
+                .information_width
+                .filter(|w| w.is_finite() && *w > 0.0);
+        }
     }
 }
 
@@ -236,8 +251,11 @@ fn validate_version(workspace: &Workspace) -> Result<()> {
 pub fn read_sql_file(path: &Path) -> Result<String> {
     let file = File::open(path).context("Cannot open SQL file")?;
     let bytes = read_limited(file, MAX_SQL_FILE_BYTES).context("Cannot read SQL file")?;
-    let text = String::from_utf8(bytes).context("SQL file must be UTF-8")?;
-    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned())
+    let mut text = String::from_utf8(bytes).context("SQL file must be UTF-8")?;
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(text)
 }
 
 /// Persist SQL without truncating the old destination before the new contents
@@ -257,12 +275,20 @@ fn read_limited(file: File, limit: usize) -> Result<Vec<u8>> {
         bail!("Expected a regular file");
     }
     if file.metadata()?.len() > limit as u64 {
-        bail!("File exceeds the {} byte limit", limit);
+        bail!(
+            "File exceeds the {} MiB limit ({} bytes)",
+            limit / 1024 / 1024,
+            limit
+        );
     }
     let mut bytes = Vec::new();
     file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > limit {
-        bail!("File exceeds the {} byte limit", limit);
+        bail!(
+            "File exceeds the {} MiB limit ({} bytes)",
+            limit / 1024 / 1024,
+            limit
+        );
     }
     Ok(bytes)
 }
@@ -466,6 +492,36 @@ mod tests {
         fs::write(&path, too_large).unwrap();
         assert!(read_sql_file(&path).is_err());
         assert!(write_sql_file(directory.path(), "oops").is_err());
+    }
+
+    #[test]
+    fn sql_dump_larger_than_16_mib_can_be_opened_saved_and_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-dump.sql");
+        let mut sql = "-- 中文 🦀\n".to_owned();
+        sql.push_str(&"INSERT INTO items VALUES (1, 'value');\n".repeat(1_000_000));
+        sql.push_str("SELECT '文件末尾';\n");
+        assert!(sql.len() > 36 * 1024 * 1024);
+        write_sql_file(&path, &sql).unwrap();
+        assert_eq!(read_sql_file(&path).unwrap(), sql);
+        sql.push_str("-- saved edit\n");
+        write_sql_file(&path, &sql).unwrap();
+        assert_eq!(read_sql_file(&path).unwrap(), sql);
+
+        let store = WorkspaceStore::new(directory.path().to_owned());
+        let mut workspace = Workspace::default();
+        workspace.tabs.push(SavedTab {
+            id: Uuid::new_v4(),
+            name: "large-dump.sql".into(),
+            sql: sql.clone(),
+            file_path: Some(path),
+            saved_sql: sql,
+            target: None,
+            saved_query: None,
+            document: None,
+        });
+        store.save(&workspace).unwrap();
+        assert_eq!(store.load().unwrap().tabs, workspace.tabs);
     }
 
     #[test]

@@ -101,29 +101,34 @@ mod tests {
         let icon = super::icon_data();
         assert_eq!((icon.width, icon.height), (256, 256));
         let image = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba).unwrap();
-        for (x, y) in [(0, 0), (255, 0), (0, 255), (255, 255), (28, 28)] {
+        for (x, y) in [(0, 0), (255, 0), (0, 255), (255, 255), (8, 8)] {
             assert_eq!(image.get_pixel(x, y)[3], 0);
         }
-        for (x, y) in [(128, 32), (32, 128), (128, 128), (128, 223)] {
+        for (x, y) in [(128, 0), (0, 128), (128, 128), (128, 255), (255, 128)] {
             assert_eq!(image.get_pixel(x, y)[3], 255);
         }
-        assert!(image.rows().next().unwrap().all(|pixel| pixel[3] == 0));
-        assert!(image.rows().next_back().unwrap().all(|pixel| pixel[3] == 0));
     }
 
     #[test]
     fn rounded_icon_has_a_solid_plate_and_transparent_rounded_exterior() {
         let image = super::icon_image();
         assert_eq!(image.dimensions(), (1024, 1024));
-        for (x, y) in [(0, 0), (1023, 0), (0, 1023), (1023, 1023), (110, 110)] {
+        for (x, y) in [(0, 0), (1023, 0), (0, 1023), (1023, 1023), (16, 16)] {
             assert_eq!(image.get_pixel(x, y)[3], 0);
         }
         // Both the pale backing plate and the animal artwork must be opaque.
         for (x, y) in [(512, 125), (125, 512), (512, 512), (512, 898)] {
             assert_eq!(image.get_pixel(x, y)[3], 255);
         }
-        assert!(image.rows().next().unwrap().all(|pixel| pixel[3] == 0));
-        assert!(image.rows().next_back().unwrap().all(|pixel| pixel[3] == 0));
+        if cfg!(target_os = "windows") {
+            for (x, y) in [(512, 0), (0, 512), (512, 1023), (1023, 512)] {
+                assert_eq!(image.get_pixel(x, y)[3], 255);
+            }
+        } else {
+            assert_eq!(image.get_pixel(110, 110)[3], 0);
+            assert!(image.rows().next().unwrap().all(|pixel| pixel[3] == 0));
+            assert!(image.rows().next_back().unwrap().all(|pixel| pixel[3] == 0));
+        }
         if let Some(path) = std::env::var_os("SQLSHOP_ICON_PREVIEW") {
             image.save(path).unwrap();
         }

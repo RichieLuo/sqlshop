@@ -63,7 +63,7 @@ fn namespace_preview_escapes_literal_binary_prefix_and_deletes_only_deduplicated
 }
 
 #[test]
-fn namespace_preview_rejects_10001_unique_keys_and_never_offers_partial_snapshot() {
+fn large_namespace_preview_warns_and_deletes_all_10001_keys_in_batches() {
     let mut steps = vec![
         ping(),
         exact(
@@ -92,21 +92,52 @@ fn namespace_preview_rejects_10001_unique_keys_and_never_offers_partial_snapshot
             reply,
         ));
     }
+    let deleted_keys = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    for batch in 0..101 {
+        let deleted_keys = deleted_keys.clone();
+        steps.push(Box::new(move |args| {
+            let count = if batch == 100 { 1 } else { 100 };
+            assert_eq!(args[0], b"UNLINK");
+            assert_eq!(args.len(), count + 1);
+            let mut deleted_keys = deleted_keys.lock().unwrap();
+            for key in &args[1..] {
+                assert!(deleted_keys.insert(key.clone()), "duplicate deletion");
+            }
+            integer(count as i64)
+        }));
+    }
     let mock = Mock::start(steps);
     let worker = RedisWorker::start(|| {});
     connect(&worker, mock.profile.clone(), Credentials::default());
     let old = namespace_preview(&worker, b"ns:", 1);
-    worker
-        .send(
-            2,
-            RedisRequest::PreviewNamespace {
-                prefix: b"ns:".to_vec(),
-            },
-        )
-        .unwrap();
-    let failed = response(&worker);
-    assert!(failed.connected);
-    assert!(failed.result.unwrap_err().contains("10000"));
+    let RedisData::NamespacePreview {
+        token,
+        count,
+        notice,
+        ..
+    } = run(
+        &worker,
+        RedisRequest::PreviewNamespace {
+            prefix: b"ns:".to_vec(),
+        },
+    )
+    else {
+        panic!("expected a complete namespace preview")
+    };
+    assert_eq!(count, 10_001);
+    assert!(notice.is_some());
+    assert_ne!(token, old);
+    assert!(matches!(
+        run(&worker, RedisRequest::DeleteNamespace { token }),
+        RedisData::NamespaceDeleted {
+            deleted: 10_001,
+            ..
+        }
+    ));
+    let expected = (0..10_001)
+        .map(|index| format!("ns:{index}").into_bytes())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(*deleted_keys.lock().unwrap(), expected);
     worker
         .send(3, RedisRequest::DeleteNamespace { token: old })
         .unwrap();
@@ -116,8 +147,9 @@ fn namespace_preview_rejects_10001_unique_keys_and_never_offers_partial_snapshot
 }
 
 #[test]
-fn namespace_key_name_budget_is_enforced_across_scan_pages() {
+fn namespace_key_names_over_4_mib_warn_and_remain_deletable() {
     let mut steps = vec![ping()];
+    let mut expected = std::collections::HashSet::new();
     for page in 0..9 {
         let mut key = b"ns:".to_vec();
         key.resize(512 * 1024, b'a' + page as u8);
@@ -133,10 +165,131 @@ fn namespace_key_name_budget_is_enforced_across_scan_pages() {
             ],
             scan(if page == 8 { 0 } else { page + 1 }, &[&key]),
         ));
+        expected.insert(key);
+    }
+    steps.push(Box::new(move |args| {
+        assert_eq!(args[0], b"UNLINK");
+        assert_eq!(
+            args[1..]
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+        integer(9)
+    }));
+    let mock = Mock::start(steps);
+    let worker = RedisWorker::start(|| {});
+    connect(&worker, mock.profile.clone(), Credentials::default());
+    let RedisData::NamespacePreview {
+        token,
+        count,
+        notice,
+        ..
+    } = run(
+        &worker,
+        RedisRequest::PreviewNamespace {
+            prefix: b"ns:".to_vec(),
+        },
+    )
+    else {
+        panic!("expected a complete namespace preview")
+    };
+    assert_eq!(count, 9);
+    assert!(notice.is_some());
+    assert!(matches!(
+        run(&worker, RedisRequest::DeleteNamespace { token }),
+        RedisData::NamespaceDeleted { deleted: 9, .. }
+    ));
+    run(&worker, RedisRequest::Disconnect);
+    mock.finish();
+}
+
+#[test]
+fn namespace_preview_continues_past_10000_scan_pages() {
+    let mut steps = vec![ping()];
+    for page in 0..=10_000 {
+        let cursor = page.to_string();
+        steps.push(exact(
+            &[
+                b"SCAN",
+                cursor.as_bytes(),
+                b"MATCH",
+                b"ns:*",
+                b"COUNT",
+                b"200",
+            ],
+            if page == 10_000 {
+                scan(0, &[b"ns:last"])
+            } else {
+                scan(page + 1, &[])
+            },
+        ));
+    }
+    steps.push(exact(&[b"UNLINK", b"ns:last"], integer(1)));
+    let mock = Mock::start(steps);
+    let worker = RedisWorker::start(|| {});
+    connect(&worker, mock.profile.clone(), Credentials::default());
+    let RedisData::NamespacePreview {
+        token,
+        count,
+        notice,
+        ..
+    } = run(
+        &worker,
+        RedisRequest::PreviewNamespace {
+            prefix: b"ns:".to_vec(),
+        },
+    )
+    else {
+        panic!("expected a complete namespace preview")
+    };
+    assert_eq!(count, 1);
+    assert!(notice.is_none());
+    assert!(matches!(
+        run(&worker, RedisRequest::DeleteNamespace { token }),
+        RedisData::NamespaceDeleted { deleted: 1, .. }
+    ));
+    run(&worker, RedisRequest::Disconnect);
+    mock.finish();
+}
+
+#[test]
+fn namespace_preview_can_take_longer_than_ten_seconds_overall() {
+    let mut steps = vec![ping()];
+    for page in 0..2 {
+        steps.push(Box::new(move |args| {
+            assert_eq!(args[0], b"SCAN");
+            assert_eq!(args[1], page.to_string().as_bytes());
+            std::thread::sleep(Duration::from_millis(5500));
+            if page == 0 {
+                scan(1, &[b"ns:first"])
+            } else {
+                scan(0, &[b"ns:last"])
+            }
+        }));
     }
     let mock = Mock::start(steps);
     let worker = RedisWorker::start(|| {});
     connect(&worker, mock.profile.clone(), Credentials::default());
+    namespace_preview(&worker, b"ns:", 2);
+    run(&worker, RedisRequest::Disconnect);
+    mock.finish();
+}
+
+#[test]
+fn failed_namespace_scan_invalidates_the_previous_preview() {
+    let mock = Mock::start(vec![
+        ping(),
+        exact(
+            &[b"SCAN", b"0", b"MATCH", b"ns:*", b"COUNT", b"200"],
+            scan(0, &[b"ns:old"]),
+        ),
+        step("SCAN", b"-NOPERM SCAN denied\r\n".to_vec()),
+    ]);
+    let worker = RedisWorker::start(|| {});
+    connect(&worker, mock.profile.clone(), Credentials::default());
+    let token = namespace_preview(&worker, b"ns:", 1);
     worker
         .send(
             2,
@@ -147,7 +300,11 @@ fn namespace_key_name_budget_is_enforced_across_scan_pages() {
         .unwrap();
     let failed = response(&worker);
     assert!(failed.connected);
-    assert!(failed.result.unwrap_err().contains("4 MiB"));
+    assert!(failed.result.is_err());
+    worker
+        .send(3, RedisRequest::DeleteNamespace { token })
+        .unwrap();
+    assert!(response(&worker).result.unwrap_err().contains("失效"));
     run(&worker, RedisRequest::Disconnect);
     mock.finish();
 }

@@ -125,7 +125,10 @@ pub(super) fn tab_bar(
     let drag_id = egui::Id::new("document-tab-drag");
     let mut dragged = ui.data(|data| data.get_temp::<Uuid>(drag_id));
     let released = ui.input(|input| input.pointer.any_released());
-    let active_id = (!objects_active).then_some(tabs[active].id);
+    let active_id = tabs
+        .get(active)
+        .filter(|_| !objects_active)
+        .map(|tab| tab.id);
     let previous =
         ui.data(|data| data.get_temp::<(Uuid, f32)>(egui::Id::new("visible-document-tab")));
     let reveal = active_id.is_some_and(|id| {

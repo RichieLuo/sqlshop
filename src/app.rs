@@ -102,7 +102,7 @@ mod tests {
         let context = egui::Context::default();
         let _ = context.run(test_input(), |ctx| {
             egui::SidePanel::left("sidebar")
-                .exact_width(310.0)
+                .exact_width(640.0)
                 .show(ctx, |_| {});
         });
         let mut storage = MemoryStorage::default();
@@ -113,9 +113,9 @@ mod tests {
         let _ = restored.run(test_input(), |ctx| {
             let panel = egui::SidePanel::left("sidebar")
                 .default_width(240.0)
-                .width_range(200.0..=340.0)
+                .width_range(200.0..=800.0)
                 .show(ctx, |ui| ui.set_min_width(ui.available_width()));
-            assert_eq!(panel.response.rect.width(), 310.0);
+            assert_eq!(panel.response.rect.width(), 640.0);
         });
     }
 }

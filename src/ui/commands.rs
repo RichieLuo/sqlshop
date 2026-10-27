@@ -21,15 +21,19 @@ impl App {
     }
 
     pub(super) fn execution_target(&self) -> Option<QueryTarget> {
-        self.tabs[self.active_tab]
+        self.tabs
+            .get(self.active_tab)?
             .target
             .clone()
             .or_else(|| self.current_target())
     }
 
     pub(super) fn can_execute(&self) -> bool {
-        !self.tabs[self.active_tab].management_document()
-            && self.tabs[self.active_tab].definition.is_none()
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
+        !tab.management_document()
+            && tab.definition.is_none()
             && self.execution_target().is_some_and(|t| {
                 self.query_target_ready(self.tabs[self.active_tab].id, &t)
                     && !self.tab_busy(self.active_tab)
@@ -274,6 +278,14 @@ impl App {
         if self.session_busy(id) {
             return;
         }
+        if let Request::RenameTable {
+            database, table, ..
+        } = &request
+            && let Some(message) = self.table_rename_rejection(id, database, table)
+        {
+            self.fail(message);
+            return;
+        }
         if matches!(&request, Request::ChangeStructure { .. })
             && self.tabs.iter().any(|tab| {
                 tab.has_table_drafts()
@@ -389,9 +401,20 @@ impl App {
             Request::ReadPage { .. } | Request::ReadLastPage { .. } | Request::ReadTable { .. }
         );
         let connection_reset = matches!(&request, Request::Connect(..) | Request::Disconnect);
+        let opening_database = match &request {
+            Request::SelectDatabase(database) | Request::ObjectCatalog { database } => {
+                Some(database.clone())
+            }
+            _ => None,
+        };
         match session.worker.send(request) {
             Ok(()) => {
+                if let Some(database) = opening_database {
+                    session.database_tree.errors.remove(&database);
+                    session.database_tree.opening = Some(database);
+                }
                 if connection_reset {
+                    session.database_tree = Default::default();
                     session.connected = None;
                     session.active_database = None;
                     for tab in &mut self.tabs {

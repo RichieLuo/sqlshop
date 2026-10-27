@@ -1,6 +1,15 @@
 const CANVAS_SIZE: u32 = 1024;
-const PLATE_SIZE: u32 = 820;
-const ARTWORK_SIZE: u32 = 736;
+// Windows already sizes icons to their display slot; extra padding makes them small.
+const OUTER_MARGIN: f32 = if cfg!(target_os = "windows") {
+    0.0
+} else {
+    0.1
+};
+const ARTWORK_SIZE: u32 = if cfg!(target_os = "windows") {
+    920
+} else {
+    736
+};
 const MIN_ALPHA: u8 = 8;
 
 pub fn icon_image() -> image::RgbaImage {
@@ -10,10 +19,8 @@ pub fn icon_image() -> image::RgbaImage {
             .into_rgba8();
     let (left, top, width, height) = visible_bounds(&source);
     let artwork = image::imageops::crop_imm(&source, left, top, width, height).to_image();
-    // Existing tiles fill the plate; a transparent mascot has its own inset.
-    // Both paths share the same final silhouette, independent of source padding.
-    let limit = if false { PLATE_SIZE } else { ARTWORK_SIZE };
-    let scale = limit as f64 / f64::from(width.max(height));
+    // Preserve the mascot's inset relative to the plate as the whole icon grows.
+    let scale = ARTWORK_SIZE as f64 / f64::from(width.max(height));
     let scaled = image::imageops::resize(
         &artwork,
         (f64::from(width) * scale).round().max(1.0) as u32,
@@ -28,9 +35,9 @@ pub fn icon_image() -> image::RgbaImage {
         i64::from((CANVAS_SIZE - scaled.width()) / 2),
         i64::from((CANVAS_SIZE - scaled.height()) / 2),
     );
-    // Match SQLShop's native icon: an 80% rounded plate and 10% outer padding.
+    // Keep the shared rounded silhouette, with no extra inset on Windows.
     let center = CANVAS_SIZE as f32 / 2.0;
-    let half_size = CANVAS_SIZE as f32 * 0.4;
+    let half_size = CANVAS_SIZE as f32 * (0.5 - OUTER_MARGIN);
     let radius = half_size * 0.44;
     for (x, y, pixel) in icon.enumerate_pixels_mut() {
         let dx = (x as f32 + 0.5 - center).abs() - (half_size - radius);
@@ -86,7 +93,11 @@ mod tests {
                     bottom = bottom.max(y + 1);
                 }
             }
-            let expected_margin = (size as f32 * 0.1).round() as u32;
+            let expected_margin = if cfg!(target_os = "windows") {
+                0
+            } else {
+                (size as f32 * 0.1).round() as u32
+            };
             assert_eq!(
                 (left, top, right, bottom),
                 (
@@ -98,7 +109,10 @@ mod tests {
                 "icon silhouette differs at {size}px"
             );
             assert_eq!(resized.get_pixel(size / 2, size / 2)[3], 255);
-            assert_eq!(resized.get_pixel(0, 0)[3], 0);
+            // Lanczos can leave faint ringing at rounded corners in small frames.
+            for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
+                assert!(resized.get_pixel(x, y)[3] < MIN_ALPHA);
+            }
         }
         if let Some(path) = std::env::var_os("SHOP_ICON_PREVIEW") {
             icon.save(path).expect("save the application icon preview");

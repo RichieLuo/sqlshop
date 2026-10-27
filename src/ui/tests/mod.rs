@@ -2,7 +2,9 @@ mod tabs;
 
 mod grid;
 
+mod database_tree;
 mod navigation;
+mod panel_layout;
 
 mod sessions;
 
@@ -18,6 +20,7 @@ mod cell_editor;
 
 mod file_open;
 mod table_drafts;
+mod table_rename;
 
 use super::*;
 
@@ -231,11 +234,9 @@ pub(super) fn session_test_app() -> App {
         confirm_exit: false,
         allow_exit: false,
         confirm_request: None,
-        confirm_sql: None,
         catalog: Catalog::default(),
         catalog_store: None,
         library_open: false,
-        library_search: String::new(),
         catalog_dialog: None,
     }
 }
