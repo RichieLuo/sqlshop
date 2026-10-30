@@ -115,24 +115,18 @@ pub(super) fn show(ui: &mut egui::Ui, tab: &mut QueryTab, height: f32) {
     }
     let mut text = tab.sql[view.range.clone()].to_owned();
     let content_height = (height - 28.0 - (ui.cursor().top() - toolbar_top)).max(40.0);
-    egui::ScrollArea::both()
-        .id_salt(("large-sql-scroll", tab.id, view.range.start))
-        .max_height(content_height)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _: f32| {
-                let job = layout_sql(ui, text.as_str(), line_height);
-                ui.fonts_mut(|fonts| fonts.layout_job(job))
-            };
-            let mut output = egui::TextEdit::multiline(&mut text)
-                .id(editor_id)
-                .layouter(&mut layouter)
-                .font(egui::TextStyle::Monospace)
-                .code_editor()
-                .desired_width(f32::INFINITY)
-                .desired_rows(1)
-                .frame(false)
-                .show(ui);
+    text_edit::show(
+        ui,
+        ("large-sql-scroll", tab.id, view.range.start),
+        content_height,
+        tab.sql[..view.range.start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+        text.bytes().filter(|byte| *byte == b'\n').count() + 1,
+        |ui| {
+            let mut output = text_edit::edit(ui, &mut text, editor_id, line_height);
             if let Some(range) = requested {
                 let start = range.start.clamp(view.range.start, view.range.end) - view.range.start;
                 let end = range.end.clamp(view.range.start, view.range.end) - view.range.start;
@@ -163,7 +157,9 @@ pub(super) fn show(ui: &mut egui::Ui, tab: &mut QueryTab, height: f32) {
                 tab.sql.replace_range(view.range.clone(), &text);
                 view.range.end = view.range.start + text.len();
             }
-        });
+            output
+        },
+    );
     view.fingerprint = fingerprint(&text);
     ui.ctx().data_mut(|data| data.insert_temp(view_id, view));
 }
@@ -226,6 +222,10 @@ mod tests {
             Some(byte_to_char_index(&tab.sql, start))
         );
         assert_eq!(tab.cursor, tab.sql.chars().count());
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::Text(text) => text.galley.job.text == "100001",
+            _ => false,
+        }));
         assert!(output.shapes.iter().all(|shape| match &shape.shape {
             egui::Shape::Text(text) => text.galley.job.text.len() <= PAGE_BYTES,
             _ => true,

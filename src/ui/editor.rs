@@ -2,6 +2,9 @@ use super::*;
 
 mod appearance;
 mod large_file;
+#[cfg(test)]
+mod tests;
+mod text_edit;
 use appearance::{layout_sql, line_height_control};
 pub(super) use appearance::{line_height, set_line_height};
 
@@ -157,17 +160,13 @@ pub(super) fn sql_editor(
                     });
                 return;
             }
-            egui::ScrollArea::both()
-                .id_salt(("editor", tab.id))
-                .min_scrolled_height(content_height)
-                .max_height(content_height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut layouter =
-                        |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
-                            let job = layout_sql(ui, text.as_str(), line_height);
-                            ui.fonts_mut(|fonts| fonts.layout_job(job))
-                        };
+            text_edit::show(
+                ui,
+                ("editor", tab.id),
+                content_height,
+                1,
+                tab.sql.bytes().filter(|byte| *byte == b'\n').count() + 1,
+                |ui| {
                     let editor_id = ui.make_persistent_id(egui::Id::new(tab.id));
                     let completion_key = if ui.is_enabled()
                         && !tab.find_open
@@ -239,15 +238,7 @@ pub(super) fn sql_editor(
                             });
                         }
                     }
-                    let mut output = egui::TextEdit::multiline(&mut tab.sql)
-                        .id(editor_id)
-                        .layouter(&mut layouter)
-                        .font(egui::TextStyle::Monospace)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(1)
-                        .frame(false)
-                        .show(ui);
+                    let mut output = text_edit::edit(ui, &mut tab.sql, editor_id, line_height);
                     if tab.focus_editor && ui.is_enabled() {
                         output.response.request_focus();
                         tab.focus_editor = false;
@@ -361,7 +352,9 @@ pub(super) fn sql_editor(
                                 .collect()
                         })
                         .unwrap_or_default();
-                });
+                    output
+                },
+            );
         });
     if !show_results {
         return (editor.response, needs_columns);
